@@ -1,0 +1,5 @@
+model/**
+Latex/**
+__pycache__/
+.DS_Store
+.vscode/
