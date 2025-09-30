@@ -48,10 +48,12 @@ def visualize_samples(model, mean, std, num_samples=3):
         history = generate_history_segments(full_traj, config.history_len, device=device)
         x_0 = full_traj[:, config.history_len:, :]
 
+        model.config.enable_cbf_guidance = False
         # Sample unguided
         sampled_unguided = model.sample(target, action, history, batch_size=1, enable_guidance=False)
         sampled_unguided_denorm = denormalize_trajectories(sampled_unguided, mean, std)
 
+        model.config.enable_cbf_guidance = True
         # Sample guided
         sampled_guided = model.sample(target, action, history, batch_size=1, enable_guidance=True, guidance_gamma=config.guidance_gamma)
         sampled_guided_denorm = denormalize_trajectories(sampled_guided, mean, std)
@@ -103,4 +105,4 @@ if __name__ == "__main__":
         std = std.to(device)
 
     # Visualize samples
-    visualize_samples(model, mean, std, num_samples=3)
+    visualize_samples(model, mean, std, num_samples=30)

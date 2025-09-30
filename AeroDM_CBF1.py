@@ -33,7 +33,7 @@ class Config:
     action_dim = 5   # 5 maneuver styles
 
     # CBF Guidance parameters (from CoDiG paper)
-    enable_cbf_guidance = False  # Disabled by default; toggle for inference
+    enable_cbf_guidance = False
     guidance_gamma = 1.0  # Base gamma for barrier guidance
     obstacle_radius = 5.0  # Safe distance radius
     
@@ -214,12 +214,6 @@ def compute_barrier_and_grad(x, config):
     grad_x = torch.zeros_like(x)
     grad_x[:, :, 1:4] = grad_pos
     
-    # Print grad_V information
-    print(f"grad_V shape: {grad_x.shape}")
-    print(f"grad_V norm: {torch.norm(grad_x):.6f}")
-    print(f"grad_V min/max: {grad_x.min():.6f} / {grad_x.max():.6f}")
-    print(f"Number of unsafe points: {unsafe_mask.sum().item()}")
-    
     return V, grad_x
 
 # Diffusion process with linear noise schedule and CoDiG CBF guidance
@@ -282,7 +276,7 @@ class DiffusionProcess:
                 
                 # Compute barrier gradient ∇V
                 _, grad_V = compute_barrier_and_grad(x_t, self.config)  # (batch, seq, state_dim)
-
+                
                 # Guided score: s_guided = s_theta - γ_t ∇V
                 s_guided = s_theta - gamma_t.view(batch_size, 1, 1) * grad_V
                 
@@ -859,9 +853,6 @@ def train_improved_aerodm():
     model = model.to(device)
     model.config = config  # Attach config to model for access
     
-    # Explicitly disable CBF guidance during training
-    model.config.enable_cbf_guidance = False
-    
     # Move diffusion process tensors to device
     model.diffusion_process.betas = model.diffusion_process.betas.to(device)
     model.diffusion_process.alphas = model.diffusion_process.alphas.to(device)
@@ -956,9 +947,6 @@ def train_improved_aerodm():
     # Plot training losses
     plot_training_losses(losses)
     
-    # Enable CBF guidance for inference/testing
-    model.config.enable_cbf_guidance = True
-    
     # Test model performance with CBF
     test_model_performance(model, trajectories_norm, mean, std)
     
@@ -1015,4 +1003,5 @@ if __name__ == "__main__":
     # Train with enhanced method and CBF
     trained_model, losses, trajectories, mean, std = train_improved_aerodm()
     
-    print("Training completed! CBF guidance integrated for obstacle avoidance.")
+    print("Training completed! CBF guidance integrated for obstacle avoidance.") 
+    
