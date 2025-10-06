@@ -10,6 +10,7 @@ from typing import Optional, Tuple, List
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 
+
 # Configuration parameters based on the paper
 class Config:
     # Model dimensions
@@ -31,6 +32,10 @@ class Config:
     # Condition dimensions
     target_dim = 3  # p_t ∈ R^3
     action_dim = 5   # 5 maneuver styles
+
+    # Obstacle parameters
+    max_obstacles = 10  # Maximum number of obstacles to process
+    obstacle_feat_dim = 4  # [x, y, z, radius]
 
     # CBF Guidance parameters (from CoDiG paper)
     enable_cbf_guidance = True  # Disabled by default; toggle for inference
@@ -57,8 +62,94 @@ class PositionalEncoding(nn.Module):
     def forward(self, x):
         return x + self.pe[:x.size(0), :]
 
-# MLP embedding for conditional inputs
-class ConditionEmbedding(nn.Module):
+# Obstacle Encoder MLP Module
+class ObstacleEncoder(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        
+        # MLP for encoding individual obstacles
+        self.obstacle_mlp = nn.Sequential(
+            nn.Linear(config.obstacle_feat_dim, config.latent_dim // 2),
+            nn.ReLU(),
+            nn.Linear(config.latent_dim // 2, config.latent_dim),
+            nn.ReLU(),
+            nn.Linear(config.latent_dim, config.latent_dim)
+        )
+        
+        # Global obstacle context encoder
+        self.global_obstacle_encoder = nn.Sequential(
+            nn.Linear(config.latent_dim, config.latent_dim),
+            nn.ReLU(),
+            nn.Linear(config.latent_dim, config.latent_dim)
+        )
+        
+        # Learnable obstacle query for aggregation
+        self.obstacle_query = nn.Parameter(torch.randn(1, config.latent_dim))
+        
+    def forward(self, obstacles_data):
+        """
+        Encode obstacle information into a latent representation.
+        """
+        if obstacles_data is None or len(obstacles_data) == 0:
+            # No obstacles, return zero embedding
+            batch_size = 1
+            return torch.zeros(batch_size, self.config.latent_dim, device=next(self.parameters()).device)
+        
+        device = next(self.parameters()).device
+        batch_size = 1
+        
+        if isinstance(obstacles_data, list):
+            # Process list of obstacle dictionaries
+            obstacle_tensors = []
+            for obstacle in obstacles_data:
+                center = obstacle['center'].to(device)
+                radius = obstacle['radius']
+                if isinstance(radius, torch.Tensor):
+                    radius_tensor = radius.to(device)
+                else:
+                    radius_tensor = torch.tensor([radius], device=device)
+                obstacle_feat = torch.cat([center, radius_tensor])
+                obstacle_tensors.append(obstacle_feat)
+            
+            if len(obstacle_tensors) == 0:
+                return torch.zeros(batch_size, self.config.latent_dim, device=device)
+            
+            # Stack and pad to max_obstacles
+            obstacle_tensor = torch.stack(obstacle_tensors)
+            if len(obstacle_tensors) < self.config.max_obstacles:
+                padding = torch.zeros(self.config.max_obstacles - len(obstacle_tensors), 
+                                    self.config.obstacle_feat_dim, device=device)  # 在正确设备上创建padding
+                obstacle_tensor = torch.cat([obstacle_tensor, padding], dim=0)
+            elif len(obstacle_tensors) > self.config.max_obstacles:
+                obstacle_tensor = obstacle_tensor[:self.config.max_obstacles]
+            
+            obstacle_tensor = obstacle_tensor.unsqueeze(0)  # Add batch dimension
+            
+        else:
+            # Assume obstacles_data is already a tensor
+            obstacle_tensor = obstacles_data.to(device)  # 移动到模型设备
+            if obstacle_tensor.dim() == 2:
+                obstacle_tensor = obstacle_tensor.unsqueeze(0)
+            batch_size = obstacle_tensor.size(0)
+        
+        # Encode each obstacle individually
+        encoded_obstacles = self.obstacle_mlp(obstacle_tensor)
+        
+        # Global aggregation using attention mechanism
+        obstacle_query = self.obstacle_query.expand(batch_size, -1, -1)
+        
+        # Simple attention-based aggregation
+        attention_weights = F.softmax(torch.bmm(obstacle_query, encoded_obstacles.transpose(1, 2)), dim=-1)
+        aggregated_obstacle = torch.bmm(attention_weights, encoded_obstacles)
+        
+        # Final encoding
+        obstacle_emb = self.global_obstacle_encoder(aggregated_obstacle.squeeze(1))
+        
+        return obstacle_emb
+    
+# Enhanced Condition Embedding with Obstacle Information
+class EnhancedConditionEmbedding(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
@@ -83,19 +174,37 @@ class ConditionEmbedding(nn.Module):
             nn.SiLU(),
             nn.Linear(config.latent_dim, config.latent_dim)
         )
+        
+        # Obstacle embedding
+        self.obstacle_encoder = ObstacleEncoder(config)
+        
+        # Feature fusion layer
+        self.fusion_layer = nn.Sequential(
+            nn.Linear(config.latent_dim * 4, config.latent_dim * 2),
+            nn.ReLU(),
+            nn.Linear(config.latent_dim * 2, config.latent_dim)
+        )
 
-    def forward(self, t, target, action):
+    def forward(self, t, target, action, obstacles_data=None):
+        # Individual embeddings
         t_emb = self.t_embed(t.unsqueeze(-1).float())
         target_emb = self.target_embed(target)
         action_emb = self.action_embed(action)
         
-        # Combine conditions (simple addition as in the paper)
-        cond_emb = t_emb + target_emb + action_emb
+        # Obstacle embedding
+        if obstacles_data is not None:
+            obstacle_emb = self.obstacle_encoder(obstacles_data)
+        else:
+            obstacle_emb = torch.zeros_like(t_emb)
+        
+        # Combine all conditions with feature fusion
+        combined_emb = torch.cat([t_emb, target_emb, action_emb, obstacle_emb], dim=-1)
+        cond_emb = self.fusion_layer(combined_emb)
         
         return cond_emb
 
-# Diffusion Transformer (decoder only)
-class DiffusionTransformer(nn.Module):
+# Enhanced Diffusion Transformer with Obstacle Awareness
+class ObstacleAwareDiffusionTransformer(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
@@ -105,6 +214,9 @@ class DiffusionTransformer(nn.Module):
         
         # Positional encoding
         self.pos_encoding = PositionalEncoding(config.latent_dim)
+        
+        # Enhanced condition embedding with obstacle information
+        self.cond_embed = EnhancedConditionEmbedding(config)
         
         # Transformer layers
         transformer_layer = nn.TransformerDecoderLayer(
@@ -120,11 +232,8 @@ class DiffusionTransformer(nn.Module):
         
         # Output projection
         self.output_proj = nn.Linear(config.latent_dim, config.state_dim)
-        
-        # Condition embedding
-        self.cond_embed = ConditionEmbedding(config)
 
-    def forward(self, x, t, target, action, history=None):
+    def forward(self, x, t, target, action, history=None, obstacles_data=None):
         batch_size, seq_len, _ = x.shape
         
         # Project input to latent space
@@ -154,8 +263,8 @@ class DiffusionTransformer(nn.Module):
         # Generate causal mask
         memory_mask = self._generate_square_subsequent_mask(total_seq_len).to(x.device)
         
-        # Get condition embedding and expand to sequence length
-        cond_emb = self.cond_embed(t, target, action)
+        # Get enhanced condition embedding with obstacle information
+        cond_emb = self.cond_embed(t, target, action, obstacles_data)
         cond_seq = cond_emb.unsqueeze(1).expand(-1, total_seq_len, -1)
         
         # Add condition to transformer input
@@ -185,31 +294,41 @@ class DiffusionTransformer(nn.Module):
         mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
         return mask
 
-# CBF Barrier Function (from CoDiG: quadratic barrier for obstacle avoidance)
-def compute_barrier_and_grad(x, config, mean, std):
+# Enhanced CBF Barrier Function with Multiple Obstacles
+def compute_barrier_and_grad(x, config, mean, std, obstacles_data=None):
     """
     Compute barrier V and its gradient ∇V for the trajectory x.
-    Example: Quadratic barrier for spherical obstacle avoidance.
-    V = sum_τ max(0, r - ||pos_τ - center||)^2
+    Extended to handle multiple spherical obstacles.
+    V = sum_τ sum_obs max(0, r_obs - ||pos_τ - center_obs||)^2
     ∇V affects only position components (indices 1:4).
     """
     # Denormalize positions for barrier computation
     pos_denorm = x[:, :, 1:4] * std[0, 0, 1:4] + mean[0, 0, 1:4]
     
-    # Get obstacle center on the correct device
-    center = config.get_obstacle_center(x.device).unsqueeze(0).unsqueeze(0)  # (1,1,3)
-    r = config.obstacle_radius
+    batch_size, seq_len, _ = pos_denorm.shape
     
-    dist = torch.norm(pos_denorm - center, dim=-1, keepdim=False)  # (batch, seq_len)
-    excess = torch.clamp(r - dist, min=0.0)  # (batch, seq_len)
-    V = (excess ** 2).sum(dim=-1)  # (batch,)
-    
-    # Gradient: ∇_pos V_τ = -2 * excess_τ * (pos_τ - center) / dist_τ if dist < r else 0
+    # Initialize barrier value and gradient
+    V_total = torch.zeros(batch_size, device=x.device)
     grad_pos_denorm = torch.zeros_like(pos_denorm)
-    unsafe_mask = dist < r
-    if unsafe_mask.any():
-        direction = (pos_denorm - center) / (dist.unsqueeze(-1) + 1e-8)  # Unit vector away from center
-        grad_pos_denorm[unsafe_mask] = -2.0 * excess[unsafe_mask].unsqueeze(-1) * direction[unsafe_mask]
+    
+    # Process each obstacle
+    if obstacles_data is not None:
+        for obstacle in obstacles_data:
+            center = obstacle['center'].unsqueeze(0).unsqueeze(0).to(x.device)  # (1,1,3)
+            r = obstacle['radius']
+            
+            # Compute distance to obstacle center
+            dist = torch.norm(pos_denorm - center, dim=-1, keepdim=False)  # (batch, seq_len)
+            excess = torch.clamp(r - dist, min=0.0)  # (batch, seq_len)
+            
+            # Accumulate barrier value
+            V_total += (excess ** 2).sum(dim=-1)  # (batch,)
+            
+            # Compute gradient for this obstacle
+            unsafe_mask = dist < r
+            if unsafe_mask.any():
+                direction = (pos_denorm - center) / (dist.unsqueeze(-1) + 1e-8)  # Unit vector away from center
+                grad_pos_denorm[unsafe_mask] += -2.0 * excess[unsafe_mask].unsqueeze(-1) * direction[unsafe_mask]
     
     # Normalize gradient back to normalized space
     grad_pos = grad_pos_denorm / std[0, 0, 1:4]
@@ -222,12 +341,46 @@ def compute_barrier_and_grad(x, config, mean, std):
     print(f"grad_V shape: {grad_x.shape}")
     print(f"grad_V norm: {torch.norm(grad_x):.6f}")
     print(f"grad_V min/max: {grad_x.min():.6f} / {grad_x.max():.6f}")
-    print(f"Number of unsafe points: {unsafe_mask.sum().item()}")
+    print(f"Total barrier value V: {V_total.mean().item():.6f}")
     
-    return V, grad_x
+    return V_total, grad_x
 
-# Diffusion process with linear noise schedule and CoDiG CBF guidance
-class DiffusionProcess:
+def generate_random_obstacles(trajectory, num_obstacles_range=(0, 10), radius_range=(0.01, 0.30), device='cpu'):
+    """
+    Generate random spherical obstacles around the trajectory.
+    Returns list of obstacle dictionaries with center and radius.
+    """
+    num_obstacles = np.random.randint(num_obstacles_range[0], num_obstacles_range[1] + 1)
+    obstacles = []
+    
+    # Get trajectory bounds for obstacle placement
+    traj_pos = trajectory[:, 1:4].cpu().numpy()
+    min_bounds = traj_pos.min(axis=0)
+    max_bounds = traj_pos.max(axis=0)
+    
+    bounds_range = max_bounds - min_bounds
+    expanded_min = min_bounds - 0.5 * bounds_range
+    expanded_max = max_bounds + 0.5 * bounds_range
+    
+    # print(f"Generating {num_obstacles} random obstacles around trajectory")
+    
+    for i in range(num_obstacles):
+        center = np.random.uniform(expanded_min, expanded_max)
+        radius = np.random.uniform(radius_range[0], radius_range[1])
+        
+        obstacle = {
+            'center': torch.tensor(center, dtype=torch.float32, device=device),  
+            'radius': radius,
+            'id': i
+        }
+        obstacles.append(obstacle)
+        
+        # print(f"Obstacle {i}: center={center}, radius={radius:.3f}")
+    
+    return obstacles
+
+# Enhanced Diffusion Process with Obstacle-Aware Sampling
+class ObstacleAwareDiffusionProcess:
     def __init__(self, config):
         self.config = config
         self.num_timesteps = config.diffusion_steps
@@ -250,16 +403,17 @@ class DiffusionProcess:
         
         return x_t, noise
     
-    def p_sample(self, model, x_t, t, target, action, history=None, guidance_gamma=None, mean=None, std=None, plot_step=False, step_idx=0):
+    def p_sample(self, model, x_t, t, target, action, history=None, guidance_gamma=None, 
+                mean=None, std=None, plot_step=False, step_idx=0, obstacles_data=None):
         """
-        Reverse diffusion process: p(x_{t-1} | x_t) with optional CoDiG CBF guidance.
-        Vectorized over batch for efficiency.
+        Reverse diffusion process with obstacle-aware sampling.
         """
         batch_size = x_t.size(0)
         device = x_t.device
         
         with torch.no_grad():
-            pred_x0 = model(x_t, t, target, action, history)  # (batch, seq, state_dim)
+            # Model prediction with obstacle information
+            pred_x0 = model(x_t, t, target, action, history, obstacles_data)
             
             # Expand t for broadcasting
             t_exp = t.view(batch_size, 1, 1) if t.dim() == 1 else t.view(-1, 1, 1)
@@ -285,8 +439,8 @@ class DiffusionProcess:
                 # Compute γ_t (scheduled: increases with t for stronger late guidance)
                 gamma_t = guidance_gamma * (t_exp.squeeze(1).float() / self.num_timesteps)
                 
-                # Compute barrier gradient ∇V with normalization handling
-                V, grad_V = compute_barrier_and_grad(x_t, self.config, mean, std)  # (batch, seq, state_dim)
+                # Compute barrier gradient ∇V with multiple obstacles
+                V, grad_V = compute_barrier_and_grad(x_t, self.config, mean, std, obstacles_data)
                 barrier_info = {'V': V, 'grad_V': grad_V, 'gamma_t': gamma_t}
 
                 # Guided score: s_guided = s_theta - γ_t ∇V
@@ -306,7 +460,7 @@ class DiffusionProcess:
                 pred_x0_guided = (x_t - sqrt_one_minus_alpha_bar_t * ε_guided) / sqrt_alpha_bar_t
                 
                 if plot_step:
-                    self._plot_diffusion_step(x_t, pred_x0_guided, t, step_idx, barrier_info, is_final=True)
+                    self._plot_diffusion_step(x_t, pred_x0_guided, t, step_idx, barrier_info, is_final=True, obstacles_data=obstacles_data)
                 return pred_x0_guided
             
             # Variance (DDPM posterior variance)
@@ -321,28 +475,44 @@ class DiffusionProcess:
             x_prev = mu + sigma * z
             
             if plot_step:
-                self._plot_diffusion_step(x_t, x_prev, t, step_idx, barrier_info, is_final=False)
+                self._plot_diffusion_step(x_t, x_prev, t, step_idx, barrier_info, is_final=False, obstacles_data=obstacles_data)
             
             return x_prev
 
-    def _plot_diffusion_step(self, x_t, x_prev, t, step_idx, barrier_info=None, is_final=False):
-        """Plot the current diffusion step"""
+    def _plot_diffusion_step(self, x_t, x_prev, t, step_idx, barrier_info=None, is_final=False, obstacles_data=None):
+        """Plot the current diffusion step with obstacles"""
         fig = plt.figure(figsize=(20, 10))
         fig.suptitle(f'Reverse Diffusion Process - Step {step_idx} (t={t[0].item()})', fontsize=16)
         
-        # Extract position coordinates (assuming x_t has shape [batch, seq_len, state_dim])
-        x_t_pos = x_t[0, :, 1:4].cpu().numpy()  # positions at indices 1-3
+        # Extract position coordinates
+        x_t_pos = x_t[0, :, 1:4].cpu().numpy()
         x_prev_pos = x_prev[0, :, 1:4].cpu().numpy()
         
-        # 1. 3D trajectory evolution
+        # 1. 3D trajectory evolution with obstacles
         ax1 = fig.add_subplot(241, projection='3d')
         ax1.plot(x_t_pos[:, 0], x_t_pos[:, 1], x_t_pos[:, 2], 'r-', label='x_t (current)', linewidth=2, alpha=0.7)
         ax1.plot(x_prev_pos[:, 0], x_prev_pos[:, 1], x_prev_pos[:, 2], 'b-', label='x_prev (denoised)', linewidth=2, alpha=0.7)
+        
+        # Plot obstacles if available
+        if obstacles_data:
+            for obstacle in obstacles_data:
+                center = obstacle['center'].numpy()
+                radius = obstacle['radius']
+                
+                # Create sphere surface
+                u = np.linspace(0, 2 * np.pi, 10)
+                v = np.linspace(0, np.pi, 10)
+                x_sphere = center[0] + radius * np.outer(np.cos(u), np.sin(v))
+                y_sphere = center[1] + radius * np.outer(np.sin(u), np.sin(v))
+                z_sphere = center[2] + radius * np.outer(np.ones(np.size(u)), np.cos(v))
+                
+                ax1.plot_surface(x_sphere, y_sphere, z_sphere, alpha=0.3, color='red')
+        
         ax1.set_xlabel('X')
         ax1.set_ylabel('Y')
         ax1.set_zlabel('Z')
         ax1.legend()
-        ax1.set_title('3D Trajectory Evolution')
+        ax1.set_title('3D Trajectory Evolution with Obstacles')
         ax1.grid(True)
         
         # 2. Position components over time
@@ -438,25 +608,32 @@ class DiffusionProcess:
         if barrier_info is not None:
             print(f"CBF - Barrier V: {barrier_info['V'][0].item():.4f}, Gamma_t: {barrier_info['gamma_t'][0].item():.4f}")
 
-# Complete Aerobatic Diffusion Model (AeroDM)
-class AeroDM(nn.Module):
+# Enhanced AeroDM with Obstacle Awareness
+class EnhancedAeroDM(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
-        self.diffusion_model = DiffusionTransformer(config)
-        self.diffusion_process = DiffusionProcess(config)
+        self.diffusion_model = ObstacleAwareDiffusionTransformer(config)
+        self.diffusion_process = ObstacleAwareDiffusionProcess(config)
         self.mean = None
         self.std = None
+        self.obstacles_data = None
         
-    def forward(self, x_t, t, target, action, history=None):
-        return self.diffusion_model(x_t, t, target, action, history)
+    def forward(self, x_t, t, target, action, history=None, obstacles_data=None):
+        return self.diffusion_model(x_t, t, target, action, history, obstacles_data)
     
     def set_normalization_params(self, mean, std):
         """Set normalization parameters for CBF guidance"""
         self.mean = mean
         self.std = std
     
-    def sample(self, target, action, history=None, batch_size=1, enable_guidance=True, guidance_gamma=None, plot_all_steps=False):
+    def set_obstacles_data(self, obstacles_data):
+        """Set obstacles data for CBF guidance and model input"""
+        self.obstacles_data = obstacles_data
+        print(f"Set {len(obstacles_data)} obstacles for model input and CBF guidance")
+    
+    def sample(self, target, action, history=None, batch_size=1, enable_guidance=True, 
+               guidance_gamma=None, plot_all_steps=False):
         device = next(self.parameters()).device
         
         if target.size(0) != batch_size:
@@ -475,10 +652,13 @@ class AeroDM(nn.Module):
         x_t = torch.randn(batch_size, self.config.seq_len, self.config.state_dim).to(device)
         
         print(f"\n{'='*50}")
-        print("STARTING REVERSE DIFFUSION PROCESS")
+        print("STARTING OBSTACLE-AWARE REVERSE DIFFUSION PROCESS")
         print(f"Initial noise stats - Mean: {x_t.mean().item():.4f}, Std: {x_t.std().item():.4f}")
         print(f"Total steps: {self.config.diffusion_steps}")
         print(f"CBF Guidance: {enable_guidance}")
+        if self.obstacles_data:
+            print(f"Number of obstacles: {len(self.obstacles_data)}")
+            print(f"Obstacle information integrated into transformer")
         print(f"{'='*50}")
         
         # Reverse diffusion process
@@ -492,12 +672,13 @@ class AeroDM(nn.Module):
             
             x_t = self.diffusion_process.p_sample(
                 self.diffusion_model, x_t, t_batch, target, action, history, 
-                gamma, self.mean, self.std, plot_step=plot_step, step_idx=step_counter
+                gamma, self.mean, self.std, plot_step=plot_step, step_idx=step_counter,
+                obstacles_data=self.obstacles_data
             )
             step_counter += 1
         
         print(f"\n{'='*50}")
-        print("REVERSE DIFFUSION PROCESS COMPLETED")
+        print("OBSTACLE-AWARE REVERSE DIFFUSION PROCESS COMPLETED")
         print(f"Final trajectory stats - Mean: {x_t.mean().item():.4f}, Std: {x_t.std().item():.4f}")
         print(f"{'='*50}")
         
@@ -515,17 +696,17 @@ class ImprovedAeroDMLoss(nn.Module):
         pred_pos = pred_trajectory[:, :, 1:4]
         gt_pos = gt_trajectory[:, :, 1:4]
 
-        # 基础损失
+        # Basic loss
         x_loss = self.mse_loss(pred_pos[:, :, 0], gt_pos[:, :, 0])
         y_loss = self.mse_loss(pred_pos[:, :, 1], gt_pos[:, :, 1])
         z_loss = self.mse_loss(pred_pos[:, :, 2], gt_pos[:, :, 2])
 
-        # 最后一个时间步的所有维度损失
+        # All dimensional losses in the last time step
         last_x_loss = self.mse_loss(pred_pos[:, -1, 0], gt_pos[:, -1, 0])
         last_y_loss = self.mse_loss(pred_pos[:, -1, 1], gt_pos[:, -1, 1])
         last_z_loss = self.mse_loss(pred_pos[:, -1, 2], gt_pos[:, -1, 2])
 
-        # 组合损失，最后一个点权重更高
+        # Combination loss, with the last point having a higher weight
         position_loss = (x_loss + y_loss + z_loss + 
                          10.0 * (last_x_loss + last_y_loss + last_z_loss))  # 最后一个点权重加倍
         
@@ -719,50 +900,72 @@ def generate_history_segments(trajectories, history_len=5, device=None):
     
     return torch.stack(histories)
 
-def analyze_z_axis_performance(original, reconstructed, sampled):
-    """Specifically analyze z-axis learning performance"""
-    original_z = original[0, :, 3].detach().cpu().numpy()  # z is at index 3 (1: speed, 2-4: x,y,z)
-    reconstructed_z = reconstructed[0, :, 3].detach().cpu().numpy()
-    sampled_z = sampled[0, :, 3].detach().cpu().numpy()
+# Update the test function to demonstrate CBF guidance with diffusion visualization
+def test_enhanced_model_performance(model, trajectories_norm, mean, std, num_test_samples=3):
+    """Enhanced testing with obstacle-aware transformer"""
+    print("\nTesting enhanced obstacle-aware model performance...")
+    config = model.config
+    device = next(model.parameters()).device
     
-    z_error_recon = np.mean(np.abs(reconstructed_z - original_z))
-    z_error_sampled = np.mean(np.abs(sampled_z - original_z))
+    # Set normalization parameters
+    model.set_normalization_params(mean, std)
     
-    print(f"Z-axis Mean Absolute Error - Reconstruction: {z_error_recon:.4f}")
-    print(f"Z-axis Mean Absolute Error - Sampling: {z_error_sampled:.4f}")
-    
-    # Plot z-axis specifically
-    plt.figure(figsize=(12, 4))
-    
-    plt.subplot(131)
-    plt.plot(original_z, 'b-', label='Original Z', linewidth=2)
-    plt.plot(reconstructed_z, 'r--', label='Reconstructed Z', linewidth=2)
-    plt.plot(sampled_z, 'g-.', label='Sampled Z', linewidth=2)
-    plt.title('Z-axis Comparison')
-    plt.legend()
-    plt.grid(True)
-    
-    plt.subplot(132)
-    plt.plot(np.abs(reconstructed_z - original_z), 'r-', label='Recon Error', linewidth=2)
-    plt.plot(np.abs(sampled_z - original_z), 'g-', label='Sample Error', linewidth=2)
-    plt.title('Z-axis Absolute Error')
-    plt.legend()
-    plt.grid(True)
-    
-    plt.subplot(133)
-    plt.bar(['Reconstruction', 'Sampling'], [z_error_recon, z_error_sampled])
-    plt.title('Z-axis Mean Absolute Error')
-    plt.grid(True)
-    
-    plt.tight_layout()
-    plt.show()
+    model.eval()
+    with torch.no_grad():
+        for i in range(min(num_test_samples, trajectories_norm.shape[0])):
+            # Prepare test sample
+            full_traj = trajectories_norm[i:i+1]
+            target_norm = generate_target_waypoints(full_traj)
+            action = generate_action_styles(1, config.action_dim, device=device)
+            history = generate_history_segments(full_traj, config.history_len, device=device)
+            x_0 = full_traj[:, config.history_len:, :]
+            
+            # Denormalize for obstacle generation and plotting
+            x_0_denorm = denormalize_trajectories(x_0, mean, std)
+            target_denorm = target_norm * std[0, 0, 1:4] + mean[0, 0, 1:4]
+            
+            # Generate random obstacles
+            obstacles = generate_random_obstacles(x_0_denorm[0], num_obstacles_range=(0, 10), radius_range=(0.05, 0.30))
 
-def plot_circular_trajectory_comparison(original, reconstructed, sampled, history=None, target=None, title="Circular Trajectory Comparison", obstacle_center=None, obstacle_radius=None):
-    """Enhanced visualization with history, target, and obstacle (for CBF demo)"""
+            # Set obstacles data for model input
+            model.set_obstacles_data(obstacles)
+            
+            print(f"\n{'='*60}")
+            print(f"ENHANCED TEST SAMPLE {i+1}")
+            print(f"Generated {len(obstacles)} random obstacles")
+            print(f"Obstacle information integrated into transformer via MLP encoder")
+            print(f"{'='*60}")
+            
+            # Sample with obstacle-aware transformer and CBF guidance
+            sampled_guided = model.sample(target_norm, action, history, batch_size=1, 
+                                        enable_guidance=True, guidance_gamma=config.guidance_gamma,
+                                        plot_all_steps=False)
+            
+            # For comparison, sample without guidance but with obstacle awareness
+            sampled_unguided = model.sample(target_norm, action, history, batch_size=1, 
+                                          enable_guidance=False, plot_all_steps=False)
+            
+            # Denormalize results
+            sampled_guided_denorm = denormalize_trajectories(sampled_guided, mean, std)
+            sampled_unguided_denorm = denormalize_trajectories(sampled_unguided, mean, std)
+            history_denorm = denormalize_trajectories(history, mean, std)
+            
+            # Enhanced visualization with obstacles
+            plot_enhanced_trajectory_comparison(
+                x_0_denorm, sampled_unguided_denorm, sampled_guided_denorm, 
+                history=history_denorm, target=target_denorm, obstacles=obstacles,
+                title=f"Enhanced Obstacle-Aware Test Sample {i+1}\n(Transformer + CBF Guidance)"
+            )
+
+    model.train()
+
+def plot_enhanced_trajectory_comparison(original, reconstructed, sampled, history=None, 
+                                      target=None, obstacles=None, title="Enhanced Trajectory Comparison"):
+    """Enhanced visualization with multiple obstacles and trajectory comparison"""
     fig = plt.figure(figsize=(20, 15))
     fig.suptitle(title, fontsize=16)
     
-    # Extract position coordinates
+    # Extract position coordinates from tensors
     original_pos = original[0, :, 1:4].detach().cpu().numpy()
     reconstructed_pos = reconstructed[0, :, 1:4].detach().cpu().numpy()
     sampled_pos = sampled[0, :, 1:4].detach().cpu().numpy()
@@ -776,7 +979,7 @@ def plot_circular_trajectory_comparison(original, reconstructed, sampled, histor
     if target is not None:
         target_pos = target[0, :].detach().cpu().numpy()  # target is [x, y, z]
     
-    # 1. 3D trajectory plot with history, target, and obstacle
+    # 1. 3D trajectory plot with history, target, and multiple obstacles
     ax1 = fig.add_subplot(341, projection='3d')
     
     # Plot history (if available)
@@ -787,7 +990,6 @@ def plot_circular_trajectory_comparison(original, reconstructed, sampled, histor
     # Plot main trajectories
     ax1.plot(original_pos[:, 0], original_pos[:, 1], original_pos[:, 2], 
              'b-', label='Original Trajectory', linewidth=3, alpha=0.8)
-    
     ax1.plot(reconstructed_pos[:, 0], reconstructed_pos[:, 1], reconstructed_pos[:, 2], 
              'r.-', label='Reconstructed Trajectory', linewidth=2, alpha=0.8)
     ax1.plot(sampled_pos[:, 0], sampled_pos[:, 1], sampled_pos[:, 2], 
@@ -798,26 +1000,33 @@ def plot_circular_trajectory_comparison(original, reconstructed, sampled, histor
         ax1.scatter(target_pos[0], target_pos[1], target_pos[2], 
                    c='yellow', s=200, marker='*', label='Target Waypoint', edgecolors='black', linewidth=2)
     
-    # Plot obstacle (if provided) - FIXED: Use scatter for obstacle to avoid legend issues
-    if obstacle_center is not None and obstacle_radius is not None:
-        # Create a proxy artist for the legend
-        from matplotlib.patches import Circle
-        from mpl_toolkits.mplot3d.art3d import Patch3DCollection
-        
-        # Plot obstacle as a transparent sphere
-        u = np.linspace(0, 2 * np.pi, 20)
-        v = np.linspace(0, np.pi, 10)
-        obs_x = obstacle_center[0] + obstacle_radius * np.outer(np.cos(u), np.sin(v))
-        obs_y = obstacle_center[1] + obstacle_radius * np.outer(np.sin(u), np.sin(v))
-        obs_z = obstacle_center[2] + obstacle_radius * np.outer(np.ones(np.size(u)), np.cos(v))
-        
-        # Create surface plot but don't add to legend directly
-        obstacle_surface = ax1.plot_surface(obs_x, obs_y, obs_z, alpha=0.3, color='red')
-        
-        # Create a proxy artist for the legend
-        proxy_artist = plt.Rectangle((0, 0), 1, 1, fc='red', alpha=0.3)
+    # Plot multiple obstacles (if provided)
+    obstacle_proxies = []
+    if obstacles is not None and len(obstacles) > 0:
+        for i, obstacle in enumerate(obstacles):
+            center = obstacle['center'].cpu().numpy() if hasattr(obstacle['center'], 'cpu') else obstacle['center']
+            radius = obstacle['radius']
+            
+            # Create sphere surface for 3D obstacle visualization
+            u = np.linspace(0, 2 * np.pi, 15)
+            v = np.linspace(0, np.pi, 10)
+            obs_x = center[0] + radius * np.outer(np.cos(u), np.sin(v))
+            obs_y = center[1] + radius * np.outer(np.sin(u), np.sin(v))
+            obs_z = center[2] + radius * np.outer(np.ones(np.size(u)), np.cos(v))
+            
+            # Use different colors for multiple obstacles
+            colors = ['red', 'orange', 'purple', 'brown', 'pink']
+            color = colors[i % len(colors)]
+            # alpha = 0.3 + (i * 0.1)  # Vary transparency
+            alpha = 0.6
+            
+            ax1.plot_surface(obs_x, obs_y, obs_z, alpha=alpha, color=color)
+            
+            # Create proxy artist for legend (only once)
+            if i == 0:
+                obstacle_proxies.append(plt.Rectangle((0, 0), 1, 1, fc=color, alpha=alpha, label=f'Obstacles'))
     
-    # Create legend with custom handling for obstacle
+    # Create legend with custom handling
     legend_handles = [
         plt.Line2D([0], [0], color='m', linewidth=4, marker='o', markersize=4, label='History'),
         plt.Line2D([0], [0], color='b', linewidth=3, label='Original Trajectory'),
@@ -827,71 +1036,95 @@ def plot_circular_trajectory_comparison(original, reconstructed, sampled, histor
                   markeredgecolor='black', markeredgewidth=2, label='Target Waypoint')
     ]
     
-    if obstacle_center is not None and obstacle_radius is not None:
-        legend_handles.append(proxy_artist)
-    
+    legend_handles.extend(obstacle_proxies)
     ax1.legend(handles=legend_handles)
     
     ax1.set_xlabel('X')
     ax1.set_ylabel('Y')
     ax1.set_zlabel('Z')
-    ax1.set_title('3D Trajectory Comparison with History, Target & Obstacle')
+    ax1.set_title('3D Trajectory with Multiple Obstacles')
     ax1.grid(True)
     
-    # 2. X-Y projection
+    # 2. X-Y projection with obstacles
     ax2 = fig.add_subplot(342)
     if history_pos is not None:
         ax2.plot(history_pos[:, 0], history_pos[:, 1], 'm-', label='History', linewidth=4, alpha=0.8, marker='o', markersize=4)
     ax2.plot(original_pos[:, 0], original_pos[:, 1], 'b-', label='Original', linewidth=3, alpha=0.8)
     ax2.plot(reconstructed_pos[:, 0], reconstructed_pos[:, 1], 'r.-', label='Reconstructed', linewidth=2, alpha=0.8)
     ax2.plot(sampled_pos[:, 0], sampled_pos[:, 1], 'g.-', label='Sampled', linewidth=2, alpha=0.8)
+    
     if target_pos is not None:
         ax2.scatter(target_pos[0], target_pos[1], c='yellow', s=200, marker='*', label='Target', edgecolors='black', linewidth=2)
-    if obstacle_center is not None and obstacle_radius is not None:
-        circle = plt.Circle((obstacle_center[0], obstacle_center[1]), obstacle_radius, color='red', alpha=0.3, label='Obstacle')
-        ax2.add_patch(circle)
+    
+    # Plot obstacles in 2D projection
+    if obstacles is not None:
+        colors = ['red', 'orange', 'purple', 'brown', 'pink']
+        for i, obstacle in enumerate(obstacles):
+            center = obstacle['center'].cpu().numpy() if hasattr(obstacle['center'], 'cpu') else obstacle['center']
+            radius = obstacle['radius']
+            color = colors[i % len(colors)]
+            circle = plt.Circle((center[0], center[1]), radius, color=color, alpha=0.3, 
+                              label=f'Obstacle {i+1}' if i < 3 else "")
+            ax2.add_patch(circle)
+    
     ax2.set_xlabel('X')
     ax2.set_ylabel('Y')
     ax2.legend()
-    ax2.set_title('X-Y Projection')
+    ax2.set_title('X-Y Projection with Obstacles')
     ax2.grid(True)
     ax2.axis('equal')
     
-    # 3. X-Z projection
+    # 3. X-Z projection with obstacles
     ax3 = fig.add_subplot(343)
     if history_pos is not None:
         ax3.plot(history_pos[:, 0], history_pos[:, 2], 'm-', label='History', linewidth=4, alpha=0.8, marker='o', markersize=4)
     ax3.plot(original_pos[:, 0], original_pos[:, 2], 'b-', label='Original', linewidth=3, alpha=0.8)
     ax3.plot(reconstructed_pos[:, 0], reconstructed_pos[:, 2], 'r.-', label='Reconstructed', linewidth=2, alpha=0.8)
     ax3.plot(sampled_pos[:, 0], sampled_pos[:, 2], 'g.-', label='Sampled', linewidth=2, alpha=0.8)
+    
     if target_pos is not None:
         ax3.scatter(target_pos[0], target_pos[2], c='yellow', s=200, marker='*', label='Target', edgecolors='black', linewidth=2)
-    if obstacle_center is not None and obstacle_radius is not None:
-        circle = plt.Circle((obstacle_center[0], obstacle_center[2]), obstacle_radius, color='red', alpha=0.3, label='Obstacle')
-        ax3.add_patch(circle)
+    
+    # Plot obstacles in X-Z projection
+    if obstacles is not None:
+        for i, obstacle in enumerate(obstacles):
+            center = obstacle['center'].cpu().numpy() if hasattr(obstacle['center'], 'cpu') else obstacle['center']
+            radius = obstacle['radius']
+            color = colors[i % len(colors)]
+            circle = plt.Circle((center[0], center[2]), radius, color=color, alpha=0.3)
+            ax3.add_patch(circle)
+    
     ax3.set_xlabel('X')
     ax3.set_ylabel('Z')
     ax3.legend()
-    ax3.set_title('X-Z Projection')
+    ax3.set_title('X-Z Projection with Obstacles')
     ax3.grid(True)
     ax3.axis('equal')
     
-    # 4. Y-Z projection
+    # 4. Y-Z projection with obstacles
     ax4 = fig.add_subplot(344)
     if history_pos is not None:
         ax4.plot(history_pos[:, 1], history_pos[:, 2], 'm-', label='History', linewidth=4, alpha=0.8, marker='o', markersize=4)
     ax4.plot(original_pos[:, 1], original_pos[:, 2], 'b-', label='Original', linewidth=3, alpha=0.8)
     ax4.plot(reconstructed_pos[:, 1], reconstructed_pos[:, 2], 'r.-', label='Reconstructed', linewidth=2, alpha=0.8)
     ax4.plot(sampled_pos[:, 1], sampled_pos[:, 2], 'g.-', label='Sampled', linewidth=2, alpha=0.8)
+    
     if target_pos is not None:
         ax4.scatter(target_pos[1], target_pos[2], c='yellow', s=200, marker='*', label='Target', edgecolors='black', linewidth=2)
-    if obstacle_center is not None and obstacle_radius is not None:
-        circle = plt.Circle((obstacle_center[1], obstacle_center[2]), obstacle_radius, color='red', alpha=0.3, label='Obstacle')
-        ax4.add_patch(circle)
+    
+    # Plot obstacles in Y-Z projection
+    if obstacles is not None:
+        for i, obstacle in enumerate(obstacles):
+            center = obstacle['center'].cpu().numpy() if hasattr(obstacle['center'], 'cpu') else obstacle['center']
+            radius = obstacle['radius']
+            color = colors[i % len(colors)]
+            circle = plt.Circle((center[1], center[2]), radius, color=color, alpha=0.3)
+            ax4.add_patch(circle)
+    
     ax4.set_xlabel('Y')
     ax4.set_ylabel('Z')
     ax4.legend()
-    ax4.set_title('Y-Z Projection')
+    ax4.set_title('Y-Z Projection with Obstacles')
     ax4.grid(True)
     ax4.axis('equal')
     
@@ -942,38 +1175,71 @@ def plot_circular_trajectory_comparison(original, reconstructed, sampled, histor
     ax8.set_title('Speed Over Time')
     ax8.grid(True)
     
-    # 9. Error analysis
+    # 9. Obstacle distance analysis
+    ax9 = fig.add_subplot(349)
+    if obstacles is not None and len(obstacles) > 0:
+        # Calculate minimum distance to any obstacle for each trajectory
+        min_dist_original = []
+        min_dist_sampled = []
+        
+        for t in range(original_pos.shape[0]):
+            # For original trajectory
+            dists_original = [np.linalg.norm(original_pos[t] - obstacle['center'].cpu().numpy()) - obstacle['radius'] 
+                            for obstacle in obstacles]
+            min_dist_original.append(min(dists_original))
+            
+            # For sampled trajectory
+            dists_sampled = [np.linalg.norm(sampled_pos[t] - obstacle['center'].cpu().numpy()) - obstacle['radius'] 
+                           for obstacle in obstacles]
+            min_dist_sampled.append(min(dists_sampled))
+        
+        ax9.plot(time_steps, min_dist_original, 'b-', label='Original Min Distance', linewidth=2)
+        ax9.plot(time_steps, min_dist_sampled, 'g-', label='Sampled Min Distance', linewidth=2)
+        ax9.axhline(y=0, color='r', linestyle='--', alpha=0.5, label='Collision Threshold')
+        ax9.set_xlabel('Time Step')
+        ax9.set_ylabel('Distance to Nearest Obstacle')
+        ax9.legend()
+        ax9.set_title('Obstacle Avoidance Performance')
+        ax9.grid(True)
+    else:
+        ax9.text(0.5, 0.5, 'No Obstacles\nAvailable', ha='center', va='center', transform=ax9.transAxes)
+        ax9.set_title('Obstacle Distance Analysis')
+    
+    # 10. Error analysis
     recon_error = np.linalg.norm(reconstructed_pos - original_pos, axis=1)
     sampled_error = np.linalg.norm(sampled_pos - original_pos, axis=1)
     
-    ax9 = fig.add_subplot(349)
-    ax9.plot(time_steps, recon_error, 'r-', label='Reconstruction Error', linewidth=2)
-    ax9.plot(time_steps, sampled_error, 'g-', label='Sampling Error', linewidth=2)
-    ax9.set_xlabel('Time Step')
-    ax9.set_ylabel('Position Error')
-    ax9.legend()
-    ax9.set_title('Position Error Over Time')
-    ax9.grid(True)
-    
-    # 10. Cumulative error
     ax10 = fig.add_subplot(3,4,10)
-    ax10.plot(time_steps, np.cumsum(recon_error), 'r-', label='Cumulative Recon Error', linewidth=2)
-    ax10.plot(time_steps, np.cumsum(sampled_error), 'g-', label='Cumulative Sample Error', linewidth=2)
+    ax10.plot(time_steps, recon_error, 'r-', label='Reconstruction Error', linewidth=2)
+    ax10.plot(time_steps, sampled_error, 'g-', label='Sampling Error', linewidth=2)
     ax10.set_xlabel('Time Step')
-    ax10.set_ylabel('Cumulative Error')
+    ax10.set_ylabel('Position Error')
     ax10.legend()
-    ax10.set_title('Cumulative Position Error')
+    ax10.set_title('Position Error Over Time')
     ax10.grid(True)
     
-    # 11. Error distribution
+    # 11. Obstacle information summary
     ax11 = fig.add_subplot(3,4,11)
-    errors = [recon_error, sampled_error]
-    ax11.boxplot(errors, labels=['Reconstruction', 'Sampling'])
-    ax11.set_ylabel('Position Error')
-    ax11.set_title('Error Distribution')
-    ax11.grid(True)
+    if obstacles is not None:
+        obstacle_info = []
+        for i, obstacle in enumerate(obstacles):
+            center = obstacle['center'].cpu().numpy() if hasattr(obstacle['center'], 'cpu') else obstacle['center']
+            radius = obstacle['radius']
+            obstacle_info.append(f'Obs {i+1}: ({center[0]:.1f}, {center[1]:.1f}, {center[2]:.1f})\nR: {radius:.1f}')
+        
+        ax11.axis('off')
+        obstacle_text = f"Obstacles: {len(obstacles)}\n\n" + "\n".join(obstacle_info[:5])  # Show first 5
+        if len(obstacles) > 5:
+            obstacle_text += f"\n... and {len(obstacles) - 5} more"
+        ax11.text(0.1, 0.9, obstacle_text, transform=ax11.transAxes, fontsize=10, 
+                 verticalalignment='top', bbox=dict(boxstyle='round', facecolor='lightgray', alpha=0.7))
+    else:
+        ax11.axis('off')
+        ax11.text(0.5, 0.5, 'No Obstacles', ha='center', va='center', transform=ax11.transAxes,
+                 bbox=dict(boxstyle='round', facecolor='lightgray', alpha=0.7))
+    ax11.set_title('Obstacle Information')
     
-    # 12. Summary statistics
+    # 12. Performance statistics
     ax12 = fig.add_subplot(3,4,12)
     stats_data = [
         np.mean(recon_error), np.std(recon_error), np.max(recon_error),
@@ -984,7 +1250,7 @@ def plot_circular_trajectory_comparison(original, reconstructed, sampled, histor
     ax12.set_xticks(range(len(stats_data)))
     ax12.set_xticklabels(stats_labels, rotation=45)
     ax12.set_ylabel('Error Value')
-    ax12.set_title('Error Statistics')
+    ax12.set_title('Performance Statistics')
     
     # Add value labels on bars
     for bar, value in zip(bars, stats_data):
@@ -994,85 +1260,284 @@ def plot_circular_trajectory_comparison(original, reconstructed, sampled, histor
     plt.tight_layout()
     plt.show()
     
-    # Print detailed error analysis
-    print("\n=== Detailed Error Analysis ===")
+    # Print detailed analysis
+    print("\n=== Enhanced Trajectory Analysis ===")
     print(f"Reconstruction - Total Error: {np.mean(recon_error):.4f} ± {np.std(recon_error):.4f}")
     print(f"Sampling - Total Error: {np.mean(sampled_error):.4f} ± {np.std(sampled_error):.4f}")
+    
+    if obstacles is not None and len(obstacles) > 0:
+        # Calculate collision statistics
+        collisions_original = sum(1 for dist in min_dist_original if dist < 0)
+        collisions_sampled = sum(1 for dist in min_dist_sampled if dist < 0)
+        print(f"Original Trajectory - Collisions: {collisions_original}/{len(min_dist_original)} time steps")
+        print(f"Sampled Trajectory - Collisions: {collisions_sampled}/{len(min_dist_sampled)} time steps")
+        print(f"Number of obstacles: {len(obstacles)}")
 
-# Update the test function to demonstrate CBF guidance with diffusion visualization
-def test_model_performance(model, trajectories_norm, mean, std, num_test_samples=3):
-    """Enhanced testing with history, target, and CBF guidance visualization"""
-    print("\nTesting model performance with CBF guidance...")
-    config = model.config  # Access config from model
-    device = next(model.parameters()).device
+# Enhanced training function
+# def train_enhanced_aerodm():
+#     """Enhanced training with obstacle-aware transformer"""
+#     config = Config()
+#     model = EnhancedAeroDM(config)
     
-    # Set normalization parameters for CBF guidance
-    model.set_normalization_params(mean, std)
+#     # Set device
+#     device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+#     model = model.to(device)
+#     model.config = config
     
-    model.eval()
-    with torch.no_grad():
-        for i in range(min(num_test_samples, trajectories_norm.shape[0])):
-            # Prepare test sample
-            full_traj = trajectories_norm[i:i+1]  # (1, 65, 10) full trajectory
-            target_norm = generate_target_waypoints(full_traj)  # From full trajectory end
-            action = generate_action_styles(1, config.action_dim, device=device)
-            history = generate_history_segments(full_traj, config.history_len, device=device)  # First 5 steps
-            x_0 = full_traj[:, config.history_len:, :]  # Last 60 steps (prediction sequence)
+#     # Disable CBF guidance during training (obstacle info still goes to transformer)
+#     model.config.enable_cbf_guidance = False
+    
+#     # Move diffusion process tensors to device
+#     model.diffusion_process.betas = model.diffusion_process.betas.to(device)
+#     model.diffusion_process.alphas = model.diffusion_process.alphas.to(device)
+#     model.diffusion_process.alpha_bars = model.diffusion_process.alpha_bars.to(device)
+    
+#     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+#     criterion = ImprovedAeroDMLoss(config)
+    
+#     # Training parameters
+#     num_epochs = 50
+#     batch_size = 8
+#     num_trajectories = 20000
+    
+#     print("Generating training data with obstacle-aware transformer...")
+#     trajectories = generate_enhanced_circular_trajectories(
+#         num_trajectories=num_trajectories,
+#         seq_len=config.seq_len + config.history_len
+#     )
+    
+#     # Normalize trajectories
+#     trajectories_norm, mean, std = normalize_trajectories(trajectories)
+#     trajectories_norm = trajectories_norm.to(device)
+#     mean = mean.to(device)
+#     std = std.to(device)
+    
+#     # Store losses
+#     losses = {'total': [], 'position': [], 'vel': []}
+    
+#     print("Starting enhanced training with obstacle-aware transformer...")
+#     for epoch in range(num_epochs):
+#         epoch_total_loss = 0
+#         epoch_position_loss = 0
+#         epoch_vel_loss = 0
+#         num_batches = 0
+        
+#         indices = torch.randperm(num_trajectories)
+#         for i in range(0, num_trajectories, batch_size):
+#             if i + batch_size > num_trajectories:
+#                 actual_batch_size = num_trajectories - i
+#             else:
+#                 actual_batch_size = batch_size
+                
+#             batch_indices = indices[i:i+actual_batch_size]
+#             full_traj = trajectories_norm[batch_indices]
+#             target = generate_target_waypoints(full_traj)
+#             action = generate_action_styles(actual_batch_size, config.action_dim, device=device)
+#             history = generate_history_segments(full_traj, config.history_len, device=device)
+#             x_0 = full_traj[:, config.history_len:, :]
             
-            # Denormalize target for plotting only (model uses normalized)
-            target_denorm = target_norm * std[0, 0, 1:4] + mean[0, 0, 1:4]  # Position dims only
+#             # Generate random obstacles for this batch (for transformer input)
+#             obstacles_for_batch = []
+#             for j in range(actual_batch_size):
+#                 traj_denorm = denormalize_trajectories(full_traj[j:j+1], mean, std)
+#                 obstacles = generate_random_obstacles(traj_denorm[0], num_obstacles_range=(0, 15), radius_range=(0.5, 1.30), device=device)            
+#                 obstacles_for_batch.append(obstacles)
             
-            print(f"\n{'='*60}")
-            print(f"TEST SAMPLE {i+1}")
-            print(f"{'='*60}")
+#             # Sample diffusion time step
+#             t = torch.randint(0, config.diffusion_steps, (actual_batch_size,), device=device)
             
-            # Sample with CBF guidance and plot all diffusion steps
-            sampled_guided = model.sample(target_norm, action, history, batch_size=1, 
-                                        enable_guidance=True, guidance_gamma=config.guidance_gamma,
-                                        plot_all_steps=True)  # Set to True to plot every step
+#             # Forward diffusion
+#             noisy_x, noise = model.diffusion_process.q_sample(x_0, t)
             
-            # For comparison, also sample without guidance (no plots)
-            sampled_unguided = model.sample(target_norm, action, history, batch_size=1, 
-                                          enable_guidance=False, plot_all_steps=False)
+#             # Model prediction with obstacle information - 修改这里：逐个处理batch中的每个样本
+#             pred_x0_list = []
+#             for j in range(actual_batch_size):
+#                 # 对batch中的每个样本单独调用模型
+#                 pred_x0_j = model(
+#                     noisy_x[j:j+1], 
+#                     t[j:j+1], 
+#                     target[j:j+1], 
+#                     action[j:j+1], 
+#                     history[j:j+1] if history is not None else None,
+#                     obstacles_for_batch[j]  # 传递单个样本的障碍物列表
+#                 )
+#                 pred_x0_list.append(pred_x0_j)
             
-            # Denormalize others
-            sampled_guided_denorm = denormalize_trajectories(sampled_guided, mean, std)
-            sampled_unguided_denorm = denormalize_trajectories(sampled_unguided, mean, std)
-            x_0_denorm = denormalize_trajectories(x_0, mean, std)
-            history_denorm = denormalize_trajectories(history, mean, std)
+#             # 合并预测结果
+#             pred_x0 = torch.cat(pred_x0_list, dim=0)
             
-            # Get obstacle center and normalize it for CBF computation
-            obstacle_center_original = config.get_obstacle_center('cpu').numpy()
-            obstacle_center_norm = normalize_obstacle(obstacle_center_original, mean, std)
+#             # Calculate loss
+#             total_loss, position_loss, vel_loss = criterion(pred_x0, x_0)
             
-            print(f"Original obstacle center: {obstacle_center_original}")
-            print(f"Normalized obstacle center: {obstacle_center_norm}")
+#             # Backward propagation
+#             optimizer.zero_grad()
+#             total_loss.backward()
+#             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+#             optimizer.step()
             
-            # For visualization, use denormalized obstacle
-            obstacle_center_viz = obstacle_center_original
+#             epoch_total_loss += total_loss.item()
+#             epoch_position_loss += position_loss.item()
+#             epoch_vel_loss += vel_loss.item()
+#             num_batches += 1
+        
+#         # Calculate average loss
+#         if num_batches > 0:
+#             avg_total = epoch_total_loss / num_batches
+#             avg_position = epoch_position_loss / num_batches
+#             avg_vel = epoch_vel_loss / num_batches
             
-            # Visualize: unguided vs guided, with obstacle
-            plot_circular_trajectory_comparison(
-                x_0_denorm, sampled_unguided_denorm, sampled_guided_denorm, 
-                history=history_denorm, target=target_denorm,
-                title=f"CBF Guidance Test Sample {i+1}\n(Guided: Green avoids Red Obstacle)",
-                obstacle_center=obstacle_center_viz,
-                obstacle_radius=config.obstacle_radius
+#             losses['total'].append(avg_total)
+#             losses['position'].append(avg_position)
+#             losses['vel'].append(avg_vel)
+        
+#         if epoch % 5 == 0:
+#             print(f"Epoch {epoch}: Total Loss: {avg_total:.4f}, "
+#                   f"Position: {avg_position:.4f}, Vel: {avg_vel:.4f}")
+#         if avg_position < 0.02:
+#             print("Early stopping as position loss is below threshold.")
+#             break
+
+#     # Plot training losses
+#     plot_training_losses(losses)
+    
+#     # Enable CBF guidance for inference
+#     model.config.enable_cbf_guidance = True
+    
+#     # Test enhanced model
+#     test_enhanced_model_performance(model, trajectories_norm, mean, std, num_test_samples=30)
+    
+#     torch.save({
+#         'model_state_dict': model.state_dict(),
+#         'optimizer_state_dict': optimizer.state_dict(),
+#         'epoch': epoch,
+#         'loss': losses,
+#         'mean': mean,
+#         'std': std
+#     }, "model/enhanced_obstacle_aware_aerodm.pth")
+
+#     return model, losses, trajectories, mean, std
+
+# Main execution
+# if __name__ == "__main__":
+#     print("Training Enhanced Obstacle-Aware AeroDM with Transformer Integration...")
+    
+#     # Train with enhanced obstacle-aware model
+#     trained_model, losses, trajectories, mean, std = train_enhanced_aerodm()
+    
+#     print("Training completed! Obstacle information integrated into transformer via MLP encoder.")
+
+
+# Enhanced Loss Function with Obstacle Distance Term
+class ObstacleAwareAeroDMLoss(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.mse_loss = nn.MSELoss()
+        self.obstacle_weight = 10.0  # Weight for obstacle distance term
+        
+    def compute_obstacle_distance_loss(self, pred_trajectory, obstacles_data, mean, std):
+        """
+        Compute obstacle distance loss to encourage obstacle avoidance.
+        Loss = sum over obstacles and time steps of max(0, safety_margin - distance)^2
+        """
+        if not obstacles_data or len(obstacles_data) == 0:
+            return torch.tensor(0.0, device=pred_trajectory.device)
+        
+        batch_size, seq_len, _ = pred_trajectory.shape
+        obstacle_loss = torch.tensor(0.0, device=pred_trajectory.device)
+        
+        # Denormalize positions for distance computation
+        pred_pos_denorm = pred_trajectory[:, :, 1:4] * std[0, 0, 1:4] + mean[0, 0, 1:4]
+        
+        for batch_idx in range(batch_size):
+            # Get obstacles for this batch sample
+            if isinstance(obstacles_data, list):
+                obstacles = obstacles_data[batch_idx] if batch_idx < len(obstacles_data) else []
+            else:
+                obstacles = obstacles_data
+                
+            for obstacle in obstacles:
+                center = obstacle['center'].to(pred_trajectory.device)
+                radius = obstacle['radius']
+                safety_margin = radius * 1.2  # Add 20% safety margin
+                
+                # Compute distances from trajectory to obstacle center
+                distances = torch.norm(pred_pos_denorm[batch_idx] - center, dim=1)
+                
+                # Effective distance considering obstacle radius
+                effective_distances = distances - radius
+                
+                # Penalize trajectories that get too close to obstacles
+                closeness_penalty = torch.clamp(safety_margin - effective_distances, min=0.0)
+                obstacle_loss += torch.sum(closeness_penalty ** 2)
+        
+        # Normalize by batch size and sequence length
+        if batch_size > 0 and len(obstacles_data) > 0:
+            obstacle_loss = obstacle_loss / (batch_size * seq_len)
+            
+        return obstacle_loss
+    
+    def forward(self, pred_trajectory, gt_trajectory, obstacles_data=None, mean=None, std=None):
+        # Separate position dimensions for balanced learning
+        pred_pos = pred_trajectory[:, :, 1:4]
+        gt_pos = gt_trajectory[:, :, 1:4]
+
+        # Basic loss components
+        x_loss = self.mse_loss(pred_pos[:, :, 0], gt_pos[:, :, 0])
+        y_loss = self.mse_loss(pred_pos[:, :, 1], gt_pos[:, :, 1])
+        z_loss = self.mse_loss(pred_pos[:, :, 2], gt_pos[:, :, 2])
+
+        # Last time step losses with higher weight
+        last_x_loss = self.mse_loss(pred_pos[:, -1, 0], gt_pos[:, -1, 0])
+        last_y_loss = self.mse_loss(pred_pos[:, -1, 1], gt_pos[:, -1, 1])
+        last_z_loss = self.mse_loss(pred_pos[:, -1, 2], gt_pos[:, -1, 2])
+
+        # Combined position loss
+        position_loss = (x_loss + y_loss + z_loss + 
+                         10.0 * (last_x_loss + last_y_loss + last_z_loss))
+        
+        # Velocity regularization
+        pred_vel = pred_pos[:, 1:, :] - pred_pos[:, :-1, :]
+        gt_vel = gt_pos[:, 1:, :] - gt_pos[:, :-1, :]
+        
+        vel_x_loss = self.mse_loss(pred_vel[:, :, 0], gt_vel[:, :, 0])
+        vel_y_loss = self.mse_loss(pred_vel[:, :, 1], gt_vel[:, :, 1])
+        vel_z_loss = self.mse_loss(pred_vel[:, :, 2], gt_vel[:, :, 2])
+        vel_loss = vel_x_loss + vel_y_loss + vel_z_loss
+        
+        # Other state components
+        other_components_loss = self.mse_loss(
+            torch.cat([pred_trajectory[:, :, :1], pred_trajectory[:, :, 4:]], dim=2),
+            torch.cat([gt_trajectory[:, :, :1], gt_trajectory[:, :, 4:]], dim=2)
+        )
+        
+        # Obstacle distance loss (if obstacles and normalization params are provided)
+        obstacle_loss = torch.tensor(0.0, device=pred_trajectory.device)
+        if obstacles_data is not None and mean is not None and std is not None:
+            obstacle_loss = self.compute_obstacle_distance_loss(
+                pred_trajectory, obstacles_data, mean, std
             )
-            
-    model.train()
+        
+        # Total loss with obstacle term
+        total_loss = (2.0 * position_loss + 
+                     1.5 * vel_loss + 
+                     other_components_loss + 
+                     self.obstacle_weight * obstacle_loss)
+        
+        return total_loss, position_loss, vel_loss, obstacle_loss
 
-def train_improved_aerodm():
-    """Enhanced training function with z-axis improvements"""
+# Update the training function to use the new loss
+def train_enhanced_aerodm():
+    """Enhanced training with obstacle-aware transformer and obstacle-aware loss"""
     config = Config()
-    model = AeroDM(config)
+    model = EnhancedAeroDM(config)
     
-    # Set device to MPS if available
+    # Set device
     device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
     model = model.to(device)
-    model.config = config  # Attach config to model for access
+    model.config = config
     
-    # Explicitly disable CBF guidance during training
+    # Disable CBF guidance during training (obstacle info still goes to transformer)
     model.config.enable_cbf_guidance = False
     
     # Move diffusion process tensors to device
@@ -1081,15 +1546,14 @@ def train_improved_aerodm():
     model.diffusion_process.alpha_bars = model.diffusion_process.alpha_bars.to(device)
     
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
-    criterion = ImprovedAeroDMLoss(config)  # Use improved loss
+    criterion = ObstacleAwareAeroDMLoss(config)  # Use the new loss function
     
     # Training parameters
     num_epochs = 50
     batch_size = 8
     num_trajectories = 20000
     
-    print("Generating enhanced circular trajectory data...")
-    # Generate enhanced training data
+    print("Generating training data with obstacle-aware transformer...")
     trajectories = generate_enhanced_circular_trajectories(
         num_trajectories=num_trajectories,
         seq_len=config.seq_len + config.history_len
@@ -1101,17 +1565,17 @@ def train_improved_aerodm():
     mean = mean.to(device)
     std = std.to(device)
     
-    # Store losses for plotting
-    losses = {'total': [], 'position': [], 'vel': []}
+    # Store losses
+    losses = {'total': [], 'position': [], 'vel': [], 'obstacle': []}
     
-    print("Starting improved training with z-axis focus...")
+    print("Starting enhanced training with obstacle-aware transformer and loss...")
     for epoch in range(num_epochs):
         epoch_total_loss = 0
         epoch_position_loss = 0
         epoch_vel_loss = 0
+        epoch_obstacle_loss = 0
         num_batches = 0
         
-        # Random batch training
         indices = torch.randperm(num_trajectories)
         for i in range(0, num_trajectories, batch_size):
             if i + batch_size > num_trajectories:
@@ -1120,11 +1584,18 @@ def train_improved_aerodm():
                 actual_batch_size = batch_size
                 
             batch_indices = indices[i:i+actual_batch_size]
-            full_traj = trajectories_norm[batch_indices]  # (bs, 65, 10) full trajectory
-            target = generate_target_waypoints(full_traj)  # From full trajectory end
+            full_traj = trajectories_norm[batch_indices]
+            target = generate_target_waypoints(full_traj)
             action = generate_action_styles(actual_batch_size, config.action_dim, device=device)
-            history = generate_history_segments(full_traj, config.history_len, device=device)  # First 5 steps
-            x_0 = full_traj[:, config.history_len:, :]  # FIXED: Last 60 steps (prediction sequence)
+            history = generate_history_segments(full_traj, config.history_len, device=device)
+            x_0 = full_traj[:, config.history_len:, :]
+            
+            # Generate random obstacles for this batch (for transformer input and loss)
+            obstacles_for_batch = []
+            for j in range(actual_batch_size):
+                traj_denorm = denormalize_trajectories(full_traj[j:j+1], mean, std)
+                obstacles = generate_random_obstacles(traj_denorm[0], num_obstacles_range=(0, 15), radius_range=(0.5, 1.30), device=device)            
+                obstacles_for_batch.append(obstacles)
             
             # Sample diffusion time step
             t = torch.randint(0, config.diffusion_steps, (actual_batch_size,), device=device)
@@ -1132,11 +1603,25 @@ def train_improved_aerodm():
             # Forward diffusion
             noisy_x, noise = model.diffusion_process.q_sample(x_0, t)
             
-            # Model prediction
-            pred_x0 = model(noisy_x, t, target, action, history)
+            # Model prediction with obstacle information
+            pred_x0_list = []
+            for j in range(actual_batch_size):
+                pred_x0_j = model(
+                    noisy_x[j:j+1], 
+                    t[j:j+1], 
+                    target[j:j+1], 
+                    action[j:j+1], 
+                    history[j:j+1] if history is not None else None,
+                    obstacles_for_batch[j]
+                )
+                pred_x0_list.append(pred_x0_j)
             
-            # Calculate loss
-            total_loss, position_loss, vel_loss = criterion(pred_x0, x_0)
+            pred_x0 = torch.cat(pred_x0_list, dim=0)
+            
+            # Calculate loss with obstacle awareness
+            total_loss, position_loss, vel_loss, obstacle_loss = criterion(
+                pred_x0, x_0, obstacles_for_batch, mean, std
+            )
             
             # Backward propagation
             optimizer.zero_grad()
@@ -1147,6 +1632,7 @@ def train_improved_aerodm():
             epoch_total_loss += total_loss.item()
             epoch_position_loss += position_loss.item()
             epoch_vel_loss += vel_loss.item()
+            epoch_obstacle_loss += obstacle_loss.item()
             num_batches += 1
         
         # Calculate average loss
@@ -1154,26 +1640,54 @@ def train_improved_aerodm():
             avg_total = epoch_total_loss / num_batches
             avg_position = epoch_position_loss / num_batches
             avg_vel = epoch_vel_loss / num_batches
+            avg_obstacle = epoch_obstacle_loss / num_batches
             
             losses['total'].append(avg_total)
             losses['position'].append(avg_position)
             losses['vel'].append(avg_vel)
+            losses['obstacle'].append(avg_obstacle)
         
         if epoch % 5 == 0:
             print(f"Epoch {epoch}: Total Loss: {avg_total:.4f}, "
-                  f"Position: {avg_position:.4f}, Vel: {avg_vel:.4f}")
+                  f"Position: {avg_position:.4f}, Vel: {avg_vel:.4f}, Obstacle: {avg_obstacle:.4f}")
         if avg_position < 0.02:
             print("Early stopping as position loss is below threshold.")
             break
 
-    # Plot training losses
-    plot_training_losses(losses)
+    # Enhanced plotting with obstacle loss
+    def plot_enhanced_training_losses(losses):
+        """Plot training losses including obstacle loss"""
+        plt.figure(figsize=(12, 8))
+        epochs = range(len(losses['total']))
+        
+        plt.subplot(2, 1, 1)
+        plt.plot(epochs, losses['total'], 'b-', label='Total Loss', linewidth=2)
+        plt.plot(epochs, losses['position'], 'r--', label='Position Loss', linewidth=2)
+        plt.plot(epochs, losses['vel'], 'g-.', label='Velocity Loss', linewidth=2)
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss')
+        plt.title('Training Losses - Main Components')
+        plt.legend()
+        plt.grid(True)
+        
+        plt.subplot(2, 1, 2)
+        plt.plot(epochs, losses['obstacle'], 'm-', label='Obstacle Loss', linewidth=2)
+        plt.xlabel('Epoch')
+        plt.ylabel('Obstacle Loss')
+        plt.title('Obstacle Distance Loss')
+        plt.legend()
+        plt.grid(True)
+        
+        plt.tight_layout()
+        plt.show()
     
-    # Enable CBF guidance for inference/testing
+    plot_enhanced_training_losses(losses)
+    
+    # Enable CBF guidance for inference
     model.config.enable_cbf_guidance = True
     
-    # Test model performance with CBF and diffusion visualization
-    test_model_performance(model, trajectories_norm, mean, std, num_test_samples=1)  # Reduced for demonstration
+    # Test enhanced model
+    test_enhanced_model_performance(model, trajectories_norm, mean, std, num_test_samples=30)
     
     torch.save({
         'model_state_dict': model.state_dict(),
@@ -1182,51 +1696,15 @@ def train_improved_aerodm():
         'loss': losses,
         'mean': mean,
         'std': std
-    }, "model/improved_aerodm_with_cbf.pth")
+    }, "model/enhanced_obstacle_aware_aerodm.pth")
 
     return model, losses, trajectories, mean, std
 
-# Main execution
+# Update the main execution
 if __name__ == "__main__":
-    print("Training Improved AeroDM with CBF Guidance Integration...")
+    print("Training Enhanced Obstacle-Aware AeroDM with Transformer Integration and Obstacle-Aware Loss...")
     
-    # Generate example enhanced circular trajectories for demonstration
-    print("Generating example enhanced circular trajectories...")
-    demo_trajectories = generate_enhanced_circular_trajectories(num_trajectories=18, seq_len=60)
+    # Train with enhanced obstacle-aware model and loss
+    trained_model, losses, trajectories, mean, std = train_enhanced_aerodm()
     
-    # Visualize some training data with z-axis focus
-    fig = plt.figure(figsize=(15, 10))
-    for i in range(6):
-        ax = fig.add_subplot(3, 6, i+1, projection='3d')
-        trajectory = demo_trajectories[i, :, 1:4].numpy()
-        ax.plot(trajectory[:, 0], trajectory[:, 1], trajectory[:, 2], 'b-', linewidth=2)
-        ax.set_title(f'Enhanced Circular Trajectory {i+1}')
-        ax.set_xlabel('X')
-        ax.set_ylabel('Y')
-        ax.set_zlabel('Z')
-        ax.grid(True)
-        
-        ax = fig.add_subplot(3, 6, i+6+1, projection='3d')
-        trajectory = demo_trajectories[i+6, :, 1:4].numpy()
-        ax.plot(trajectory[:, 0], trajectory[:, 1], trajectory[:, 2], 'b-', linewidth=2)
-        ax.set_title(f'Enhanced Circular Trajectory {i+7}')
-        ax.set_xlabel('X')
-        ax.set_ylabel('Y')
-        ax.set_zlabel('Z')
-        ax.grid(True)
-
-        ax = fig.add_subplot(3, 6, i+12+1, projection='3d')
-        trajectory = demo_trajectories[i+12, :, 1:4].numpy()
-        ax.plot(trajectory[:, 0], trajectory[:, 1], trajectory[:, 2], 'b-', linewidth=2)
-        ax.set_title(f'Enhanced Circular Trajectory {i+13}')
-        ax.set_xlabel('X')
-        ax.set_ylabel('Y')
-        ax.set_zlabel('Z')
-        ax.grid(True)
-    plt.tight_layout()
-    plt.show()
-    
-    # Train with enhanced method and CBF
-    trained_model, losses, trajectories, mean, std = train_improved_aerodm()
-    
-    print("Training completed! CBF guidance integrated for obstacle avoidance.")
+    print("Training completed! Obstacle information integrated into both transformer and loss function.")
