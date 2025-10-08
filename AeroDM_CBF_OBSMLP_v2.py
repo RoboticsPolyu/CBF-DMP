@@ -236,11 +236,8 @@ class ObstacleAwareDiffusionTransformer(nn.Module):
     def forward(self, x, t, target, action, history=None, obstacles_data=None):
         batch_size, seq_len, _ = x.shape
         
-        # Project input to latent space
-        x_emb = self.input_proj(x)
-        
-        # Add positional encoding
-        x_emb = self.pos_encoding(x_emb.transpose(0, 1)).transpose(0, 1)
+        # Project input to latent space (no PE yet)
+        x_proj = self.input_proj(x)
         
         # Prepare transformer input
         if history is not None:
@@ -250,17 +247,18 @@ class ObstacleAwareDiffusionTransformer(nn.Module):
                 else:
                     raise ValueError(f"History data batch size mismatch")
             
-            history_emb = self.input_proj(history)
-            history_emb = self.pos_encoding(history_emb.transpose(0, 1)).transpose(0, 1)
-            
-            # Concatenate history data with current sequence along sequence dimension
-            transformer_input = torch.cat([history_emb, x_emb], dim=1)
-            total_seq_len = history_emb.size(1) + seq_len
+            history_proj = self.input_proj(history)
+            # Concatenate projected history and current *before* adding PE
+            transformer_input = torch.cat([history_proj, x_proj], dim=1)
+            total_seq_len = history_proj.size(1) + seq_len
         else:
-            transformer_input = x_emb
+            transformer_input = x_proj
             total_seq_len = seq_len
         
-        # Generate causal mask
+        # Now add positional encoding to the *combined* input (correct absolute positions)
+        transformer_input = self.pos_encoding(transformer_input.transpose(0, 1)).transpose(0, 1)
+        
+        # Generate causal mask for the total sequence
         memory_mask = self._generate_square_subsequent_mask(total_seq_len).to(x.device)
         
         # Get enhanced condition embedding with obstacle information
@@ -345,40 +343,6 @@ def compute_barrier_and_grad(x, config, mean, std, obstacles_data=None):
     
     return V_total, grad_x
 
-# def generate_random_obstacles(trajectory, num_obstacles_range=(0, 10), radius_range=(0.01, 0.30), device='cpu'):
-#     """
-#     Generate random spherical obstacles around the trajectory.
-#     Returns list of obstacle dictionaries with center and radius.
-#     """
-#     num_obstacles = np.random.randint(num_obstacles_range[0], num_obstacles_range[1] + 1)
-#     obstacles = []
-    
-#     # Get trajectory bounds for obstacle placement
-#     traj_pos = trajectory[:, 1:4].cpu().numpy()
-#     min_bounds = traj_pos.min(axis=0)
-#     max_bounds = traj_pos.max(axis=0)
-    
-#     bounds_range = max_bounds - min_bounds
-#     expanded_min = min_bounds - 0.5 * bounds_range
-#     expanded_max = max_bounds + 0.5 * bounds_range
-    
-#     # print(f"Generating {num_obstacles} random obstacles around trajectory")
-    
-#     for i in range(num_obstacles):
-#         center = np.random.uniform(expanded_min, expanded_max)
-#         radius = np.random.uniform(radius_range[0], radius_range[1])
-        
-#         obstacle = {
-#             'center': torch.tensor(center, dtype=torch.float32, device=device),  
-#             'radius': radius,
-#             'id': i
-#         }
-#         obstacles.append(obstacle)
-        
-#         # print(f"Obstacle {i}: center={center}, radius={radius:.3f}")
-    
-#     return obstacles
-
 def generate_random_obstacles(trajectory, num_obstacles_range=(0, 10), radius_range=(0.01, 0.30), device='cpu'):
     """
     Generate random spherical obstacles around the trajectory without collisions between them.
@@ -429,7 +393,7 @@ def generate_random_obstacles(trajectory, num_obstacles_range=(0, 10), radius_ra
             attempts += 1
         
         if collision:
-            # print(f"Warning: Could not place obstacle {i} without collision after {max_attempts} attempts. Skipping.")
+            print(f"Warning: Could not place obstacle {i} without collision after {max_attempts} attempts. Skipping.")
             continue
         
         # Create obstacle dictionary
@@ -737,6 +701,13 @@ class EnhancedAeroDM(nn.Module):
         # Initialize with noise
         x_t = torch.randn(batch_size, self.config.seq_len, self.config.state_dim).to(device)
         
+        # Optional: Soft init from history for better continuity
+        if history is not None:
+            last_pos = history[:, -1, 1:4]
+            last_vel = history[:, -1, 1:4] - history[:, -2, 1:4] if history.size(1) > 1 else torch.zeros_like(last_pos)
+            init_first_pos = last_pos.unsqueeze(1) + last_vel.unsqueeze(1)
+            x_t[:, :1, 1:4] = 0.5 * x_t[:, :1, 1:4] + 0.5 * init_first_pos
+        
         print(f"\n{'='*50}")
         print("STARTING OBSTACLE-AWARE REVERSE DIFFUSION PROCESS")
         print(f"Initial noise stats - Mean: {x_t.mean().item():.4f}, Std: {x_t.std().item():.4f}")
@@ -778,7 +749,7 @@ class UnifiedAeroDMLoss(nn.Module):
     Supports switching obstacle term via flag; always returns 4 values for consistency.
     Fixes: Proper safety margin for obstacles, Z-weighting, normalization by avg obstacles.
     """
-    def __init__(self, config, enable_obstacle_term=False, safe_extra_factor=0.2, z_weight=1.5, obstacle_weight=10.0):
+    def __init__(self, config, enable_obstacle_term=False, safe_extra_factor=0.2, z_weight=1.5, obstacle_weight=10.0, continuity_weight=5.0):
         super().__init__()
         self.config = config
         # Flag to enable/disable obstacle distance penalty in total loss
@@ -789,6 +760,8 @@ class UnifiedAeroDMLoss(nn.Module):
         self.z_weight = z_weight
         # Scaling factor for the entire obstacle loss term
         self.obstacle_weight = obstacle_weight
+        # Weight for continuity loss
+        self.continuity_weight = continuity_weight
         # Base MSE loss for all components
         self.mse_loss = nn.MSELoss()
     
@@ -854,7 +827,7 @@ class UnifiedAeroDMLoss(nn.Module):
         # Clamp to non-negative for stability (though clamp in penalty ensures this)
         return torch.clamp(obstacle_loss, min=0.0)
     
-    def forward(self, pred_trajectory, gt_trajectory, obstacles_data=None, mean=None, std=None):
+    def forward(self, pred_trajectory, gt_trajectory, obstacles_data=None, mean=None, std=None, history=None):
         """
         Computes total loss and components.
         Always returns (total_loss, position_loss, vel_loss, obstacle_loss).
@@ -914,13 +887,27 @@ class UnifiedAeroDMLoss(nn.Module):
         if self.enable_obstacle_term and obstacles_data is not None and mean is not None and std is not None:
             obstacle_loss = self.compute_obstacle_distance_loss(pred_trajectory, obstacles_data, mean, std)
         
+        # New: Continuity loss (MSE between last history and first pred timestep)
+        continuity_loss = torch.tensor(0.0, device=device, requires_grad=True)
+        if history is not None and pred_trajectory.size(1) > 0:
+            # Focus on position components (indices 1:4) for smoothness
+            last_history_pos = history[:, -1, 1:4]
+            first_pred_pos = pred_trajectory[:, 0, 1:4]
+            continuity_loss = self.mse_loss(first_pred_pos, last_history_pos)
+            # Optional: Add velocity continuity (delta from last history to first pred)
+            if history.size(1) > 1:
+                last_history_vel = history[:, -1, 1:4] - history[:, -2, 1:4]
+                first_pred_vel = pred_trajectory[:, 0, 1:4] - last_history_pos  # Approx
+                continuity_loss += self.mse_loss(first_pred_vel, last_history_vel)
+        
         # Total weighted loss
         total_loss = (2.0 * position_loss + 
                       1.5 * vel_loss + 
                       other_loss + 
-                      self.obstacle_weight * obstacle_loss)
+                      self.obstacle_weight * obstacle_loss +
+                      self.continuity_weight * continuity_loss)
         
-        return total_loss, position_loss, vel_loss, obstacle_loss
+        return total_loss, position_loss, vel_loss, obstacle_loss, continuity_loss
     
 def normalize_trajectories(trajectories):
     """Normalize each dimension to zero mean and unit variance"""
@@ -1081,7 +1068,9 @@ def generate_history_segments(trajectories, history_len=5, device=None):
     histories = []
     
     for i in range(batch_size):
-        # start_idx = np.random.randint(0, max(1, seq_len - history_len - 10))
+        # Random start (ensure enough room for history + some continuation)
+        # max_start = max(0, seq_len - history_len - 10)  # Leave buffer for continuation
+        # start_idx = np.random.randint(0, max_start + 1)
         start_idx = 0
         history_segment = trajectories[i, start_idx:start_idx+history_len]
         
@@ -1152,7 +1141,7 @@ def test_enhanced_model_performance(model, trajectories_norm, mean, std, num_tes
 
     model.train()
 
-def plot_enhanced_trajectory_comparison(original, reconstructed, sampled, history=None, 
+def plot_enhanced_trajectory_comparison(original, sampled_unguided_denorm, sampled_guided_denorm, history=None, 
                                       target=None, obstacles=None, title="Enhanced Trajectory Comparison"):
     """Enhanced visualization with multiple obstacles and trajectory comparison"""
     fig = plt.figure(figsize=(20, 15))
@@ -1160,8 +1149,8 @@ def plot_enhanced_trajectory_comparison(original, reconstructed, sampled, histor
     
     # Extract position coordinates from tensors
     original_pos = original[0, :, 1:4].detach().cpu().numpy()
-    reconstructed_pos = reconstructed[0, :, 1:4].detach().cpu().numpy()
-    sampled_pos = sampled[0, :, 1:4].detach().cpu().numpy()
+    reconstructed_pos = sampled_unguided_denorm[0, :, 1:4].detach().cpu().numpy()
+    sampled_pos = sampled_guided_denorm[0, :, 1:4].detach().cpu().numpy()
     
     # Extract history and target if provided
     history_pos = None
@@ -1190,7 +1179,7 @@ def plot_enhanced_trajectory_comparison(original, reconstructed, sampled, histor
     ax1.plot(reconstructed_pos[:, 0], reconstructed_pos[:, 1], reconstructed_pos[:, 2], 
              'r.-', label='Reconstructed Trajectory', linewidth=2, alpha=0.8)
     ax1.plot(sampled_pos[:, 0], sampled_pos[:, 1], sampled_pos[:, 2], 
-             'g.-', label='Sampled Trajectory', linewidth=2, alpha=0.8)
+             'g.-', label='Sampled Guided Trajectory', linewidth=2, alpha=0.8)
     
     # Plot target (if available)
     if target_pos is not None:
@@ -1228,7 +1217,7 @@ def plot_enhanced_trajectory_comparison(original, reconstructed, sampled, histor
         plt.Line2D([0], [0], color='m', linewidth=4, marker='o', markersize=4, label='History'),
         plt.Line2D([0], [0], color='b', linewidth=3, label='Original Trajectory'),
         plt.Line2D([0], [0], color='r', linewidth=2, marker='.', label='Reconstructed Trajectory'),
-        plt.Line2D([0], [0], color='g', linewidth=2, marker='.', label='Sampled Trajectory'),
+        plt.Line2D([0], [0], color='g', linewidth=2, marker='.', label='Sampled Guided Trajectory'),
         plt.Line2D([0], [0], color='yellow', marker='*', markersize=10, linestyle='None', 
                   markeredgecolor='black', markeredgewidth=2, label='Target Waypoint')
     ]
@@ -1253,7 +1242,7 @@ def plot_enhanced_trajectory_comparison(original, reconstructed, sampled, histor
         ax2.plot(history_pos[:, 0], history_pos[:, 1], 'm-', label='History', linewidth=4, alpha=0.8, marker='o', markersize=4)
     ax2.plot(original_pos[:, 0], original_pos[:, 1], 'b-', label='Original', linewidth=3, alpha=0.8)
     ax2.plot(reconstructed_pos[:, 0], reconstructed_pos[:, 1], 'r.-', label='Reconstructed', linewidth=2, alpha=0.8)
-    ax2.plot(sampled_pos[:, 0], sampled_pos[:, 1], 'g.-', label='Sampled', linewidth=2, alpha=0.8)
+    ax2.plot(sampled_pos[:, 0], sampled_pos[:, 1], 'g.-', label='Sampled Guided', linewidth=2, alpha=0.8)
     
     if target_pos is not None:
         ax2.scatter(target_pos[0], target_pos[1], c='yellow', s=200, marker='*', label='Target', edgecolors='black', linewidth=2)
@@ -1282,7 +1271,7 @@ def plot_enhanced_trajectory_comparison(original, reconstructed, sampled, histor
         ax3.plot(history_pos[:, 0], history_pos[:, 2], 'm-', label='History', linewidth=4, alpha=0.8, marker='o', markersize=4)
     ax3.plot(original_pos[:, 0], original_pos[:, 2], 'b-', label='Original', linewidth=3, alpha=0.8)
     ax3.plot(reconstructed_pos[:, 0], reconstructed_pos[:, 2], 'r.-', label='Reconstructed', linewidth=2, alpha=0.8)
-    ax3.plot(sampled_pos[:, 0], sampled_pos[:, 2], 'g.-', label='Sampled', linewidth=2, alpha=0.8)
+    ax3.plot(sampled_pos[:, 0], sampled_pos[:, 2], 'g.-', label='Sampled Guided', linewidth=2, alpha=0.8)
     
     if target_pos is not None:
         ax3.scatter(target_pos[0], target_pos[2], c='yellow', s=200, marker='*', label='Target', edgecolors='black', linewidth=2)
@@ -1309,7 +1298,7 @@ def plot_enhanced_trajectory_comparison(original, reconstructed, sampled, histor
         ax4.plot(history_pos[:, 1], history_pos[:, 2], 'm-', label='History', linewidth=4, alpha=0.8, marker='o', markersize=4)
     ax4.plot(original_pos[:, 1], original_pos[:, 2], 'b-', label='Original', linewidth=3, alpha=0.8)
     ax4.plot(reconstructed_pos[:, 1], reconstructed_pos[:, 2], 'r.-', label='Reconstructed', linewidth=2, alpha=0.8)
-    ax4.plot(sampled_pos[:, 1], sampled_pos[:, 2], 'g.-', label='Sampled', linewidth=2, alpha=0.8)
+    ax4.plot(sampled_pos[:, 1], sampled_pos[:, 2], 'g.-', label='Sampled Guided', linewidth=2, alpha=0.8)
     
     if target_pos is not None:
         ax4.scatter(target_pos[1], target_pos[2], c='yellow', s=200, marker='*', label='Target', edgecolors='black', linewidth=2)
@@ -1335,7 +1324,7 @@ def plot_enhanced_trajectory_comparison(original, reconstructed, sampled, histor
     ax5 = fig.add_subplot(345)
     ax5.plot(time_steps, original_pos[:, 0], 'b-', label='Original X', linewidth=2)
     ax5.plot(time_steps, reconstructed_pos[:, 0], 'r--', label='Reconstructed X', linewidth=2)
-    ax5.plot(time_steps, sampled_pos[:, 0], 'g-.', label='Sampled X', linewidth=2)
+    ax5.plot(time_steps, sampled_pos[:, 0], 'g-.', label='Sampled Guided X', linewidth=2)
     ax5.set_xlabel('Time Step')
     ax5.set_ylabel('X Position')
     ax5.legend()
@@ -1345,7 +1334,7 @@ def plot_enhanced_trajectory_comparison(original, reconstructed, sampled, histor
     ax6 = fig.add_subplot(346)
     ax6.plot(time_steps, original_pos[:, 1], 'b-', label='Original Y', linewidth=2)
     ax6.plot(time_steps, reconstructed_pos[:, 1], 'r--', label='Reconstructed Y', linewidth=2)
-    ax6.plot(time_steps, sampled_pos[:, 1], 'g-.', label='Sampled Y', linewidth=2)
+    ax6.plot(time_steps, sampled_pos[:, 1], 'g-.', label='Sampled Guided Y', linewidth=2)
     ax6.set_xlabel('Time Step')
     ax6.set_ylabel('Y Position')
     ax6.legend()
@@ -1355,7 +1344,7 @@ def plot_enhanced_trajectory_comparison(original, reconstructed, sampled, histor
     ax7 = fig.add_subplot(347)
     ax7.plot(time_steps, original_pos[:, 2], 'b-', label='Original Z', linewidth=2)
     ax7.plot(time_steps, reconstructed_pos[:, 2], 'r--', label='Reconstructed Z', linewidth=2)
-    ax7.plot(time_steps, sampled_pos[:, 2], 'g-.', label='Sampled Z', linewidth=2)
+    ax7.plot(time_steps, sampled_pos[:, 2], 'g-.', label='Sampled Guided Z', linewidth=2)
     ax7.set_xlabel('Time Step')
     ax7.set_ylabel('Z Position')
     ax7.legend()
@@ -1364,13 +1353,13 @@ def plot_enhanced_trajectory_comparison(original, reconstructed, sampled, histor
     
     # 8. Speed comparison
     original_speed = original[0, :, 0].detach().cpu().numpy()
-    reconstructed_speed = reconstructed[0, :, 0].detach().cpu().numpy()
-    sampled_speed = sampled[0, :, 0].detach().cpu().numpy()
+    reconstructed_speed = sampled_unguided_denorm[0, :, 0].detach().cpu().numpy()
+    sampled_speed = sampled_guided_denorm[0, :, 0].detach().cpu().numpy()
     
     ax8 = fig.add_subplot(348)
     ax8.plot(time_steps, original_speed, 'b-', label='Original Speed', linewidth=2)
     ax8.plot(time_steps, reconstructed_speed, 'r--', label='Reconstructed Speed', linewidth=2)
-    ax8.plot(time_steps, sampled_speed, 'g-.', label='Sampled Speed', linewidth=2)
+    ax8.plot(time_steps, sampled_speed, 'g-.', label='Sampled Guided Speed', linewidth=2)
     ax8.set_xlabel('Time Step')
     ax8.set_ylabel('Speed')
     ax8.legend()
@@ -1605,7 +1594,8 @@ def train_enhanced_aerodm(use_obstacle_loss=True):
         enable_obstacle_term=use_obstacle_loss,
         safe_extra_factor=0.2,  # Safety buffer as fraction of radius (e.g., 20%)
         z_weight=1.5,           # Extra weight for Z-axis (height) in aviation
-        obstacle_weight=10.0    # Weight for obstacle term
+        obstacle_weight=10.0,   # Weight for obstacle term
+        continuity_weight=5.0   # Weight for continuity term
     )
     print(f"Using UnifiedAeroDMLoss (obstacle term: {use_obstacle_loss})")
     
@@ -1620,14 +1610,29 @@ def train_enhanced_aerodm(use_obstacle_loss=True):
         seq_len=config.seq_len + config.history_len
     )
     
-    # Normalize trajectories
-    trajectories_norm, mean, std = normalize_trajectories(trajectories)
-    trajectories_norm = trajectories_norm.to(device)
+    # Split trajectories into train and test sets (80/20 split)
+    torch.manual_seed(42)  # For reproducibility
+    indices = torch.randperm(num_trajectories)
+    train_size = int(0.8 * num_trajectories)
+    train_indices = indices[:train_size]
+    test_indices = indices[train_size:]
+    
+    train_trajectories = trajectories[train_indices]
+    test_trajectories = trajectories[test_indices]
+    
+    # Normalize on train set and apply to test
+    train_norm, mean, std = normalize_trajectories(train_trajectories)
+    test_norm = (test_trajectories - mean) / std
+    
+    train_norm = train_norm.to(device)
+    test_norm = test_norm.to(device)  # Move to device for consistency in testing
     mean = mean.to(device)
     std = std.to(device)
     
+    # Use train_size for training loop
+    train_size = train_trajectories.shape[0]
 
-    losses = {'total': [], 'position': [], 'vel': [], 'obstacle': []}
+    losses = {'total': [], 'position': [], 'vel': [], 'obstacle': [], 'continuity': []}
     
     mode_str = "with obstacle-aware loss" if use_obstacle_loss else "with basic loss"
     print(f"Starting enhanced training {mode_str}...")
@@ -1637,17 +1642,18 @@ def train_enhanced_aerodm(use_obstacle_loss=True):
         epoch_position_loss = 0
         epoch_vel_loss = 0
         epoch_obstacle_loss = 0 if use_obstacle_loss else None
+        epoch_continuity_loss = 0
         num_batches = 0
         
-        indices = torch.randperm(num_trajectories)
-        for i in range(0, num_trajectories, batch_size):
-            if i + batch_size > num_trajectories:
-                actual_batch_size = num_trajectories - i
+        indices = torch.randperm(train_size)
+        for i in range(0, train_size, batch_size):
+            if i + batch_size > train_size:
+                actual_batch_size = train_size - i
             else:
                 actual_batch_size = batch_size
                 
             batch_indices = indices[i:i+actual_batch_size]
-            full_traj = trajectories_norm[batch_indices]
+            full_traj = train_norm[batch_indices]
             target = generate_target_waypoints(full_traj)
             action = generate_action_styles(actual_batch_size, config.action_dim, device=device)
             history = generate_history_segments(full_traj, config.history_len, device=device)
@@ -1688,8 +1694,8 @@ def train_enhanced_aerodm(use_obstacle_loss=True):
             pred_x0 = torch.cat(pred_x0_list, dim=0)
             
             # Calculate loss based on flag
-            total_loss, position_loss, vel_loss, obstacle_loss = criterion(
-                pred_x0, x_0, obstacles_for_batch if use_obstacle_loss else None, mean, std
+            total_loss, position_loss, vel_loss, obstacle_loss, continuity_loss = criterion(
+                pred_x0, x_0, obstacles_for_batch if use_obstacle_loss else None, mean, std, history
             )
 
             # Backward propagation
@@ -1702,7 +1708,9 @@ def train_enhanced_aerodm(use_obstacle_loss=True):
             epoch_total_loss += total_loss.item()
             epoch_position_loss += position_loss.item()
             epoch_vel_loss += vel_loss.item()
-            epoch_obstacle_loss += obstacle_loss.item()
+            if use_obstacle_loss:
+                epoch_obstacle_loss += obstacle_loss.item()
+            epoch_continuity_loss += continuity_loss.item()
             num_batches += 1
         
         # Calculate average losses for the epoch
@@ -1710,10 +1718,12 @@ def train_enhanced_aerodm(use_obstacle_loss=True):
             avg_total = epoch_total_loss / num_batches
             avg_position = epoch_position_loss / num_batches
             avg_vel = epoch_vel_loss / num_batches
+            avg_continuity = epoch_continuity_loss / num_batches
             
             losses['total'].append(avg_total)
             losses['position'].append(avg_position)
             losses['vel'].append(avg_vel)
+            losses['continuity'].append(avg_continuity)
             
             if use_obstacle_loss:
                 avg_obstacle = epoch_obstacle_loss / num_batches
@@ -1723,10 +1733,10 @@ def train_enhanced_aerodm(use_obstacle_loss=True):
         if epoch % 5 == 0:
             if use_obstacle_loss:
                 print(f"Epoch {epoch}: Total Loss: {avg_total:.4f}, "
-                      f"Position: {avg_position:.4f}, Vel: {avg_vel:.4f}, Obstacle: {avg_obstacle:.4f}")
+                      f"Position: {avg_position:.4f}, Vel: {avg_vel:.4f}, Obstacle: {avg_obstacle:.4f}, Continuity: {avg_continuity:.4f}")
             else:
                 print(f"Epoch {epoch}: Total Loss: {avg_total:.4f}, "
-                      f"Position: {avg_position:.4f}, Vel: {avg_vel:.4f}")
+                      f"Position: {avg_position:.4f}, Vel: {avg_vel:.4f}, Continuity: {avg_continuity:.4f}")
         
         # Early stopping condition
         if avg_position < 0.10:
@@ -1753,9 +1763,10 @@ def train_enhanced_aerodm(use_obstacle_loss=True):
         # Always plot obstacle (even if 0)
         plt.subplot(2, 1, 2)
         plt.plot(epochs, losses['obstacle'], 'm-', label='Obstacle Loss', linewidth=2)
+        plt.plot(epochs, losses['continuity'], 'c-', label='Continuity Loss', linewidth=2)
         plt.xlabel('Epoch')
-        plt.ylabel('Obstacle Loss')
-        plt.title('Obstacle Distance Loss')
+        plt.ylabel('Loss')
+        plt.title('Obstacle and Continuity Losses')
         plt.legend()
         plt.grid(True)
 
@@ -1769,8 +1780,8 @@ def train_enhanced_aerodm(use_obstacle_loss=True):
     # Enable CBF guidance for inference
     model.config.enable_cbf_guidance = True
     
-    # Test enhanced model performance
-    test_enhanced_model_performance(model, trajectories_norm, mean, std, num_test_samples=30)
+    # Test enhanced model performance on test set
+    test_enhanced_model_performance(model, test_norm, mean, std, num_test_samples=30)
     
     # Save model checkpoint
     checkpoint = {
