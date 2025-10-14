@@ -953,10 +953,21 @@ def plot_training_losses(losses):
     plt.show()
 
 def generate_enhanced_circular_trajectories(num_trajectories=100, seq_len=60, radius=10.0, height=0.0):
-    """Generate diverse aerobatic trajectories based on five maneuver styles:
-    (a) Power Loop, (b) Barrel Roll, (c) Split-S, (d) Immelmann Turn, (e) Wall Ride."""
+    """Generate diverse aerobatic trajectories based on eleven maneuver styles:
+    (a) Power Loop, (b) Barrel Roll, (c) Split-S, (d) Immelmann Turn, (e) Wall Ride,
+    (f) Eight Figure, (g) Patrick, (h) Star, (i) Half Moon, (j) Sphinx, (k) Clover."""
     trajectories = []
-    maneuver_styles = ['power_loop', 'barrel_roll', 'split_s', 'immelmann', 'wall_ride']
+    maneuver_styles = ['power_loop', 'barrel_roll', 'split_s', 'immelmann', 'wall_ride',
+                      'eight_figure', 'star', 'half_moon', 'sphinx', 'clover']
+    
+    def smooth_trajectory(positions, smoothing_factor=0.1):
+        """Apply smoothing to trajectory positions using a simple moving average"""
+        smoothed = np.zeros_like(positions)
+        for i in range(len(positions)):
+            start_idx = max(0, i - 1)
+            end_idx = min(len(positions), i + 2)
+            smoothed[i] = np.mean(positions[start_idx:end_idx], axis=0)
+        return smoothing_factor * smoothed + (1 - smoothing_factor) * positions
     
     for i in range(num_trajectories):
         # Randomly select a maneuver style
@@ -968,64 +979,185 @@ def generate_enhanced_circular_trajectories(num_trajectories=100, seq_len=60, ra
         center_z = height + np.random.uniform(-10, 10)
         
         current_radius = radius * np.random.uniform(0.8, 1.2)
-        angular_velocity = np.random.uniform(0.5, 2.0)
         
-        # Normalize time steps to [0, 1]
+        # Fixed period of 1 for all trajectories
+        period = 1.0
+        angular_velocity = 1.0 / period  # This ensures exactly one period
+        
+        # Normalize time steps to [0, 1] - exactly one period
         norm_t = np.linspace(0, 1, seq_len)
         
         # Compute positions and velocities based on style
         if style == 'power_loop':
             # Full vertical loop in xz plane, starting at bottom with forward velocity
-            theta = 2 * np.pi * norm_t * angular_velocity
+            theta = 2 * np.pi * norm_t
             x = center_x + current_radius * np.sin(theta)
             y = np.full(seq_len, center_y)
             z = center_z - current_radius * np.cos(theta)
-            vx = current_radius * angular_velocity * 2 * np.pi * np.cos(theta)
+            vx = current_radius * 2 * np.pi * np.cos(theta)
             vy = np.zeros(seq_len)
-            vz = current_radius * angular_velocity * 2 * np.pi * np.sin(theta)
+            vz = current_radius * 2 * np.pi * np.sin(theta)
         
         elif style == 'barrel_roll':
-            # Helical path (corkscrew) along x
-            theta = 2 * np.pi * norm_t * angular_velocity
-            forward_speed = np.random.uniform(5.0, 15.0)  # Forward component
-            x = center_x + forward_speed * norm_t
+            # Helical path (corkscrew) along x - exactly one full rotation
+            theta = 2 * np.pi * norm_t
+            forward_distance = current_radius * 2  # Control forward movement to match period
+            x = center_x + forward_distance * norm_t
             y = center_y + current_radius * np.cos(theta)
             z = center_z + current_radius * np.sin(theta)
-            vx = np.full(seq_len, forward_speed)
-            vy = -current_radius * angular_velocity * 2 * np.pi * np.sin(theta)
-            vz = current_radius * angular_velocity * 2 * np.pi * np.cos(theta)
+            vx = np.full(seq_len, forward_distance)
+            vy = -current_radius * 2 * np.pi * np.sin(theta)
+            vz = current_radius * 2 * np.pi * np.cos(theta)
         
         elif style == 'split_s':
-            # Descending half-loop (semicircle down) in xz plane
-            theta = np.pi * norm_t * angular_velocity
+            # Descending half-loop (semicircle down) in xz plane - exactly one half period
+            theta = np.pi * norm_t
             x = center_x - current_radius * (1 - np.cos(theta))
             y = np.full(seq_len, center_y)
             z = center_z - current_radius * np.sin(theta)
-            vx = -current_radius * angular_velocity * np.pi * np.sin(theta)
+            vx = -current_radius * np.pi * np.sin(theta)
             vy = np.zeros(seq_len)
-            vz = -current_radius * angular_velocity * np.pi * np.cos(theta)
+            vz = -current_radius * np.pi * np.cos(theta)
         
         elif style == 'immelmann':
-            # Ascending half-loop (semicircle up) in xz plane
-            theta = np.pi * norm_t * angular_velocity
+            # Ascending half-loop (semicircle up) in xz plane - exactly one half period
+            theta = np.pi * norm_t
             x = center_x - current_radius * (1 - np.cos(theta))
             y = np.full(seq_len, center_y)
             z = center_z + current_radius * np.sin(theta)
-            vx = -current_radius * angular_velocity * np.pi * np.sin(theta)
+            vx = -current_radius * np.pi * np.sin(theta)
             vy = np.zeros(seq_len)
-            vz = current_radius * angular_velocity * np.pi * np.cos(theta)
+            vz = current_radius * np.pi * np.cos(theta)
         
         elif style == 'wall_ride':
-            # Vertical helix climb (spiral up)
-            turns = np.random.uniform(0.5, 1.5)  # Number of turns
-            climb_height = np.random.uniform(20.0, 40.0)
-            theta = 2 * np.pi * turns * norm_t * angular_velocity
+            # Vertical helix climb (spiral up) - exactly one full rotation
+            theta = 2 * np.pi * norm_t
+            climb_height = current_radius * 2
             x = center_x + current_radius * np.cos(theta)
             y = center_y + current_radius * np.sin(theta)
             z = center_z + climb_height * norm_t
-            vx = -current_radius * (2 * np.pi * turns * angular_velocity) * np.sin(theta)
-            vy = current_radius * (2 * np.pi * turns * angular_velocity) * np.cos(theta)
+            vx = -current_radius * 2 * np.pi * np.sin(theta)
+            vy = current_radius * 2 * np.pi * np.cos(theta)
             vz = np.full(seq_len, climb_height)
+        
+        elif style == 'eight_figure':
+            # Lemniscate (infinity symbol) in xy plane - exactly one period
+            theta = 2 * np.pi * norm_t
+            a = current_radius
+            denom = 1 + np.sin(theta)**2
+            x = center_x + a * np.cos(theta) / denom
+            y = center_y + a * np.sin(theta) * np.cos(theta) / denom
+            z = center_z + current_radius * 0.1 * np.sin(2 * theta)  # Smooth vertical variation
+            
+            # Numerical derivatives for smooth velocity
+            dt = 1.0 / seq_len
+            x_smooth = smooth_trajectory(x)
+            y_smooth = smooth_trajectory(y)
+            z_smooth = smooth_trajectory(z)
+            vx = np.gradient(x_smooth, dt)
+            vy = np.gradient(y_smooth, dt)
+            vz = np.gradient(z_smooth, dt)
+            x, y, z = x_smooth, y_smooth, z_smooth
+        
+        elif style == 'patrick':
+            # Complex 3D star-like pattern - exactly one period
+            freq1, freq2, freq3 = 2.0, 3.0, 1.5  # Fixed frequencies for period control
+            theta = 2 * np.pi * norm_t
+            x = center_x + current_radius * np.sin(freq1 * theta) * np.cos(freq2 * theta)
+            y = center_y + current_radius * np.sin(freq2 * theta) * np.cos(freq3 * theta)
+            z = center_z + current_radius * np.sin(freq3 * theta) * np.cos(freq1 * theta)
+            
+            # Apply smoothing and compute derivatives
+            x_smooth = smooth_trajectory(x, 0.2)
+            y_smooth = smooth_trajectory(y, 0.2)
+            z_smooth = smooth_trajectory(z, 0.2)
+            dt = 1.0 / seq_len
+            vx = np.gradient(x_smooth, dt)
+            vy = np.gradient(y_smooth, dt)
+            vz = np.gradient(z_smooth, dt)
+            x, y, z = x_smooth, y_smooth, z_smooth
+        
+        elif style == 'star':
+            # 5-point star pattern in xy plane with vertical oscillation - exactly one period
+            points = 5
+            theta = 2 * np.pi * norm_t
+            r = current_radius * (1 + 0.3 * np.sin(points * theta))  # Smoother star shape
+            x = center_x + r * np.cos(theta)
+            y = center_y + r * np.sin(theta)
+            z = center_z + current_radius * 0. * np.sin(3 * theta)
+            
+            # Apply smoothing
+            positions = np.column_stack([x, y, z])
+            smoothed_positions = smooth_trajectory(positions)
+            x, y, z = smoothed_positions[:, 0], smoothed_positions[:, 1], smoothed_positions[:, 2]
+            dt = 1.0 / seq_len
+            vx = np.gradient(x, dt)
+            vy = np.gradient(y, dt)
+            vz = np.gradient(z, dt)
+        
+        elif style == 'half_moon':
+            # Crescent moon shape in xy plane - exactly one half period
+            theta = np.pi * norm_t
+            r = current_radius * (1 + 0.3 * np.cos(2 * theta))  # Smoother crescent
+            x = center_x + r * np.cos(theta)
+            y = center_y + r * np.sin(theta)
+            z = center_z + current_radius * 0.1 * np.sin(2 * theta)  # Smooth vertical variation
+            
+            # Apply smoothing
+            x_smooth = smooth_trajectory(x)
+            y_smooth = smooth_trajectory(y)
+            z_smooth = smooth_trajectory(z)
+            dt = 1.0 / seq_len
+            vx = np.gradient(x_smooth, dt)
+            vy = np.gradient(y_smooth, dt)
+            vz = np.gradient(z_smooth, dt)
+            x, y, z = x_smooth, y_smooth, z_smooth
+        
+        elif style == 'sphinx':
+            # Pyramid-like triangular pattern - exactly one period
+            theta = 2 * np.pi * norm_t
+            # Smoother triangular wave using sine approximation
+            triangle_wave = 0.5 * np.sin(2 * theta) + 0.3 * np.sin(4 * theta)
+            x = center_x + current_radius * np.cos(theta)
+            y = center_y + current_radius * np.sin(theta)
+            z = center_z + current_radius * 0.3 * triangle_wave
+            
+            # Apply smoothing
+            positions = np.column_stack([x, y, z])
+            smoothed_positions = smooth_trajectory(positions, 0.15)
+            x, y, z = smoothed_positions[:, 0], smoothed_positions[:, 1], smoothed_positions[:, 2]
+            dt = 1.0 / seq_len
+            vx = np.gradient(x, dt)
+            vy = np.gradient(y, dt)
+            vz = np.gradient(z, dt)
+        
+        elif style == 'clover':
+            # 4-leaf clover pattern - exactly one period
+            leaves = 4
+            theta = 2 * np.pi * norm_t
+            r = current_radius * (1 + 0.2 * np.sin(leaves * theta))  # Smoother clover
+            x = center_x + r * np.cos(theta)
+            y = center_y + r * np.sin(theta)
+            z = center_z + current_radius * 0.0 * np.cos(2 * theta)
+            
+            # Apply smoothing
+            x_smooth = smooth_trajectory(x)
+            y_smooth = smooth_trajectory(y)
+            z_smooth = smooth_trajectory(z)
+            dt = 1.0 / seq_len
+            vx = np.gradient(x_smooth, dt)
+            vy = np.gradient(y_smooth, dt)
+            vz = np.gradient(z_smooth, dt)
+            x, y, z = x_smooth, y_smooth, z_smooth
+        
+        # Ensure all trajectories are properly periodic
+        if style not in ['split_s', 'immelmann', 'half_moon']:  # These are half-period maneuvers
+            # Check and enforce periodicity for full-period maneuvers
+            if not np.allclose([x[0], y[0], z[0]], [x[-1], y[-1], z[-1]], atol=1e-2):
+                # Adjust to make periodic
+                x = x - (x[-1] - x[0]) * norm_t
+                y = y - (y[-1] - y[0]) * norm_t
+                z = z - (z[-1] - z[0]) * norm_t
         
         # Compute speed and direction
         speed = np.sqrt(vx**2 + vy**2 + vz**2)
@@ -1107,7 +1239,7 @@ def test_enhanced_model_performance(model, trajectories_norm, mean, std, num_tes
             target_denorm = target_norm * std[0, 0, 1:4] + mean[0, 0, 1:4]
             
             # Generate random obstacles
-            obstacles = generate_random_obstacles(x_0_denorm[0], num_obstacles_range=(0, 10), radius_range=(0.35, 0.80))
+            obstacles = generate_random_obstacles(x_0_denorm[0], num_obstacles_range=(10, 20), radius_range=(0.35, 0.80))
 
             # Set obstacles data for model input
             model.set_obstacles_data(obstacles)
@@ -1471,7 +1603,10 @@ class ObstacleAwareAeroDMLoss(nn.Module):
         self.config = config
         self.mse_loss = nn.MSELoss()
         self.obstacle_weight = 10.0  # Weight for obstacle distance term
-        
+        self.pos_weight = 2.0
+        self.vel_weight = 0.5
+        self.last_pos_weight = 10.0  # Weight for last time step position error
+
     def compute_obstacle_distance_loss(self, pred_trajectory, obstacles_data, mean, std):
         """
         Compute obstacle distance loss to encourage obstacle avoidance.
@@ -1531,7 +1666,7 @@ class ObstacleAwareAeroDMLoss(nn.Module):
 
         # Combined position loss
         position_loss = (x_loss + y_loss + z_loss + 
-                         10.0 * (last_x_loss + last_y_loss + last_z_loss))
+                         self.last_pos_weight * (last_x_loss + last_y_loss + last_z_loss))
         
         # Velocity regularization
         pred_vel = pred_pos[:, 1:, :] - pred_pos[:, :-1, :]
@@ -1556,8 +1691,8 @@ class ObstacleAwareAeroDMLoss(nn.Module):
             )
         
         # Total loss with obstacle term
-        total_loss = (2.0 * position_loss + 
-                     1.5 * vel_loss + 
+        total_loss = (self.pos_weight * position_loss + 
+                     self.vel_weight * vel_loss + 
                      other_components_loss + 
                      self.obstacle_weight * obstacle_loss)
         
@@ -1805,6 +1940,68 @@ def train_enhanced_aerodm(use_obstacle_loss=True):
 if __name__ == "__main__":
     print("Training Enhanced Obstacle-Aware AeroDM with Transformer Integration and Obstacle-Aware Loss...")
     
+    # # Generate example enhanced circular trajectories for demonstration
+    # print("Generating example enhanced circular trajectories...")
+    # demo_trajectories = generate_enhanced_circular_trajectories(num_trajectories=18, seq_len=60)
+    
+    # # Visualize some training data with z-axis focus
+    # plt.style.use('seaborn-v0_8-whitegrid')  # Use a clean style
+    # fig = plt.figure(figsize=(18, 12))
+    # fig.suptitle('3D Enhanced Circular Trajectories Visualization\nTraining Dataset Overview', 
+    #             fontsize=16, fontweight='bold', y=0.95)
+
+    # for i in range(6):
+    #     # First row
+    #     ax = fig.add_subplot(3, 6, i+1, projection='3d')
+    #     trajectory = demo_trajectories[i, :, 1:4].numpy()
+    #     ax.plot(trajectory[:, 0], trajectory[:, 1], trajectory[:, 2], 'b-', linewidth=2.5, alpha=0.8)
+    #     ax.scatter(trajectory[::10, 0], trajectory[::10, 1], trajectory[::10, 2], 
+    #             color='red', s=20, alpha=0.6, marker='o')  # Add sample points
+    #     ax.set_title(f'Trajectory {i+1}', fontsize=12, fontweight='bold', pad=10)
+    #     ax.set_xlabel('X', fontsize=10, fontweight='bold')
+    #     ax.set_ylabel('Y', fontsize=10, fontweight='bold')
+    #     ax.set_zlabel('Z', fontsize=10, fontweight='bold')
+    #     ax.grid(True, alpha=0.3)
+    #     ax.xaxis.pane.fill = False
+    #     ax.yaxis.pane.fill = False
+    #     ax.zaxis.pane.fill = False
+    #     ax.xaxis.pane.set_edgecolor('w')
+    #     ax.yaxis.pane.set_edgecolor('w')
+    #     ax.zaxis.pane.set_edgecolor('w')
+        
+    #     # Second row
+    #     ax = fig.add_subplot(3, 6, i+6+1, projection='3d')
+    #     trajectory = demo_trajectories[i+6, :, 1:4].numpy()
+    #     ax.plot(trajectory[:, 0], trajectory[:, 1], trajectory[:, 2], 'g-', linewidth=2.5, alpha=0.8)
+    #     ax.scatter(trajectory[::10, 0], trajectory[::10, 1], trajectory[::10, 2], 
+    #             color='orange', s=20, alpha=0.6, marker='o')
+    #     ax.set_title(f'Trajectory {i+7}', fontsize=12, fontweight='bold', pad=10)
+    #     ax.set_xlabel('X', fontsize=10, fontweight='bold')
+    #     ax.set_ylabel('Y', fontsize=10, fontweight='bold')
+    #     ax.set_zlabel('Z', fontsize=10, fontweight='bold')
+    #     ax.grid(True, alpha=0.3)
+    #     ax.xaxis.pane.fill = False
+    #     ax.yaxis.pane.fill = False
+    #     ax.zaxis.pane.fill = False
+        
+    #     # Third row
+    #     ax = fig.add_subplot(3, 6, i+12+1, projection='3d')
+    #     trajectory = demo_trajectories[i+12, :, 1:4].numpy()
+    #     ax.plot(trajectory[:, 0], trajectory[:, 1], trajectory[:, 2], 'purple', linewidth=2.5, alpha=0.8)
+    #     ax.scatter(trajectory[::10, 0], trajectory[::10, 1], trajectory[::10, 2], 
+    #             color='cyan', s=20, alpha=0.6, marker='o')
+    #     ax.set_title(f'Trajectory {i+13}', fontsize=12, fontweight='bold', pad=10)
+    #     ax.set_xlabel('X', fontsize=10, fontweight='bold')
+    #     ax.set_ylabel('Y', fontsize=10, fontweight='bold')
+    #     ax.set_zlabel('Z', fontsize=10, fontweight='bold')
+    #     ax.grid(True, alpha=0.3)
+    #     ax.xaxis.pane.fill = False
+    #     ax.yaxis.pane.fill = False
+    #     ax.zaxis.pane.fill = False
+
+    # plt.tight_layout(rect=[0, 0.05, 1, 0.93])  # Adjust layout to accommodate title and text
+    # plt.show()
+
     # Train with enhanced obstacle-aware model and loss
     trained_model, losses, trajectories, mean, std = train_enhanced_aerodm()
     
