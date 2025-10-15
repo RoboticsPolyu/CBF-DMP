@@ -1239,7 +1239,7 @@ def test_enhanced_model_performance(model, trajectories_norm, mean, std, num_tes
             target_denorm = target_norm * std[0, 0, 1:4] + mean[0, 0, 1:4]
             
             # Generate random obstacles
-            obstacles = generate_random_obstacles(x_0_denorm[0], num_obstacles_range=(10, 20), radius_range=(0.35, 0.80))
+            obstacles = generate_random_obstacles(x_0_denorm[0], num_obstacles_range=(0, 10), radius_range=(0.35, 0.80))
 
             # Set obstacles data for model input
             model.set_obstacles_data(obstacles)
@@ -1800,7 +1800,7 @@ def train_enhanced_aerodm(use_obstacle_loss=True):
                 traj_denorm = denormalize_trajectories(full_traj[j:j+1], mean, std)
                 obstacles = generate_random_obstacles(
                     traj_denorm[0], 
-                    num_obstacles_range=(0, 15), 
+                    num_obstacles_range=(0, 10), 
                     radius_range=(0.5, 1.30), 
                     device=device
                 )            
@@ -1874,9 +1874,9 @@ def train_enhanced_aerodm(use_obstacle_loss=True):
                       f"Position: {avg_position:.4f}, Vel: {avg_vel:.4f}, Continuity: {avg_continuity:.4f}")
         
         # Early stopping condition
-        if avg_position < 0.10:
-            print("Early stopping as position loss is below threshold.")
-            break
+        # if avg_position < 0.10:
+        #     print("Early stopping as position loss is below threshold.")
+        #     break
 
     def plot_enhanced_training_losses(losses, use_obstacle_loss):
         """Plot training losses with optional obstacle loss visualization"""
