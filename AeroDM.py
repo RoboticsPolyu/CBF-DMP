@@ -331,7 +331,7 @@ def plot_training_losses(losses):
     plt.grid(True)
     plt.show()
 
-def generate_enhanced_circular_trajectories(num_trajectories=100, seq_len=60, radius=10.0, height=50.0):
+def generate_aerobatic_trajectories(num_trajectories=100, seq_len=60, radius=10.0, height=50.0):
     """Generate diverse aerobatic trajectories based on five maneuver styles:
     (a) Power Loop, (b) Barrel Roll, (c) Split-S, (d) Immelmann Turn, (e) Wall Ride."""
     trajectories = []
@@ -877,7 +877,7 @@ def train_improved_aerodm():
     
     print("Generating enhanced circular trajectory data...")
     # Generate enhanced training data
-    trajectories = generate_enhanced_circular_trajectories(
+    trajectories = generate_aerobatic_trajectories(
         num_trajectories=num_trajectories,
         seq_len=config.seq_len + config.history_len
     )
@@ -974,7 +974,7 @@ if __name__ == "__main__":
     
     # Generate example enhanced circular trajectories for demonstration
     print("Generating example enhanced circular trajectories...")
-    demo_trajectories = generate_enhanced_circular_trajectories(num_trajectories=18, seq_len=60)
+    demo_trajectories = generate_aerobatic_trajectories(num_trajectories=18, seq_len=60)
     
     # Visualize some training data with z-axis focus
     fig = plt.figure(figsize=(15, 10))

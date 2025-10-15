@@ -80,12 +80,85 @@ class ConditionEmbedding(nn.Module):
         target_emb = self.target_embed(target)
         action_emb = self.action_embed(action)
         
-        # Combine conditions (simple addition as in the paper)
-        cond_emb = t_emb + target_emb + action_emb
-        
-        return cond_emb
+        # Return separate embeddings for cross-attention
+        return t_emb, target_emb, action_emb
 
-# Diffusion Transformer (decoder only)
+# Cross-attention module for conditional inputs
+class CrossAttentionLayer(nn.Module):
+    def __init__(self, d_model, nhead, dropout=0.1):
+        super().__init__()
+        self.multihead_attn = nn.MultiheadAttention(
+            d_model, nhead, dropout=dropout, batch_first=True
+        )
+        self.norm = nn.LayerNorm(d_model)
+        self.dropout = nn.Dropout(dropout)
+        
+    def forward(self, query, key, value, key_padding_mask=None):
+        # query: main sequence, key/value: conditional inputs
+        attn_output, _ = self.multihead_attn(
+            query, key, value, 
+            key_padding_mask=key_padding_mask
+        )
+        output = self.norm(query + self.dropout(attn_output))
+        return output
+
+# Modified Transformer Decoder Layer with Cross-Attention
+class CrossAttentionTransformerDecoderLayer(nn.Module):
+    def __init__(self, d_model, nhead, dim_feedforward=1024, dropout=0.1):
+        super().__init__()
+        # Self-attention
+        self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.dropout1 = nn.Dropout(dropout)
+        
+        # Cross-attention for conditions
+        self.cross_attn_target = CrossAttentionLayer(d_model, nhead, dropout)
+        self.cross_attn_action = CrossAttentionLayer(d_model, nhead, dropout)
+        self.cross_attn_t = CrossAttentionLayer(d_model, nhead, dropout)
+        
+        # Feedforward
+        self.linear1 = nn.Linear(d_model, dim_feedforward)
+        self.dropout = nn.Dropout(dropout)
+        self.linear2 = nn.Linear(dim_feedforward, d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.dropout2 = nn.Dropout(dropout)
+        
+        self.activation = nn.ReLU()
+
+    def forward(self, tgt, memory, tgt_mask=None, memory_mask=None,
+                tgt_key_padding_mask=None, memory_key_padding_mask=None,
+                target_cond=None, action_cond=None, t_cond=None):
+        # Self-attention
+        self_attn_output, _ = self.self_attn(
+            tgt, tgt, tgt, 
+            attn_mask=tgt_mask,
+            key_padding_mask=tgt_key_padding_mask
+        )
+        tgt = self.norm1(tgt + self.dropout1(self_attn_output))
+        
+        # Cross-attention with conditions
+        if target_cond is not None:
+            # Expand target condition to match sequence length
+            target_cond_seq = target_cond.unsqueeze(1).expand(-1, tgt.size(1), -1)
+            tgt = self.cross_attn_target(tgt, target_cond_seq, target_cond_seq)
+        
+        if action_cond is not None:
+            # Expand action condition to match sequence length
+            action_cond_seq = action_cond.unsqueeze(1).expand(-1, tgt.size(1), -1)
+            tgt = self.cross_attn_action(tgt, action_cond_seq, action_cond_seq)
+        
+        if t_cond is not None:
+            # Expand timestep condition to match sequence length
+            t_cond_seq = t_cond.unsqueeze(1).expand(-1, tgt.size(1), -1)
+            tgt = self.cross_attn_t(tgt, t_cond_seq, t_cond_seq)
+        
+        # Feedforward
+        ff_output = self.linear2(self.dropout(self.activation(self.linear1(tgt))))
+        tgt = self.norm2(tgt + self.dropout2(ff_output))
+        
+        return tgt
+
+# Modified Diffusion Transformer with Cross-Attention
 class DiffusionTransformer(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -97,23 +170,21 @@ class DiffusionTransformer(nn.Module):
         # Positional encoding
         self.pos_encoding = PositionalEncoding(config.latent_dim)
         
-        # Transformer layers
-        transformer_layer = nn.TransformerDecoderLayer(
-            d_model=config.latent_dim,
-            nhead=config.num_heads,
-            dim_feedforward=config.latent_dim * 4,
-            dropout=config.dropout,
-            batch_first=True
-        )
-        self.transformer = nn.TransformerDecoder(
-            transformer_layer, num_layers=config.num_layers
-        )
+        # Condition embedding
+        self.cond_embed = ConditionEmbedding(config)
+        
+        # Transformer layers with cross-attention
+        self.layers = nn.ModuleList([
+            CrossAttentionTransformerDecoderLayer(
+                d_model=config.latent_dim,
+                nhead=config.num_heads,
+                dim_feedforward=config.latent_dim * 4,
+                dropout=config.dropout
+            ) for _ in range(config.num_layers)
+        ])
         
         # Output projection
         self.output_proj = nn.Linear(config.latent_dim, config.state_dim)
-        
-        # Condition embedding
-        self.cond_embed = ConditionEmbedding(config)
 
     def forward(self, x, t, target, action, history=None):
         batch_size, seq_len, _ = x.shape
@@ -145,22 +216,117 @@ class DiffusionTransformer(nn.Module):
         # Generate causal mask
         memory_mask = self._generate_square_subsequent_mask(total_seq_len).to(x.device)
         
-        # Get condition embedding and expand to sequence length
-        cond_emb = self.cond_embed(t, target, action)
-        cond_seq = cond_emb.unsqueeze(1).expand(-1, total_seq_len, -1)
+        # Get condition embeddings
+        t_emb, target_emb, action_emb = self.cond_embed(t, target, action)
         
-        # Add condition to transformer input
-        transformer_input = transformer_input + cond_seq
-        
-        # Self-attention with causal mask
-        transformer_output = self.transformer(
-            tgt=transformer_input,
-            memory=transformer_input,
-            tgt_mask=memory_mask,
-            memory_mask=memory_mask
-        )
+        # Apply transformer layers with cross-attention
+        output = transformer_input
+        for layer in self.layers:
+            output = layer(
+                tgt=output,
+                memory=output,  # Self-attention uses same input as key/value
+                tgt_mask=memory_mask,
+                target_cond=target_emb,
+                action_cond=action_emb,
+                t_cond=t_emb
+            )
         
         # Extract current sequence part (exclude history data)
+        if history is not None:
+            current_output = output[:, -seq_len:, :]
+        else:
+            current_output = output
+        
+        # Final projection
+        output = self.output_proj(current_output)
+        
+        return output
+
+    def _generate_square_subsequent_mask(self, sz):
+        mask = (torch.triu(torch.ones(sz, sz)) == 1).transpose(0, 1)
+        mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
+        return mask
+
+# Alternative implementation using standard TransformerDecoder with memory as conditions
+class AlternativeDiffusionTransformer(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        
+        # Input projection
+        self.input_proj = nn.Linear(config.state_dim, config.latent_dim)
+        
+        # Positional encoding
+        self.pos_encoding = PositionalEncoding(config.latent_dim)
+        
+        # Condition embedding and projection
+        self.cond_embed = ConditionEmbedding(config)
+        self.cond_proj = nn.Linear(config.latent_dim * 3, config.latent_dim)
+        
+        # Transformer layers
+        transformer_layer = nn.TransformerDecoderLayer(
+            d_model=config.latent_dim,
+            nhead=config.num_heads,
+            dim_feedforward=config.latent_dim * 4,
+            dropout=config.dropout,
+            batch_first=True
+        )
+        self.transformer = nn.TransformerDecoder(
+            transformer_layer, num_layers=config.num_layers
+        )
+        
+        # Output projection
+        self.output_proj = nn.Linear(config.latent_dim, config.state_dim)
+
+    def forward(self, x, t, target, action, history=None):
+        batch_size, seq_len, _ = x.shape
+        
+        # Project input to latent space
+        x_emb = self.input_proj(x)
+        
+        # Add positional encoding
+        x_emb = self.pos_encoding(x_emb.transpose(0, 1)).transpose(0, 1)
+        
+        # Prepare transformer input
+        if history is not None:
+            if history.size(0) != batch_size:
+                if history.size(0) == 1:
+                    history = history.repeat(batch_size, 1, 1)
+                else:
+                    raise ValueError(f"History data batch size mismatch")
+            
+            history_emb = self.input_proj(history)
+            history_emb = self.pos_encoding(history_emb.transpose(0, 1)).transpose(0, 1)
+            
+            # Concatenate history data with current sequence along sequence dimension
+            transformer_input = torch.cat([history_emb, x_emb], dim=1)
+            total_seq_len = history_emb.size(1) + seq_len
+        else:
+            transformer_input = x_emb
+            total_seq_len = seq_len
+        
+        # Generate causal mask for self-attention
+        memory_mask = self._generate_square_subsequent_mask(total_seq_len).to(x.device)
+        
+        # Get condition embeddings and combine them as memory
+        t_emb, target_emb, action_emb = self.cond_embed(t, target, action)
+        
+        # Combine conditions and project to latent dimension
+        combined_cond = torch.cat([t_emb, target_emb, action_emb], dim=-1)
+        cond_memory = self.cond_proj(combined_cond)
+        
+        # Expand memory to sequence length for cross-attention
+        cond_memory = cond_memory.unsqueeze(1).expand(-1, total_seq_len, -1)
+        
+        # Transformer with conditions as memory for cross-attention
+        transformer_output = self.transformer(
+            tgt=transformer_input,
+            memory=cond_memory,
+            tgt_mask=memory_mask,
+            memory_mask=None  # No mask for conditions
+        )
+        
+        # Extract current sequence part
         if history is not None:
             current_output = transformer_output[:, -seq_len:, :]
         else:
@@ -176,7 +342,7 @@ class DiffusionTransformer(nn.Module):
         mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
         return mask
 
-# Diffusion process with linear noise schedule
+# Diffusion process with linear noise schedule (unchanged)
 class DiffusionProcess:
     def __init__(self, config):
         self.config = config
@@ -229,12 +395,15 @@ class DiffusionProcess:
             
             return x_prev
 
-# Complete Aerobatic Diffusion Model (AeroDM)
+# Complete Aerobatic Diffusion Model (AeroDM) - choose which transformer to use
 class AeroDM(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, use_cross_attention=True):
         super().__init__()
         self.config = config
-        self.diffusion_model = DiffusionTransformer(config)
+        if use_cross_attention:
+            self.diffusion_model = DiffusionTransformer(config)
+        else:
+            self.diffusion_model = AlternativeDiffusionTransformer(config)
         self.diffusion_process = DiffusionProcess(config)
         
     def forward(self, x_t, t, target, action, history=None):
@@ -331,7 +500,7 @@ def plot_training_losses(losses):
     plt.grid(True)
     plt.show()
 
-def generate_enhanced_circular_trajectories(num_trajectories=100, seq_len=60, radius=10.0, height=50.0):
+def generate_aerobatic_trajectories(num_trajectories=100, seq_len=60, radius=10.0, height=50.0):
     """Generate diverse aerobatic trajectories based on five maneuver styles:
     (a) Power Loop, (b) Barrel Roll, (c) Split-S, (d) Immelmann Turn, (e) Wall Ride."""
     trajectories = []
@@ -853,13 +1022,16 @@ def test_model_performance(model, trajectories_norm, mean, std, num_test_samples
     
     model.train()
 
+
+# Modify the training function to use cross-attention
 def train_improved_aerodm():
-    """Enhanced training function with z-axis improvements"""
+    """Enhanced training function with cross-attention for conditions"""
     config = Config()
-    model = AeroDM(config)
+    model = AeroDM(config, use_cross_attention=True)  # Use cross-attention version
     
     # Set device to MPS if available
-    device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+    # device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+    device = torch.device("cpu")
     model = model.to(device)
     
     # Move diffusion process tensors to device
@@ -868,7 +1040,7 @@ def train_improved_aerodm():
     model.diffusion_process.alpha_bars = model.diffusion_process.alpha_bars.to(device)
     
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
-    criterion = ImprovedAeroDMLoss(config)  # Use improved loss
+    criterion = ImprovedAeroDMLoss(config)
     
     # Training parameters
     num_epochs = 50
@@ -877,7 +1049,7 @@ def train_improved_aerodm():
     
     print("Generating enhanced circular trajectory data...")
     # Generate enhanced training data
-    trajectories = generate_enhanced_circular_trajectories(
+    trajectories = generate_aerobatic_trajectories(
         num_trajectories=num_trajectories,
         seq_len=config.seq_len + config.history_len
     )
@@ -891,7 +1063,7 @@ def train_improved_aerodm():
     # Store losses for plotting
     losses = {'total': [], 'position': [], 'vel': []}
     
-    print("Starting improved training with z-axis focus...")
+    print("Starting improved training with cross-attention...")
     for epoch in range(num_epochs):
         epoch_total_loss = 0
         epoch_position_loss = 0
@@ -911,7 +1083,7 @@ def train_improved_aerodm():
             target = generate_target_waypoints(full_traj)  # From full trajectory end
             action = generate_action_styles(actual_batch_size, config.action_dim, device=device)
             history = generate_history_segments(full_traj, config.history_len, device=device)  # First 5 steps
-            x_0 = full_traj[:, config.history_len:, :]  # FIXED: Last 60 steps (prediction sequence)
+            x_0 = full_traj[:, config.history_len:, :]  # Last 60 steps (prediction sequence)
             
             # Sample diffusion time step
             t = torch.randint(0, config.diffusion_steps, (actual_batch_size,), device=device)
@@ -919,7 +1091,7 @@ def train_improved_aerodm():
             # Forward diffusion
             noisy_x, noise = model.diffusion_process.q_sample(x_0, t)
             
-            # Model prediction
+            # Model prediction with cross-attention
             pred_x0 = model(noisy_x, t, target, action, history)
             
             # Calculate loss
@@ -949,6 +1121,10 @@ def train_improved_aerodm():
         if epoch % 5 == 0:
             print(f"Epoch {epoch}: Total Loss: {avg_total:.4f}, "
                   f"Position: {avg_position:.4f}, Vel: {avg_vel:.4f}")
+            
+        if avg_position < 0.02:
+            print("Early stopping as position loss is below threshold.")
+            break
     
     # Plot training losses
     plot_training_losses(losses)
@@ -961,76 +1137,52 @@ def train_improved_aerodm():
         'optimizer_state_dict': optimizer.state_dict(),
         'epoch': epoch,
         'loss': losses,
-    }, "model/improved_aerodm_checkpoint.pth")
+    }, "model/cross_attention_aerodm_checkpoint.pth")
 
     return model, losses, trajectories, mean, std
 
-def load_trained_model(checkpoint_path, device='cuda' if torch.cuda.is_available() else 'cpu'):
-    """Load trained model"""
-    config = Config()
-    model = AeroDM(config)
-    
-    checkpoint = torch.load(checkpoint_path, map_location=device)
-    model.load_state_dict(checkpoint['model_state_dict'])
-    model = model.to(device)
-    model.eval()
-    
-    # Move diffusion process parameters to device
-    model.diffusion_process.betas = model.diffusion_process.betas.to(device)
-    model.diffusion_process.alphas = model.diffusion_process.alphas.to(device)
-    model.diffusion_process.alpha_bars = model.diffusion_process.alpha_bars.to(device)
-    
-    print(f"Model loaded successfully! Using device: {device}")
-    return model, config
-
-def run_model_validation(checkpoint_path, num_test_cases=5):
-    """Run model validation"""
-    # Set device
-    device = torch.device("mps" if torch.backends.mps.is_available() else 
-                         "cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
-    
-    # Load model
-    model, config = load_trained_model(checkpoint_path, device)
-    
-    print("Generating enhanced circular trajectory data...")
-    # Generate enhanced training data
-    trajectories = generate_enhanced_circular_trajectories(
-        num_trajectories=num_test_cases,
-        seq_len=config.seq_len + config.history_len
-    )
-    
-    # Normalize trajectories
-    trajectories_norm, mean, std = normalize_trajectories(trajectories)
-    trajectories_norm = trajectories_norm.to(device)
-    mean = mean.to(device)
-    std = std.to(device)
-    
-    # Test model performance
-    test_model_performance(model, trajectories_norm, mean, std)
-
 # Main execution
 if __name__ == "__main__":
-    # Specify your model file path
-    checkpoint_path = "model/improved_aerodm_checkpoint.pth"  # Change to your model path
+    print("Training AeroDM with Cross-Attention for Conditional Inputs...")
     
-    try:
-        # Run validation
-        test_cases, trajectories = run_model_validation(checkpoint_path, num_test_cases=5)
+    # Generate example enhanced circular trajectories for demonstration
+    print("Generating example enhanced circular trajectories...")
+    demo_trajectories = generate_aerobatic_trajectories(num_trajectories=18, seq_len=60)
+    
+    # Visualize some training data with z-axis focus
+    fig = plt.figure(figsize=(15, 10))
+    for i in range(6):
+        ax = fig.add_subplot(3, 6, i+1, projection='3d')
+        trajectory = demo_trajectories[i, :, 1:4].numpy()
+        ax.plot(trajectory[:, 0], trajectory[:, 1], trajectory[:, 2], 'b-', linewidth=2)
+        ax.set_title(f'Enhanced Circular Trajectory {i+1}')
+        ax.set_xlabel('X')
+        ax.set_ylabel('Y')
+        ax.set_zlabel('Z')
+        ax.grid(True)
         
-        print("\n" + "="*60)
-        print("Model validation completed!")
-        print("="*60)
-        
-    except FileNotFoundError:
-        print(f"Error: Model file '{checkpoint_path}' not found")
-        print("Please ensure the model file path is correct, or use the following to download an example model:")
-        print("1. Check file path")
-        print("2. If file doesn't exist, you need to train the model first")
-        
-    except Exception as e:
-        print(f"Error during validation: {e}")
-        print("Possible reasons:")
-        print("1. Model file corrupted")
-        print("2. Model structure doesn't match code")
-        print("3. Device incompatibility")
+        ax = fig.add_subplot(3, 6, i+6+1, projection='3d')
+        trajectory = demo_trajectories[i+6, :, 1:4].numpy()
+        ax.plot(trajectory[:, 0], trajectory[:, 1], trajectory[:, 2], 'b-', linewidth=2)
+        ax.set_title(f'Enhanced Circular Trajectory {i+7}')
+        ax.set_xlabel('X')
+        ax.set_ylabel('Y')
+        ax.set_zlabel('Z')
+        ax.grid(True)
+
+        ax = fig.add_subplot(3, 6, i+12+1, projection='3d')
+        trajectory = demo_trajectories[i+12, :, 1:4].numpy()
+        ax.plot(trajectory[:, 0], trajectory[:, 1], trajectory[:, 2], 'b-', linewidth=2)
+        ax.set_title(f'Enhanced Circular Trajectory {i+13}')
+        ax.set_xlabel('X')
+        ax.set_ylabel('Y')
+        ax.set_zlabel('Z')
+        ax.grid(True)
+    
+    plt.tight_layout()
+    plt.show()
+    
+    # Train with cross-attention method
+    trained_model, losses, trajectories, mean, std = train_improved_aerodm()
+    
+    print("Training completed! Cross-attention should provide better conditional integration.")

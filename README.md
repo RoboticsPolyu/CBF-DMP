@@ -138,7 +138,7 @@ Enhanced synthetic data generation for urban scenarios:
 
 ```python
 # Generate diverse aerobatic trajectories
-trajectories = generate_enhanced_circular_trajectories(
+trajectories = generate_aerobatic_trajectories(
     num_trajectories=1000,
     seq_len=60,
     radius=10.0,

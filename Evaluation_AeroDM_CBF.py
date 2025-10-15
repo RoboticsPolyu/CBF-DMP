@@ -9,7 +9,7 @@ import numpy as np
 # Import your model and utility functions
 from AeroDM_CBF import (
     Config, AeroDM,
-    generate_enhanced_circular_trajectories,
+    generate_aerobatic_trajectories,
     normalize_trajectories, denormalize_trajectories,
     generate_target_waypoints, generate_action_styles, generate_history_segments,
     plot_circular_trajectory_comparison, analyze_z_axis_performance
@@ -32,7 +32,7 @@ def visualize_samples(model, mean, std, num_samples=3):
     config = model.config
 
     # Generate test trajectories
-    test_trajectories = generate_enhanced_circular_trajectories(
+    test_trajectories = generate_aerobatic_trajectories(
         num_trajectories=num_samples,
         seq_len=config.seq_len + config.history_len
     ).to(device)
@@ -93,7 +93,7 @@ if __name__ == "__main__":
     if mean is None or std is None:
         # If not saved, generate training data and compute mean/std
         print("Mean/Std not found in checkpoint, generating training data for normalization...")
-        trajectories = generate_enhanced_circular_trajectories(
+        trajectories = generate_aerobatic_trajectories(
             num_trajectories=500,
             seq_len=model.config.seq_len + model.config.history_len
         ).to(device)

@@ -10,8 +10,8 @@ from typing import List, Dict
 
 # Import your model and utility functions
 from AeroDM_CBF_OBSMLP_v2 import (
-    Config, EnhancedAeroDM,
-    generate_enhanced_circular_trajectories,
+    Config, AeroDM,
+    generate_aerobatic_trajectories,
     normalize_trajectories, denormalize_trajectories,
     generate_target_waypoints, generate_action_styles, 
     generate_history_segments, generate_random_obstacles
@@ -19,7 +19,7 @@ from AeroDM_CBF_OBSMLP_v2 import (
 
 def load_model(checkpoint_path, device):
     config = Config()
-    model = EnhancedAeroDM(config).to(device)
+    model = AeroDM(config).to(device)
     checkpoint = torch.load(checkpoint_path, map_location=device)
     model.load_state_dict(checkpoint['model_state_dict'])
     model.eval()
@@ -145,7 +145,7 @@ def visualize_samples(model, mean, std, num_samples=3):
     config = model.config
 
     # Generate test trajectories
-    test_trajectories = generate_enhanced_circular_trajectories(
+    test_trajectories = generate_aerobatic_trajectories(
         num_trajectories=num_samples,
         seq_len=config.seq_len + config.history_len
     ).to(device)
@@ -216,7 +216,7 @@ if __name__ == "__main__":
     if mean is None or std is None:
         # If not saved, generate training data and compute mean/std
         print("Mean/Std not found in checkpoint, generating training data for normalization...")
-        trajectories = generate_enhanced_circular_trajectories(
+        trajectories = generate_aerobatic_trajectories(
             num_trajectories=500,
             seq_len=model.config.seq_len + model.config.history_len
         ).to(device)

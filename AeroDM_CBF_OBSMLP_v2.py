@@ -149,7 +149,7 @@ class ObstacleEncoder(nn.Module):
         return obstacle_emb
     
 # Enhanced Condition Embedding with Obstacle Information
-class EnhancedConditionEmbedding(nn.Module):
+class ConditionEmbedding(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
@@ -216,7 +216,7 @@ class ObstacleAwareDiffusionTransformer(nn.Module):
         self.pos_encoding = PositionalEncoding(config.latent_dim)
         
         # Enhanced condition embedding with obstacle information
-        self.cond_embed = EnhancedConditionEmbedding(config)
+        self.cond_embed = ConditionEmbedding(config)
         
         # Transformer layers
         transformer_layer = nn.TransformerDecoderLayer(
@@ -659,7 +659,7 @@ class ObstacleAwareDiffusionProcess:
             print(f"CBF - Barrier V: {barrier_info['V'][0].item():.4f}, Gamma_t: {barrier_info['gamma_t'][0].item():.4f}")
             
 # Enhanced AeroDM with Obstacle Awareness
-class EnhancedAeroDM(nn.Module):
+class AeroDM(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
@@ -742,7 +742,7 @@ class EnhancedAeroDM(nn.Module):
         return x_t
 
 # Pos Error, Velocity Error, Obstacle Distance Loss
-class UnifiedAeroDMLoss(nn.Module):
+class AeroDMLoss(nn.Module):
     """
     Unified loss function for AeroDM training.
     Combines position, velocity, speed, attitude, and optional obstacle avoidance losses.
@@ -952,7 +952,7 @@ def plot_training_losses(losses):
     plt.grid(True)
     plt.show()
 
-def generate_enhanced_circular_trajectories(num_trajectories=100, seq_len=60, radius=10.0, height=0.0):
+def generate_aerobatic_trajectories(num_trajectories=100, seq_len=60, radius=10.0, height=0.0):
     """Generate diverse aerobatic trajectories based on eleven maneuver styles:
     (a) Power Loop, (b) Barrel Roll, (c) Split-S, (d) Immelmann Turn, (e) Wall Ride,
     (f) Eight Figure, (g) Patrick, (h) Star, (i) Half Moon, (j) Sphinx, (k) Clover."""
@@ -1215,7 +1215,7 @@ def generate_history_segments(trajectories, history_len=5, device=None):
     return torch.stack(histories)
 
 # Update the test function to demonstrate CBF guidance with diffusion visualization
-def test_enhanced_model_performance(model, trajectories_norm, mean, std, num_test_samples=3):
+def test_model_performance(model, trajectories_norm, mean, std, num_test_samples=3):
     """Enhanced testing with obstacle-aware transformer"""
     print("\nTesting enhanced obstacle-aware model performance...")
     config = model.config
@@ -1265,7 +1265,7 @@ def test_enhanced_model_performance(model, trajectories_norm, mean, std, num_tes
             history_denorm = denormalize_trajectories(history, mean, std)
             
             # Enhanced visualization with obstacles
-            plot_enhanced_trajectory_comparison(
+            plot_trajectory_comparison(
                 x_0_denorm, sampled_unguided_denorm, sampled_guided_denorm, 
                 history=history_denorm, target=target_denorm, obstacles=obstacles,
                 title=f"Enhanced Obstacle-Aware Test Sample {i+1}\n(Transformer + CBF Guidance)"
@@ -1273,7 +1273,7 @@ def test_enhanced_model_performance(model, trajectories_norm, mean, std, num_tes
 
     model.train()
 
-def plot_enhanced_trajectory_comparison(original, sampled_unguided_denorm, sampled_guided_denorm, history=None, 
+def plot_trajectory_comparison(original, sampled_unguided_denorm, sampled_guided_denorm, history=None, 
                                       target=None, obstacles=None, title="Enhanced Trajectory Comparison"):
     """Enhanced visualization with multiple obstacles and trajectory comparison"""
     fig = plt.figure(figsize=(20, 15))
@@ -1298,7 +1298,7 @@ def plot_enhanced_trajectory_comparison(original, sampled_unguided_denorm, sampl
     fixed_max = np.array([20.0, 20.0, 20.0])
 
     # 1. 3D trajectory plot with history, target, and multiple obstacles
-    ax1 = fig.add_subplot(341, projection='3d')
+    ax1 = fig.add_subplot(331, projection='3d')
     
     # Plot history (if available)
     if history_pos is not None:
@@ -1369,7 +1369,7 @@ def plot_enhanced_trajectory_comparison(original, sampled_unguided_denorm, sampl
     ax1.grid(True)
     
     # 2. X-Y projection with obstacles
-    ax2 = fig.add_subplot(342)
+    ax2 = fig.add_subplot(332)
     if history_pos is not None:
         ax2.plot(history_pos[:, 0], history_pos[:, 1], 'm-', label='History', linewidth=4, alpha=0.8, marker='o', markersize=4)
     ax2.plot(original_pos[:, 0], original_pos[:, 1], 'b-', label='Original', linewidth=3, alpha=0.8)
@@ -1398,7 +1398,7 @@ def plot_enhanced_trajectory_comparison(original, sampled_unguided_denorm, sampl
     ax2.axis('equal')
     
     # 3. X-Z projection with obstacles
-    ax3 = fig.add_subplot(343)
+    ax3 = fig.add_subplot(333)
     if history_pos is not None:
         ax3.plot(history_pos[:, 0], history_pos[:, 2], 'm-', label='History', linewidth=4, alpha=0.8, marker='o', markersize=4)
     ax3.plot(original_pos[:, 0], original_pos[:, 2], 'b-', label='Original', linewidth=3, alpha=0.8)
@@ -1425,7 +1425,7 @@ def plot_enhanced_trajectory_comparison(original, sampled_unguided_denorm, sampl
     ax3.axis('equal')
     
     # 4. Y-Z projection with obstacles
-    ax4 = fig.add_subplot(344)
+    ax4 = fig.add_subplot(334)
     if history_pos is not None:
         ax4.plot(history_pos[:, 1], history_pos[:, 2], 'm-', label='History', linewidth=4, alpha=0.8, marker='o', markersize=4)
     ax4.plot(original_pos[:, 1], original_pos[:, 2], 'b-', label='Original', linewidth=3, alpha=0.8)
@@ -1453,7 +1453,7 @@ def plot_enhanced_trajectory_comparison(original, sampled_unguided_denorm, sampl
     
     # 5. Position components over time
     time_steps = np.arange(original_pos.shape[0])
-    ax5 = fig.add_subplot(345)
+    ax5 = fig.add_subplot(335)
     ax5.plot(time_steps, original_pos[:, 0], 'b-', label='Original X', linewidth=2)
     ax5.plot(time_steps, reconstructed_pos[:, 0], 'r--', label='Reconstructed X', linewidth=2)
     ax5.plot(time_steps, sampled_pos[:, 0], 'g-.', label='Sampled Guided X', linewidth=2)
@@ -1463,7 +1463,7 @@ def plot_enhanced_trajectory_comparison(original, sampled_unguided_denorm, sampl
     ax5.set_title('X Position Over Time')
     ax5.grid(True)
     
-    ax6 = fig.add_subplot(346)
+    ax6 = fig.add_subplot(336)
     ax6.plot(time_steps, original_pos[:, 1], 'b-', label='Original Y', linewidth=2)
     ax6.plot(time_steps, reconstructed_pos[:, 1], 'r--', label='Reconstructed Y', linewidth=2)
     ax6.plot(time_steps, sampled_pos[:, 1], 'g-.', label='Sampled Guided Y', linewidth=2)
@@ -1473,7 +1473,7 @@ def plot_enhanced_trajectory_comparison(original, sampled_unguided_denorm, sampl
     ax6.set_title('Y Position Over Time')
     ax6.grid(True)
     
-    ax7 = fig.add_subplot(347)
+    ax7 = fig.add_subplot(337)
     ax7.plot(time_steps, original_pos[:, 2], 'b-', label='Original Z', linewidth=2)
     ax7.plot(time_steps, reconstructed_pos[:, 2], 'r--', label='Reconstructed Z', linewidth=2)
     ax7.plot(time_steps, sampled_pos[:, 2], 'g-.', label='Sampled Guided Z', linewidth=2)
@@ -1488,7 +1488,7 @@ def plot_enhanced_trajectory_comparison(original, sampled_unguided_denorm, sampl
     reconstructed_speed = sampled_unguided_denorm[0, :, 0].detach().cpu().numpy()
     sampled_speed = sampled_guided_denorm[0, :, 0].detach().cpu().numpy()
     
-    ax8 = fig.add_subplot(348)
+    ax8 = fig.add_subplot(338)
     ax8.plot(time_steps, original_speed, 'b-', label='Original Speed', linewidth=2)
     ax8.plot(time_steps, reconstructed_speed, 'r--', label='Reconstructed Speed', linewidth=2)
     ax8.plot(time_steps, sampled_speed, 'g-.', label='Sampled Guided Speed', linewidth=2)
@@ -1498,103 +1498,22 @@ def plot_enhanced_trajectory_comparison(original, sampled_unguided_denorm, sampl
     ax8.set_title('Speed Over Time')
     ax8.grid(True)
     
-    # 9. Obstacle distance analysis
-    ax9 = fig.add_subplot(349)
-    if obstacles is not None and len(obstacles) > 0:
-        # Calculate minimum distance to any obstacle for each trajectory
-        min_dist_original = []
-        min_dist_sampled = []
-        
-        for t in range(original_pos.shape[0]):
-            # For original trajectory
-            dists_original = [np.linalg.norm(original_pos[t] - obstacle['center'].cpu().numpy()) - obstacle['radius'] 
-                            for obstacle in obstacles]
-            min_dist_original.append(min(dists_original))
-            
-            # For sampled trajectory
-            dists_sampled = [np.linalg.norm(sampled_pos[t] - obstacle['center'].cpu().numpy()) - obstacle['radius'] 
-                           for obstacle in obstacles]
-            min_dist_sampled.append(min(dists_sampled))
-        
-        ax9.plot(time_steps, min_dist_original, 'b-', label='Original Min Distance', linewidth=2)
-        ax9.plot(time_steps, min_dist_sampled, 'g-', label='Sampled Min Distance', linewidth=2)
-        ax9.axhline(y=0, color='r', linestyle='--', alpha=0.5, label='Collision Threshold')
-        ax9.set_xlabel('Time Step')
-        ax9.set_ylabel('Distance to Nearest Obstacle')
-        ax9.legend()
-        ax9.set_title('Obstacle Avoidance Performance')
-        ax9.grid(True)
-    else:
-        ax9.text(0.5, 0.5, 'No Obstacles\nAvailable', ha='center', va='center', transform=ax9.transAxes)
-        ax9.set_title('Obstacle Distance Analysis')
     
     # 10. Error analysis
     recon_error = np.linalg.norm(reconstructed_pos - original_pos, axis=1)
     sampled_error = np.linalg.norm(sampled_pos - original_pos, axis=1)
     
-    ax10 = fig.add_subplot(3,4,10)
-    ax10.plot(time_steps, recon_error, 'r-', label='Reconstruction Error', linewidth=2)
-    ax10.plot(time_steps, sampled_error, 'g-', label='Sampling Error', linewidth=2)
-    ax10.set_xlabel('Time Step')
-    ax10.set_ylabel('Position Error')
-    ax10.legend()
-    ax10.set_title('Position Error Over Time')
-    ax10.grid(True)
-    
-    # 11. Obstacle information summary
-    ax11 = fig.add_subplot(3,4,11)
-    if obstacles is not None:
-        obstacle_info = []
-        for i, obstacle in enumerate(obstacles):
-            center = obstacle['center'].cpu().numpy() if hasattr(obstacle['center'], 'cpu') else obstacle['center']
-            radius = obstacle['radius']
-            obstacle_info.append(f'Obs {i+1}: ({center[0]:.1f}, {center[1]:.1f}, {center[2]:.1f})\nR: {radius:.1f}')
-        
-        ax11.axis('off')
-        obstacle_text = f"Obstacles: {len(obstacles)}\n\n" + "\n".join(obstacle_info[:5])  # Show first 5
-        if len(obstacles) > 5:
-            obstacle_text += f"\n... and {len(obstacles) - 5} more"
-        ax11.text(0.1, 0.9, obstacle_text, transform=ax11.transAxes, fontsize=10, 
-                 verticalalignment='top', bbox=dict(boxstyle='round', facecolor='lightgray', alpha=0.7))
-    else:
-        ax11.axis('off')
-        ax11.text(0.5, 0.5, 'No Obstacles', ha='center', va='center', transform=ax11.transAxes,
-                 bbox=dict(boxstyle='round', facecolor='lightgray', alpha=0.7))
-    ax11.set_title('Obstacle Information')
-    
-    # 12. Performance statistics
-    ax12 = fig.add_subplot(3,4,12)
-    stats_data = [
-        np.mean(recon_error), np.std(recon_error), np.max(recon_error),
-        np.mean(sampled_error), np.std(sampled_error), np.max(sampled_error)
-    ]
-    stats_labels = ['Recon Mean', 'Recon Std', 'Recon Max', 'Sample Mean', 'Sample Std', 'Sample Max']
-    bars = ax12.bar(range(len(stats_data)), stats_data, color=['red', 'red', 'red', 'green', 'green', 'green'])
-    ax12.set_xticks(range(len(stats_data)))
-    ax12.set_xticklabels(stats_labels, rotation=45)
-    ax12.set_ylabel('Error Value')
-    ax12.set_title('Performance Statistics')
-    
-    # Add value labels on bars
-    for bar, value in zip(bars, stats_data):
-        ax12.text(bar.get_x() + bar.get_width()/2, bar.get_height(), f'{value:.3f}', 
-                 ha='center', va='bottom', fontsize=8)
+    ax9 = fig.add_subplot(339)
+    ax9.plot(time_steps, recon_error, 'r-', label='Reconstruction Error', linewidth=2)
+    ax9.plot(time_steps, sampled_error, 'g-', label='Sampling Error', linewidth=2)
+    ax9.set_xlabel('Time Step')
+    ax9.set_ylabel('Position Error')
+    ax9.legend()
+    ax9.set_title('Position Error Over Time')
+    ax9.grid(True)
     
     plt.tight_layout()
     plt.show()
-    
-    # Print detailed analysis
-    print("\n=== Enhanced Trajectory Analysis ===")
-    print(f"Reconstruction - Total Error: {np.mean(recon_error):.4f} ± {np.std(recon_error):.4f}")
-    print(f"Sampling - Total Error: {np.mean(sampled_error):.4f} ± {np.std(sampled_error):.4f}")
-    
-    if obstacles is not None and len(obstacles) > 0:
-        # Calculate collision statistics
-        collisions_original = sum(1 for dist in min_dist_original if dist < 0)
-        collisions_sampled = sum(1 for dist in min_dist_sampled if dist < 0)
-        print(f"Original Trajectory - Collisions: {collisions_original}/{len(min_dist_original)} time steps")
-        print(f"Sampled Trajectory - Collisions: {collisions_sampled}/{len(min_dist_sampled)} time steps")
-        print(f"Number of obstacles: {len(obstacles)}")
 
 # Enhanced Loss Function with Obstacle Distance Term
 class ObstacleAwareAeroDMLoss(nn.Module):
@@ -1698,7 +1617,7 @@ class ObstacleAwareAeroDMLoss(nn.Module):
         
         return total_loss, position_loss, vel_loss, obstacle_loss
 
-def train_enhanced_aerodm(use_obstacle_loss=True):
+def train_aerodm(use_obstacle_loss=True):
     """
     Enhanced training function with obstacle-aware transformer and configurable loss function
     
@@ -1706,7 +1625,7 @@ def train_enhanced_aerodm(use_obstacle_loss=True):
         use_obstacle_loss: Boolean flag to use obstacle-aware loss or basic loss
     """
     config = Config()
-    model = EnhancedAeroDM(config)
+    model = AeroDM(config)
     
     # Set device
     device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
@@ -1724,7 +1643,7 @@ def train_enhanced_aerodm(use_obstacle_loss=True):
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
     
     # Select loss function based on flag
-    criterion = UnifiedAeroDMLoss(
+    criterion = AeroDMLoss(
         config, 
         enable_obstacle_term=use_obstacle_loss,
         safe_extra_factor=0.2,  # Safety buffer as fraction of radius (e.g., 20%)
@@ -1732,7 +1651,7 @@ def train_enhanced_aerodm(use_obstacle_loss=True):
         obstacle_weight=10.0,   # Weight for obstacle term
         continuity_weight=5.0   # Weight for continuity term
     )
-    print(f"Using UnifiedAeroDMLoss (obstacle term: {use_obstacle_loss})")
+    print(f"Using AeroDMLoss (obstacle term: {use_obstacle_loss})")
     
     # Training parameters
     num_epochs = 50
@@ -1740,7 +1659,7 @@ def train_enhanced_aerodm(use_obstacle_loss=True):
     num_trajectories = 20000
     
     print("Generating training data with obstacle-aware transformer...")
-    trajectories = generate_enhanced_circular_trajectories(
+    trajectories = generate_aerobatic_trajectories(
         num_trajectories=num_trajectories,
         seq_len=config.seq_len + config.history_len
     )
@@ -1916,7 +1835,7 @@ def train_enhanced_aerodm(use_obstacle_loss=True):
     model.config.enable_cbf_guidance = True
     
     # Test enhanced model performance on test set
-    test_enhanced_model_performance(model, test_norm, mean, std, num_test_samples=30)
+    test_model_performance(model, test_norm, mean, std, num_test_samples=30)
     
     # Save model checkpoint
     checkpoint = {
@@ -1942,7 +1861,7 @@ if __name__ == "__main__":
     
     # # Generate example enhanced circular trajectories for demonstration
     # print("Generating example enhanced circular trajectories...")
-    # demo_trajectories = generate_enhanced_circular_trajectories(num_trajectories=18, seq_len=60)
+    # demo_trajectories = generate_aerobatic_trajectories(num_trajectories=18, seq_len=60)
     
     # # Visualize some training data with z-axis focus
     # plt.style.use('seaborn-v0_8-whitegrid')  # Use a clean style
@@ -2003,6 +1922,6 @@ if __name__ == "__main__":
     # plt.show()
 
     # Train with enhanced obstacle-aware model and loss
-    trained_model, losses, trajectories, mean, std = train_enhanced_aerodm()
+    trained_model, losses, trajectories, mean, std = train_aerodm()
     
     print("Training completed! Obstacle information integrated into both transformer and loss function.")

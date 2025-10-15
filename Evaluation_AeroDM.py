@@ -32,15 +32,6 @@ class Config:
     target_dim = 3  # p_t ∈ R^3
     action_dim = 5   # 5 maneuver styles
 
-    # CBF Guidance parameters (from CoDiG paper)
-    enable_cbf_guidance = False
-    guidance_gamma = 1.0  # Base gamma for barrier guidance
-    obstacle_radius = 5.0  # Safe distance radius
-    
-    @staticmethod
-    def get_obstacle_center(device='cpu'):
-        return torch.tensor([5.0, 5.0, 10.0], device=device)  # Example obstacle center
-
 # Transformer positional encoding
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model, max_len=5000):
@@ -185,38 +176,7 @@ class DiffusionTransformer(nn.Module):
         mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
         return mask
 
-# CBF Barrier Function (from CoDiG: quadratic barrier for obstacle avoidance)
-def compute_barrier_and_grad(x, config):
-    """
-    Compute barrier V and its gradient ∇V for the trajectory x.
-    Example: Quadratic barrier for spherical obstacle avoidance.
-    V = sum_τ max(0, r - ||pos_τ - center||)^2
-    ∇V affects only position components (indices 1:4).
-    """
-    pos = x[:, :, 1:4]  # (batch, seq_len, 3)
-    
-    # Get obstacle center on the correct device
-    center = config.get_obstacle_center(x.device).unsqueeze(0).unsqueeze(0)  # (1,1,3)
-    r = config.obstacle_radius
-    
-    dist = torch.norm(pos - center, dim=-1, keepdim=False)  # (batch, seq_len)
-    excess = torch.clamp(r - dist, min=0.0)  # (batch, seq_len)
-    V = (excess ** 2).sum(dim=-1)  # (batch,)
-    
-    # Gradient: ∇_pos V_τ = -2 * excess_τ * (pos_τ - center) / dist_τ if dist < r else 0
-    grad_pos = torch.zeros_like(pos)
-    unsafe_mask = dist < r
-    if unsafe_mask.any():
-        direction = (pos - center) / (dist.unsqueeze(-1) + 1e-8)  # Unit vector away from center
-        grad_pos[unsafe_mask] = -2.0 * excess[unsafe_mask].unsqueeze(-1) * direction[unsafe_mask]
-    
-    # Embed into full state gradient (only positions affected)
-    grad_x = torch.zeros_like(x)
-    grad_x[:, :, 1:4] = grad_pos
-    
-    return V, grad_x
-
-# Diffusion process with linear noise schedule and CoDiG CBF guidance
+# Diffusion process with linear noise schedule
 class DiffusionProcess:
     def __init__(self, config):
         self.config = config
@@ -240,70 +200,32 @@ class DiffusionProcess:
         
         return x_t, noise
     
-    def p_sample(self, model, x_t, t, target, action, history=None, guidance_gamma=None):
-        """
-        Reverse diffusion process: p(x_{t-1} | x_t) with optional CoDiG CBF guidance.
-        Vectorized over batch for efficiency.
-        """
-        batch_size = x_t.size(0)
-        device = x_t.device
-        
+    def p_sample(self, model, x_t, t, target, action, history=None):
+        """Reverse diffusion process: p(x_{t-1} | x_t)"""
         with torch.no_grad():
-            pred_x0 = model(x_t, t, target, action, history)  # (batch, seq, state_dim)
+            pred_x0 = model(x_t, t, target, action, history)
             
-            # Expand t for broadcasting
-            t_exp = t.view(batch_size, 1, 1) if t.dim() == 1 else t.view(-1, 1, 1)
+            batch_size = x_t.size(0)
+            x_prev = torch.zeros_like(x_t)
             
-            alpha_bar_t = self.alpha_bars[t_exp.squeeze(1)].view(batch_size, 1, 1)
-            alpha_t = self.alphas[t_exp.squeeze(1)].view(batch_size, 1, 1)
-            beta_t = self.betas[t_exp.squeeze(1)].view(batch_size, 1, 1)
-            one_minus_alpha_bar_t = 1 - alpha_bar_t
-            
-            # Compute predicted noise from pred_x0
-            sqrt_alpha_bar_t = torch.sqrt(alpha_bar_t)
-            sqrt_one_minus_alpha_bar_t = torch.sqrt(one_minus_alpha_bar_t)
-            ε_pred = (x_t - sqrt_alpha_bar_t * pred_x0) / sqrt_one_minus_alpha_bar_t
-            
-            # Compute score s_theta ≈ -ε_pred / sqrt(1 - α_bar_t)
-            sigma_t = sqrt_one_minus_alpha_bar_t
-            s_theta = - ε_pred / sigma_t
-            
-            # Apply CBF guidance if enabled
-            ε_guided = ε_pred.clone()
-            if self.config.enable_cbf_guidance and guidance_gamma is not None:
-                # Compute γ_t (scheduled: increases with t for stronger late guidance)
-                gamma_t = guidance_gamma * (t_exp.squeeze(1).float() / self.num_timesteps)
+            for i in range(batch_size):
+                t_val = t[i].item() if t.dim() > 0 else t.item()
                 
-                # Compute barrier gradient ∇V
-                _, grad_V = compute_barrier_and_grad(x_t, self.config)  # (batch, seq, state_dim)
-                
-                # Guided score: s_guided = s_theta - γ_t ∇V
-                s_guided = s_theta - gamma_t.view(batch_size, 1, 1) * grad_V
-                
-                # Guided noise
-                ε_guided = - s_guided * sigma_t
-            
-            # Compute mean μ using guided noise (standard DDPM formula)
-            coeff = (1 - alpha_t) / sqrt_one_minus_alpha_bar_t
-            mu = (1 / torch.sqrt(alpha_t)) * (x_t - coeff * ε_guided)
-            
-            # For t=0, return pred_x0 (or guided equivalent)
-            is_t_zero = (t_exp.squeeze(1) == 0).all()
-            if is_t_zero:
-                # Compute guided pred_x0 for consistency
-                pred_x0_guided = (x_t - sqrt_one_minus_alpha_bar_t * ε_guided) / sqrt_alpha_bar_t
-                return pred_x0_guided
-            
-            # Variance (DDPM posterior variance)
-            alpha_bar_prev = self.alpha_bars[t_exp.squeeze(1) - 1].view(batch_size, 1, 1) if t.min() > 0 else torch.ones_like(alpha_bar_t)
-            var = beta_t * (1 - alpha_bar_prev) / one_minus_alpha_bar_t
-            sigma = torch.sqrt(var)
-            
-            # Sample noise
-            z = torch.randn_like(x_t)
-            
-            # x_{t-1}
-            x_prev = mu + sigma * z
+                if t_val > 0:
+                    alpha_bar_t = self.alpha_bars[t_val]
+                    alpha_bar_t_prev = self.alpha_bars[t_val-1] if t_val > 0 else torch.tensor(1.0, device=x_t.device)
+                    beta_t = self.betas[t_val]
+                    
+                    coeff_x0 = (alpha_bar_t_prev.sqrt() * beta_t) / (1 - alpha_bar_t)
+                    coeff_xt = ((1 - alpha_bar_t_prev) * self.alphas[t_val].sqrt()) / (1 - alpha_bar_t)
+                    
+                    mean = coeff_x0 * pred_x0[i] + coeff_xt * x_t[i]
+                    
+                    noise = torch.randn_like(x_t[i])
+                    variance = ((1 - alpha_bar_t_prev) / (1 - alpha_bar_t)) * beta_t
+                    x_prev[i] = mean + variance.sqrt() * noise
+                else:
+                    x_prev[i] = pred_x0[i]
             
             return x_prev
 
@@ -318,7 +240,7 @@ class AeroDM(nn.Module):
     def forward(self, x_t, t, target, action, history=None):
         return self.diffusion_model(x_t, t, target, action, history)
     
-    def sample(self, target, action, history=None, batch_size=1, enable_guidance=True, guidance_gamma=None):
+    def sample(self, target, action, history=None, batch_size=1):
         device = next(self.parameters()).device
         
         if target.size(0) != batch_size:
@@ -339,9 +261,8 @@ class AeroDM(nn.Module):
         # Reverse diffusion process
         for t_step in reversed(range(self.config.diffusion_steps)):
             t_batch = torch.full((batch_size,), t_step, device=device, dtype=torch.long)
-            gamma = guidance_gamma if enable_guidance else None
             x_t = self.diffusion_process.p_sample(
-                self.diffusion_model, x_t, t_batch, target, action, history, gamma
+                self.diffusion_model, x_t, t_batch, target, action, history
             )
         
         return x_t
@@ -410,7 +331,7 @@ def plot_training_losses(losses):
     plt.grid(True)
     plt.show()
 
-def generate_enhanced_circular_trajectories(num_trajectories=100, seq_len=60, radius=10.0, height=0.0):
+def generate_aerobatic_trajectories(num_trajectories=100, seq_len=60, radius=10.0, height=50.0):
     """Generate diverse aerobatic trajectories based on five maneuver styles:
     (a) Power Loop, (b) Barrel Roll, (c) Split-S, (d) Immelmann Turn, (e) Wall Ride."""
     trajectories = []
@@ -576,8 +497,8 @@ def analyze_z_axis_performance(original, reconstructed, sampled):
     plt.tight_layout()
     plt.show()
 
-def plot_circular_trajectory_comparison(original, reconstructed, sampled, history=None, target=None, title="Circular Trajectory Comparison", obstacle_center=None, obstacle_radius=None):
-    """Enhanced visualization with history, target, and obstacle (for CBF demo)"""
+def plot_circular_trajectory_comparison(original, reconstructed, sampled, history=None, target=None, title="Circular Trajectory Comparison"):
+    """Enhanced visualization with history, target, and different colors"""
     fig = plt.figure(figsize=(20, 15))
     fig.suptitle(title, fontsize=16)
     
@@ -595,7 +516,7 @@ def plot_circular_trajectory_comparison(original, reconstructed, sampled, histor
     if target is not None:
         target_pos = target[0, :].detach().cpu().numpy()  # target is [x, y, z]
     
-    # 1. 3D trajectory plot with history, target, and obstacle
+    # 1. 3D trajectory plot with history and target
     ax1 = fig.add_subplot(341, projection='3d')
     
     # Plot history (if available)
@@ -617,112 +538,152 @@ def plot_circular_trajectory_comparison(original, reconstructed, sampled, histor
         ax1.scatter(target_pos[0], target_pos[1], target_pos[2], 
                    c='yellow', s=200, marker='*', label='Target Waypoint', edgecolors='black', linewidth=2)
     
-    # Plot obstacle (if provided)
-    if obstacle_center is not None and obstacle_radius is not None:
-        u = np.linspace(0, 2 * np.pi, 20)
-        v = np.linspace(0, np.pi, 10)
-        obs_x = obstacle_center[0] + obstacle_radius * np.outer(np.cos(u), np.sin(v))
-        obs_y = obstacle_center[1] + obstacle_radius * np.outer(np.sin(u), np.sin(v))
-        obs_z = obstacle_center[2] + obstacle_radius * np.outer(np.ones(np.size(u)), np.cos(v))
-        ax1.plot_surface(obs_x, obs_y, obs_z, alpha=0.3, color='red', label='Obstacle')
-    
     ax1.set_xlabel('X')
     ax1.set_ylabel('Y')
     ax1.set_zlabel('Z')
     ax1.legend()
-    ax1.set_title('3D Trajectory Comparison with History, Target & Obstacle')
+    ax1.set_title('3D Trajectory Comparison with History & Target')
     ax1.grid(True)
     
-    # 2. X-Y projection
+    # 2. XY plane projection
     ax2 = fig.add_subplot(342)
+    
     if history_pos is not None:
-        ax2.plot(history_pos[:, 0], history_pos[:, 1], 'm-', label='History', linewidth=4, alpha=0.8, marker='o', markersize=4)
-    ax2.plot(original_pos[:, 0], original_pos[:, 1], 'b-', label='Original', linewidth=3, alpha=0.8)
-    ax2.plot(reconstructed_pos[:, 0], reconstructed_pos[:, 1], 'r.-', label='Reconstructed', linewidth=2, alpha=0.8)
-    ax2.plot(sampled_pos[:, 0], sampled_pos[:, 1], 'g.-', label='Sampled', linewidth=2, alpha=0.8)
+        ax2.plot(history_pos[:, 0], history_pos[:, 1], 'm-', label='History', linewidth=4, marker='o', markersize=4)
+    
+    ax2.plot(original_pos[:, 0], original_pos[:, 1], 'b-', label='Original', linewidth=3)
+    ax2.plot(reconstructed_pos[:, 0], reconstructed_pos[:, 1], 'r.-', label='Reconstructed', linewidth=2)
+    ax2.plot(sampled_pos[:, 0], sampled_pos[:, 1], 'g.-', label='Sampled', linewidth=2)
+    
     if target_pos is not None:
-        ax2.scatter(target_pos[0], target_pos[1], c='yellow', s=200, marker='*', label='Target', edgecolors='black', linewidth=2)
-    if obstacle_center is not None and obstacle_radius is not None:
-        circle = plt.Circle((obstacle_center[0], obstacle_center[1]), obstacle_radius, color='red', alpha=0.3, label='Obstacle')
-        ax2.add_patch(circle)
+        ax2.scatter(target_pos[0], target_pos[1], c='yellow', s=150, marker='*', 
+                   label='Target', edgecolors='black', linewidth=2)
+    
     ax2.set_xlabel('X')
     ax2.set_ylabel('Y')
     ax2.legend()
-    ax2.set_title('X-Y Projection')
+    ax2.set_title('XY Plane Projection')
     ax2.grid(True)
     ax2.axis('equal')
     
-    # 3. X-Z projection
+    # 3. XZ plane projection (Focus on Z-axis)
     ax3 = fig.add_subplot(343)
+    
     if history_pos is not None:
-        ax3.plot(history_pos[:, 0], history_pos[:, 2], 'm-', label='History', linewidth=4, alpha=0.8, marker='o', markersize=4)
-    ax3.plot(original_pos[:, 0], original_pos[:, 2], 'b-', label='Original', linewidth=3, alpha=0.8)
-    ax3.plot(reconstructed_pos[:, 0], reconstructed_pos[:, 2], 'r.-', label='Reconstructed', linewidth=2, alpha=0.8)
-    ax3.plot(sampled_pos[:, 0], sampled_pos[:, 2], 'g.-', label='Sampled', linewidth=2, alpha=0.8)
+        ax3.plot(history_pos[:, 0], history_pos[:, 2], 'm-', label='History', linewidth=4, marker='o', markersize=4)
+    
+    ax3.plot(original_pos[:, 0], original_pos[:, 2], 'b-', label='Original', linewidth=3)
+    ax3.plot(reconstructed_pos[:, 0], reconstructed_pos[:, 2], 'r--', label='Reconstructed', linewidth=2)
+    ax3.plot(sampled_pos[:, 0], sampled_pos[:, 2], 'g-.', label='Sampled', linewidth=2)
+    
     if target_pos is not None:
-        ax3.scatter(target_pos[0], target_pos[2], c='yellow', s=200, marker='*', label='Target', edgecolors='black', linewidth=2)
-    if obstacle_center is not None and obstacle_radius is not None:
-        circle = plt.Circle((obstacle_center[0], obstacle_center[2]), obstacle_radius, color='red', alpha=0.3, label='Obstacle')
-        ax3.add_patch(circle)
+        ax3.scatter(target_pos[0], target_pos[2], c='yellow', s=150, marker='*', 
+                   label='Target', edgecolors='black', linewidth=2)
+    
     ax3.set_xlabel('X')
     ax3.set_ylabel('Z')
     ax3.legend()
-    ax3.set_title('X-Z Projection')
+    ax3.set_title('XZ Plane Projection (Z-axis Focus)')
     ax3.grid(True)
-    ax3.axis('equal')
     
-    # 4. Y-Z projection
+    # 4. YZ plane projection (Focus on Z-axis)
     ax4 = fig.add_subplot(344)
+    
     if history_pos is not None:
-        ax4.plot(history_pos[:, 1], history_pos[:, 2], 'm-', label='History', linewidth=4, alpha=0.8, marker='o', markersize=4)
-    ax4.plot(original_pos[:, 1], original_pos[:, 2], 'b-', label='Original', linewidth=3, alpha=0.8)
-    ax4.plot(reconstructed_pos[:, 1], reconstructed_pos[:, 2], 'r.-', label='Reconstructed', linewidth=2, alpha=0.8)
-    ax4.plot(sampled_pos[:, 1], sampled_pos[:, 2], 'g.-', label='Sampled', linewidth=2, alpha=0.8)
+        ax4.plot(history_pos[:, 1], history_pos[:, 2], 'm-', label='History', linewidth=4, marker='o', markersize=4)
+    
+    ax4.plot(original_pos[:, 1], original_pos[:, 2], 'b-', label='Original', linewidth=3)
+    ax4.plot(reconstructed_pos[:, 1], reconstructed_pos[:, 2], 'r--', label='Reconstructed', linewidth=2)
+    ax4.plot(sampled_pos[:, 1], sampled_pos[:, 2], 'g-.', label='Sampled', linewidth=2)
+    
     if target_pos is not None:
-        ax4.scatter(target_pos[1], target_pos[2], c='yellow', s=200, marker='*', label='Target', edgecolors='black', linewidth=2)
-    if obstacle_center is not None and obstacle_radius is not None:
-        circle = plt.Circle((obstacle_center[1], obstacle_center[2]), obstacle_radius, color='red', alpha=0.3, label='Obstacle')
-        ax4.add_patch(circle)
+        ax4.scatter(target_pos[1], target_pos[2], c='yellow', s=150, marker='*', 
+                   label='Target', edgecolors='black', linewidth=2)
+    
     ax4.set_xlabel('Y')
     ax4.set_ylabel('Z')
     ax4.legend()
-    ax4.set_title('Y-Z Projection')
+    ax4.set_title('YZ Plane Projection (Z-axis Focus)')
     ax4.grid(True)
-    ax4.axis('equal')
     
-    # 5. Position components over time
+    # 5. Z-axis only comparison
     time_steps = np.arange(original_pos.shape[0])
     ax5 = fig.add_subplot(345)
-    ax5.plot(time_steps, original_pos[:, 0], 'b-', label='Original X', linewidth=2)
-    ax5.plot(time_steps, reconstructed_pos[:, 0], 'r--', label='Reconstructed X', linewidth=2)
-    ax5.plot(time_steps, sampled_pos[:, 0], 'g-.', label='Sampled X', linewidth=2)
+    
+    # Add history time steps if available
+    if history_pos is not None:
+        history_time = np.arange(-len(history_pos), 0)
+        ax5.plot(history_time, history_pos[:, 2], 'm-', label='History Z', linewidth=3, marker='o', markersize=4)
+    
+    ax5.plot(time_steps, original_pos[:, 2], 'b-', label='Original Z', linewidth=3)
+    ax5.plot(time_steps, reconstructed_pos[:, 2], 'r--', label='Reconstructed Z', linewidth=2)
+    ax5.plot(time_steps, sampled_pos[:, 2], 'g-.', label='Sampled Z', linewidth=2)
+    
+    if target_pos is not None:
+        ax5.axhline(y=target_pos[2], color='yellow', linestyle=':', linewidth=2, label='Target Z')
+    
     ax5.set_xlabel('Time Step')
-    ax5.set_ylabel('X Position')
+    ax5.set_ylabel('Z Value')
     ax5.legend()
-    ax5.set_title('X Position Over Time')
+    ax5.set_title('Z-axis Values Over Time')
     ax5.grid(True)
     
+    # 6. Timeline visualization showing history -> prediction
     ax6 = fig.add_subplot(346)
-    ax6.plot(time_steps, original_pos[:, 1], 'b-', label='Original Y', linewidth=2)
-    ax6.plot(time_steps, reconstructed_pos[:, 1], 'r--', label='Reconstructed Y', linewidth=2)
-    ax6.plot(time_steps, sampled_pos[:, 1], 'g-.', label='Sampled Y', linewidth=2)
-    ax6.set_xlabel('Time Step')
-    ax6.set_ylabel('Y Position')
+    
+    # Combine history and current trajectories for timeline view
+    all_time_steps = []
+    all_original_z = []
+    all_reconstructed_z = []
+    all_sampled_z = []
+    
+    if history_pos is not None:
+        history_time = np.arange(-len(history_pos), 0)
+        all_time_steps.extend(history_time)
+        all_original_z.extend(history_pos[:, 2])
+        all_reconstructed_z.extend(history_pos[:, 2])  # History is same for all
+        all_sampled_z.extend(history_pos[:, 2])
+    
+    all_time_steps.extend(time_steps)
+    all_original_z.extend(original_pos[:, 2])
+    all_reconstructed_z.extend(reconstructed_pos[:, 2])
+    all_sampled_z.extend(sampled_pos[:, 2])
+    
+    ax6.plot(all_time_steps, all_original_z, 'b-', label='Original', linewidth=3)
+    ax6.plot(all_time_steps, all_reconstructed_z, 'r--', label='Reconstructed', linewidth=2)
+    ax6.plot(all_time_steps, all_sampled_z, 'g-.', label='Sampled', linewidth=2)
+    
+    # Add vertical line separating history from prediction
+    if history_pos is not None:
+        ax6.axvline(x=-0.5, color='black', linestyle='--', alpha=0.7, label='History/Prediction Boundary')
+    
+    if target_pos is not None:
+        ax6.axhline(y=target_pos[2], color='yellow', linestyle=':', linewidth=2, label='Target Z')
+    
+    ax6.set_xlabel('Time Step (Negative: History, Positive: Prediction)')
+    ax6.set_ylabel('Z Value')
     ax6.legend()
-    ax6.set_title('Y Position Over Time')
+    ax6.set_title('Complete Timeline: History + Prediction')
     ax6.grid(True)
     
+    # 7. Position error with separate z-error
+    recon_error = np.linalg.norm(reconstructed_pos - original_pos, axis=1)
+    sampled_error = np.linalg.norm(sampled_pos - original_pos, axis=1)
+    recon_z_error = np.abs(reconstructed_pos[:, 2] - original_pos[:, 2])
+    sampled_z_error = np.abs(sampled_pos[:, 2] - original_pos[:, 2])
+    
     ax7 = fig.add_subplot(347)
-    ax7.plot(time_steps, original_pos[:, 2], 'b-', label='Original Z', linewidth=2)
-    ax7.plot(time_steps, reconstructed_pos[:, 2], 'r--', label='Reconstructed Z', linewidth=2)
-    ax7.plot(time_steps, sampled_pos[:, 2], 'g-.', label='Sampled Z', linewidth=2)
+    ax7.plot(time_steps, recon_error, 'r-', label='Recon Total Error', linewidth=2)
+    ax7.plot(time_steps, sampled_error, 'g-', label='Sample Total Error', linewidth=2)
+    ax7.plot(time_steps, recon_z_error, 'r--', label='Recon Z Error', linewidth=2, alpha=0.7)
+    ax7.plot(time_steps, sampled_z_error, 'g--', label='Sample Z Error', linewidth=2, alpha=0.7)
     ax7.set_xlabel('Time Step')
-    ax7.set_ylabel('Z Position')
+    ax7.set_ylabel('Error')
     ax7.legend()
-    ax7.set_title('Z Position Over Time')
+    ax7.set_title('Error Analysis (Z-error highlighted)')
     ax7.grid(True)
     
-    # 8. Speed comparison
+    # 8. Velocity comparison
     original_speed = original[0, :, 0].detach().cpu().numpy()
     reconstructed_speed = reconstructed[0, :, 0].detach().cpu().numpy()
     sampled_speed = sampled[0, :, 0].detach().cpu().numpy()
@@ -734,71 +695,123 @@ def plot_circular_trajectory_comparison(original, reconstructed, sampled, histor
     ax8.set_xlabel('Time Step')
     ax8.set_ylabel('Speed')
     ax8.legend()
-    ax8.set_title('Speed Over Time')
+    ax8.set_title('Speed Comparison')
     ax8.grid(True)
     
-    # 9. Error analysis
-    recon_error = np.linalg.norm(reconstructed_pos - original_pos, axis=1)
-    sampled_error = np.linalg.norm(sampled_pos - original_pos, axis=1)
-    
+    # 9. Error statistics including history-target relationship
     ax9 = fig.add_subplot(349)
-    ax9.plot(time_steps, recon_error, 'r-', label='Reconstruction Error', linewidth=2)
-    ax9.plot(time_steps, sampled_error, 'g-', label='Sampling Error', linewidth=2)
-    ax9.set_xlabel('Time Step')
-    ax9.set_ylabel('Position Error')
-    ax9.legend()
-    ax9.set_title('Position Error Over Time')
-    ax9.grid(True)
+    errors = {
+        'Recon Total': np.mean(recon_error),
+        'Sample Total': np.mean(sampled_error),
+        'Recon Z': np.mean(recon_z_error),
+        'Sample Z': np.mean(sampled_z_error)
+    }
     
-    # 10. Cumulative error
-    ax10 = fig.add_subplot(3,4,10)
-    ax10.plot(time_steps, np.cumsum(recon_error), 'r-', label='Cumulative Recon Error', linewidth=2)
-    ax10.plot(time_steps, np.cumsum(sampled_error), 'g-', label='Cumulative Sample Error', linewidth=2)
-    ax10.set_xlabel('Time Step')
-    ax10.set_ylabel('Cumulative Error')
-    ax10.legend()
-    ax10.set_title('Cumulative Position Error')
-    ax10.grid(True)
+    # Add target distance if available
+    target_distance = None
+    if target_pos is not None:
+        final_original_pos = original_pos[-1]
+        target_distance = np.linalg.norm(final_original_pos - target_pos)
+        errors['Target Dist'] = target_distance
     
-    # 11. Error distribution
-    ax11 = fig.add_subplot(3,4,11)
-    errors = [recon_error, sampled_error]
-    ax11.boxplot(errors, labels=['Reconstruction', 'Sampling'])
-    ax11.set_ylabel('Position Error')
-    ax11.set_title('Error Distribution')
-    ax11.grid(True)
+    colors = ['red', 'green', 'darkred', 'darkgreen', 'orange']
+    ax9.bar(range(len(errors)), list(errors.values()), color=colors[:len(errors)])
+    ax9.set_xticks(range(len(errors)))
+    ax9.set_xticklabels(list(errors.keys()), rotation=45)
+    ax9.set_ylabel('Mean Error / Distance')
+    ax9.set_title('Error & Target Distance Comparison')
+    ax9.grid(True, alpha=0.3)
+    
+    # 10. Target achievement analysis
+    ax10 = fig.add_subplot(3, 4, 10)
+    
+    if target_pos is not None:
+        # Calculate distance to target over time
+        recon_target_dist = np.linalg.norm(reconstructed_pos - target_pos, axis=1)
+        sampled_target_dist = np.linalg.norm(sampled_pos - target_pos, axis=1)
+        original_target_dist = np.linalg.norm(original_pos - target_pos, axis=1)
+        
+        ax10.plot(time_steps, original_target_dist, 'b-', label='Original to Target', linewidth=2)
+        ax10.plot(time_steps, recon_target_dist, 'r--', label='Recon to Target', linewidth=2)
+        ax10.plot(time_steps, sampled_target_dist, 'g-.', label='Sampled to Target', linewidth=2)
+        ax10.set_xlabel('Time Step')
+        ax10.set_ylabel('Distance to Target')
+        ax10.legend()
+        ax10.set_title('Distance to Target Over Time')
+        ax10.grid(True)
+    
+    # 11. History continuity analysis
+    ax11 = fig.add_subplot(3, 4, 11)
+    
+    if history_pos is not None:
+        # Check continuity between history and predictions
+        history_end = history_pos[-1]
+        recon_start = reconstructed_pos[0]
+        sampled_start = sampled_pos[0]
+        original_start = original_pos[0]
+        
+        continuity_errors = {
+            'Original': np.linalg.norm(original_start - history_end),
+            'Reconstructed': np.linalg.norm(recon_start - history_end),
+            'Sampled': np.linalg.norm(sampled_start - history_end)
+        }
+        
+        colors = ['blue', 'red', 'green']
+        ax11.bar(range(len(continuity_errors)), list(continuity_errors.values()), color=colors)
+        ax11.set_xticks(range(len(continuity_errors)))
+        ax11.set_xticklabels(list(continuity_errors.keys()), rotation=45)
+        ax11.set_ylabel('Continuity Error')
+        ax11.set_title('History-Prediction Continuity')
+        ax11.grid(True, alpha=0.3)
     
     # 12. Summary statistics
-    ax12 = fig.add_subplot(3,4,12)
-    stats_data = [
-        np.mean(recon_error), np.std(recon_error), np.max(recon_error),
-        np.mean(sampled_error), np.std(sampled_error), np.max(sampled_error)
-    ]
-    stats_labels = ['Recon Mean', 'Recon Std', 'Recon Max', 'Sample Mean', 'Sample Std', 'Sample Max']
-    bars = ax12.bar(range(len(stats_data)), stats_data, color=['red', 'red', 'red', 'green', 'green', 'green'])
-    ax12.set_xticks(range(len(stats_data)))
-    ax12.set_xticklabels(stats_labels, rotation=45)
-    ax12.set_ylabel('Error Value')
-    ax12.set_title('Error Statistics')
+    ax12 = fig.add_subplot(3, 4, 12)
     
-    # Add value labels on bars
-    for bar, value in zip(bars, stats_data):
-        ax12.text(bar.get_x() + bar.get_width()/2, bar.get_height(), f'{value:.3f}', 
-                 ha='center', va='bottom', fontsize=8)
+    summary_stats = []
+    stat_labels = []
+    
+    # Basic statistics
+    summary_stats.extend([np.mean(original_pos[:, 2]), np.std(original_pos[:, 2])])
+    stat_labels.extend(['Mean Z', 'Std Z'])
+    
+    # Error statistics
+    summary_stats.extend([np.mean(recon_z_error), np.mean(sampled_z_error)])
+    stat_labels.extend(['Recon Z Err', 'Sample Z Err'])
+    
+    if target_pos is not None:
+        summary_stats.append(target_distance)
+        stat_labels.append('Final Target Dist')
+    
+    ax12.bar(range(len(summary_stats)), summary_stats, color='lightblue', alpha=0.7)
+    ax12.set_xticks(range(len(summary_stats)))
+    ax12.set_xticklabels(stat_labels, rotation=45)
+    ax12.set_ylabel('Values')
+    ax12.set_title('Summary Statistics')
+    ax12.grid(True, alpha=0.3)
     
     plt.tight_layout()
     plt.show()
     
     # Print detailed error analysis
     print("\n=== Detailed Error Analysis ===")
-    print(f"Reconstruction - Total Error: {np.mean(recon_error):.4f} ± {np.std(recon_error):.4f}")
-    print(f"Sampling - Total Error: {np.mean(sampled_error):.4f} ± {np.std(sampled_error):.4f}")
+    print(f"Reconstruction - Total Error: {np.mean(recon_error):.4f}, Z-error: {np.mean(recon_z_error):.4f}")
+    print(f"Sampling - Total Error: {np.mean(sampled_error):.4f}, Z-error: {np.mean(sampled_z_error):.4f}")
+    
+    if target_pos is not None:
+        print(f"Final Target Distance - Original: {np.linalg.norm(original_pos[-1] - target_pos):.4f}")
+        print(f"Final Target Distance - Reconstructed: {np.linalg.norm(reconstructed_pos[-1] - target_pos):.4f}")
+        print(f"Final Target Distance - Sampled: {np.linalg.norm(sampled_pos[-1] - target_pos):.4f}")
+    
+    if history_pos is not None:
+        print(f"History-Prediction Continuity Error - Original: {np.linalg.norm(original_pos[0] - history_pos[-1]):.4f}")
+        print(f"History-Prediction Continuity Error - Reconstructed: {np.linalg.norm(reconstructed_pos[0] - history_pos[-1]):.4f}")
+        print(f"History-Prediction Continuity Error - Sampled: {np.linalg.norm(sampled_pos[0] - history_pos[-1]):.4f}")
 
-# Update the test function to demonstrate CBF guidance
+# Update the test function to pass history and target
 def test_model_performance(model, trajectories_norm, mean, std, num_test_samples=3):
-    """Enhanced testing with history, target, and CBF guidance visualization"""
-    print("\nTesting model performance with CBF guidance...")
-    config = model.config  # Access config from model
+    """Enhanced testing with history and target visualization"""
+    print("\nTesting model performance with history and target visualization...")
+    config = Config()
     device = next(model.parameters()).device
     
     model.eval()
@@ -809,37 +822,34 @@ def test_model_performance(model, trajectories_norm, mean, std, num_test_samples
             target_norm = generate_target_waypoints(full_traj)  # From full trajectory end
             action = generate_action_styles(1, config.action_dim, device=device)
             history = generate_history_segments(full_traj, config.history_len, device=device)  # First 5 steps
-            x_0 = full_traj[:, config.history_len:, :]  # Last 60 steps (prediction sequence)
+            x_0 = full_traj[:, config.history_len:, :]  # FIXED: Last 60 steps (prediction sequence)
             
             # Denormalize target for plotting only (model uses normalized)
             target_denorm = target_norm * std[0, 0, 1:4] + mean[0, 0, 1:4]  # Position dims only
             
-            # Sample without guidance
-            sampled_unguided = model.sample(target_norm, action, history, batch_size=1, enable_guidance=False)
-            sampled_unguided_denorm = denormalize_trajectories(sampled_unguided, mean, std)
+            # Add noise and reconstruct
+            t = torch.randint(0, config.diffusion_steps, (1,), device=device)
+            noisy_x, _ = model.diffusion_process.q_sample(x_0, t)
+            reconstructed = model(noisy_x, t, target_norm, action, history)  # Pass normalized to model
             
-            # Sample with CBF guidance
-            sampled_guided = model.sample(target_norm, action, history, batch_size=1, enable_guidance=True, guidance_gamma=config.guidance_gamma)
-            sampled_guided_denorm = denormalize_trajectories(sampled_guided, mean, std)
+            # Sample new trajectory
+            sampled = model.sample(target_norm, action, history, batch_size=1)  # Normalized input to model
             
-            # Denormalize others
+            # Denormalize for visualization
             x_0_denorm = denormalize_trajectories(x_0, mean, std)
+            reconstructed_denorm = denormalize_trajectories(reconstructed, mean, std)
+            sampled_denorm = denormalize_trajectories(sampled, mean, std)
             history_denorm = denormalize_trajectories(history, mean, std)
             
-            # Get obstacle center for plotting
-            obstacle_center = config.get_obstacle_center('cpu').numpy()
-            
-            # Visualize: unguided vs guided, with obstacle
+            # Visualize results with history and denormalized target
             plot_circular_trajectory_comparison(
-                x_0_denorm, sampled_unguided_denorm, sampled_guided_denorm, 
+                x_0_denorm, reconstructed_denorm, sampled_denorm, 
                 history=history_denorm, target=target_denorm,
-                title=f"CBF Guidance Test Sample {i+1}\n(Guided: Green avoids Red Obstacle)",
-                obstacle_center=obstacle_center,
-                obstacle_radius=config.obstacle_radius
+                title=f"Enhanced Circular Trajectory Test Sample {i+1}\n(History: Magenta, Target: Yellow Star)"
             )
             
-            # Z-axis analysis on guided
-            analyze_z_axis_performance(x_0_denorm, sampled_unguided_denorm, sampled_guided_denorm)
+            # Z-axis specific analysis
+            analyze_z_axis_performance(x_0_denorm, reconstructed_denorm, sampled_denorm)
     
     model.train()
 
@@ -851,7 +861,6 @@ def train_improved_aerodm():
     # Set device to MPS if available
     device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
     model = model.to(device)
-    model.config = config  # Attach config to model for access
     
     # Move diffusion process tensors to device
     model.diffusion_process.betas = model.diffusion_process.betas.to(device)
@@ -868,7 +877,7 @@ def train_improved_aerodm():
     
     print("Generating enhanced circular trajectory data...")
     # Generate enhanced training data
-    trajectories = generate_enhanced_circular_trajectories(
+    trajectories = generate_aerobatic_trajectories(
         num_trajectories=num_trajectories,
         seq_len=config.seq_len + config.history_len
     )
@@ -940,14 +949,11 @@ def train_improved_aerodm():
         if epoch % 5 == 0:
             print(f"Epoch {epoch}: Total Loss: {avg_total:.4f}, "
                   f"Position: {avg_position:.4f}, Vel: {avg_vel:.4f}")
-        if avg_position < 0.02:
-            print("Early stopping as position loss is below threshold.")
-            break
-
+    
     # Plot training losses
     plot_training_losses(losses)
     
-    # Test model performance with CBF
+    # Test model performance
     test_model_performance(model, trajectories_norm, mean, std)
     
     torch.save({
@@ -955,53 +961,76 @@ def train_improved_aerodm():
         'optimizer_state_dict': optimizer.state_dict(),
         'epoch': epoch,
         'loss': losses,
-    }, "model/improved_aerodm_with_cbf.pth")
+    }, "model/improved_aerodm_checkpoint.pth")
 
     return model, losses, trajectories, mean, std
 
+def load_trained_model(checkpoint_path, device='cuda' if torch.cuda.is_available() else 'cpu'):
+    """Load trained model"""
+    config = Config()
+    model = AeroDM(config)
+    
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    model = model.to(device)
+    model.eval()
+    
+    # Move diffusion process parameters to device
+    model.diffusion_process.betas = model.diffusion_process.betas.to(device)
+    model.diffusion_process.alphas = model.diffusion_process.alphas.to(device)
+    model.diffusion_process.alpha_bars = model.diffusion_process.alpha_bars.to(device)
+    
+    print(f"Model loaded successfully! Using device: {device}")
+    return model, config
+
+def run_model_validation(checkpoint_path, num_test_cases=5):
+    """Run model validation"""
+    # Set device
+    device = torch.device("mps" if torch.backends.mps.is_available() else 
+                         "cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+    
+    # Load model
+    model, config = load_trained_model(checkpoint_path, device)
+    
+    print("Generating enhanced circular trajectory data...")
+    # Generate enhanced training data
+    trajectories = generate_aerobatic_trajectories(
+        num_trajectories=num_test_cases,
+        seq_len=config.seq_len + config.history_len
+    )
+    
+    # Normalize trajectories
+    trajectories_norm, mean, std = normalize_trajectories(trajectories)
+    trajectories_norm = trajectories_norm.to(device)
+    mean = mean.to(device)
+    std = std.to(device)
+    
+    # Test model performance
+    test_model_performance(model, trajectories_norm, mean, std)
+
 # Main execution
 if __name__ == "__main__":
-    print("Training Improved AeroDM with CBF Guidance Integration...")
+    # Specify your model file path
+    checkpoint_path = "model/improved_aerodm_checkpoint.pth"  # Change to your model path
     
-    # Generate example enhanced circular trajectories for demonstration
-    print("Generating example enhanced circular trajectories...")
-    demo_trajectories = generate_enhanced_circular_trajectories(num_trajectories=18, seq_len=60)
-    
-    # Visualize some training data with z-axis focus
-    fig = plt.figure(figsize=(15, 10))
-    for i in range(6):
-        ax = fig.add_subplot(3, 6, i+1, projection='3d')
-        trajectory = demo_trajectories[i, :, 1:4].numpy()
-        ax.plot(trajectory[:, 0], trajectory[:, 1], trajectory[:, 2], 'b-', linewidth=2)
-        ax.set_title(f'Enhanced Circular Trajectory {i+1}')
-        ax.set_xlabel('X')
-        ax.set_ylabel('Y')
-        ax.set_zlabel('Z')
-        ax.grid(True)
+    try:
+        # Run validation
+        test_cases, trajectories = run_model_validation(checkpoint_path, num_test_cases=5)
         
-        ax = fig.add_subplot(3, 6, i+6+1, projection='3d')
-        trajectory = demo_trajectories[i+6, :, 1:4].numpy()
-        ax.plot(trajectory[:, 0], trajectory[:, 1], trajectory[:, 2], 'b-', linewidth=2)
-        ax.set_title(f'Enhanced Circular Trajectory {i+7}')
-        ax.set_xlabel('X')
-        ax.set_ylabel('Y')
-        ax.set_zlabel('Z')
-        ax.grid(True)
-
-        ax = fig.add_subplot(3, 6, i+12+1, projection='3d')
-        trajectory = demo_trajectories[i+12, :, 1:4].numpy()
-        ax.plot(trajectory[:, 0], trajectory[:, 1], trajectory[:, 2], 'b-', linewidth=2)
-        ax.set_title(f'Enhanced Circular Trajectory {i+13}')
-        ax.set_xlabel('X')
-        ax.set_ylabel('Y')
-        ax.set_zlabel('Z')
-        ax.grid(True)
-    
-    plt.tight_layout()
-    plt.show()
-    
-    # Train with enhanced method and CBF
-    trained_model, losses, trajectories, mean, std = train_improved_aerodm()
-    
-    print("Training completed! CBF guidance integrated for obstacle avoidance.") 
-    
+        print("\n" + "="*60)
+        print("Model validation completed!")
+        print("="*60)
+        
+    except FileNotFoundError:
+        print(f"Error: Model file '{checkpoint_path}' not found")
+        print("Please ensure the model file path is correct, or use the following to download an example model:")
+        print("1. Check file path")
+        print("2. If file doesn't exist, you need to train the model first")
+        
+    except Exception as e:
+        print(f"Error during validation: {e}")
+        print("Possible reasons:")
+        print("1. Model file corrupted")
+        print("2. Model structure doesn't match code")
+        print("3. Device incompatibility")
