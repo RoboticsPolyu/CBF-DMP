@@ -33,7 +33,7 @@ class Config:
     action_dim = 5   # 5 maneuver styles
 
     # CBF Guidance parameters (from CoDiG paper)
-    enable_cbf_guidance = True  # Disabled by default; toggle for inference
+    enable_cbf_guidance = False  # Disabled by default; toggle for inference
     guidance_gamma = 100.0  # Base gamma for barrier guidance
     obstacle_radius = 5.0  # Safe distance radius
     
@@ -186,6 +186,46 @@ class DiffusionTransformer(nn.Module):
         return mask
 
 # CBF Barrier Function (from CoDiG: quadratic barrier for obstacle avoidance)
+# def compute_barrier_and_grad(x, config, mean, std):
+#     """
+#     Compute barrier V and its gradient ∇V for the trajectory x.
+#     Example: Quadratic barrier for spherical obstacle avoidance.
+#     V = sum_τ max(0, r - ||pos_τ - center||)^2
+#     ∇V affects only position components (indices 1:4).
+#     """
+#     # Denormalize positions for barrier computation
+#     pos_denorm = x[:, :, 1:4] * std[0, 0, 1:4] + mean[0, 0, 1:4]
+    
+#     # Get obstacle center on the correct device
+#     center = config.get_obstacle_center(x.device).unsqueeze(0).unsqueeze(0)  # (1,1,3)
+#     r = config.obstacle_radius
+    
+#     dist = torch.norm(pos_denorm - center, dim=-1, keepdim=False)  # (batch, seq_len)
+#     excess = torch.clamp(r - dist, min=0.0)  # (batch, seq_len)
+#     V = (excess ** 2).sum(dim=-1)  # (batch,)
+    
+#     # Gradient: ∇_pos V_τ = -2 * excess_τ * (pos_τ - center) / dist_τ if dist < r else 0
+#     grad_pos_denorm = torch.zeros_like(pos_denorm)
+#     unsafe_mask = dist < r
+#     if unsafe_mask.any():
+#         direction = (pos_denorm - center) / (dist.unsqueeze(-1) + 1e-8)  # Unit vector away from center
+#         grad_pos_denorm[unsafe_mask] = -2.0 * excess[unsafe_mask].unsqueeze(-1) * direction[unsafe_mask]
+    
+#     # Normalize gradient back to normalized space
+#     grad_pos = grad_pos_denorm / std[0, 0, 1:4]
+    
+#     # Embed into full state gradient (only positions affected)
+#     grad_x = torch.zeros_like(x)
+#     grad_x[:, :, 1:4] = grad_pos
+    
+#     # Print grad_V information
+#     print(f"grad_V shape: {grad_x.shape}")
+#     print(f"grad_V norm: {torch.norm(grad_x):.6f}")
+#     print(f"grad_V min/max: {grad_x.min():.6f} / {grad_x.max():.6f}")
+#     print(f"Number of unsafe points: {unsafe_mask.sum().item()}")
+    
+#     return V, grad_x
+
 def compute_barrier_and_grad(x, config, mean, std):
     """
     Compute barrier V and its gradient ∇V for the trajectory x.
@@ -193,36 +233,72 @@ def compute_barrier_and_grad(x, config, mean, std):
     V = sum_τ max(0, r - ||pos_τ - center||)^2
     ∇V affects only position components (indices 1:4).
     """
+    # Ensure mean and std are on the same device as x
+    device = x.device
+    mean = mean.to(device)
+    std = std.to(device)
+    
+    # Handle different possible shapes of mean/std
+    if mean.dim() == 3:
+        pos_mean = mean[0, 0, 1:4]  # Shape (1, 1, state_dim)
+        pos_std = std[0, 0, 1:4]
+    elif mean.dim() == 2:
+        pos_mean = mean[0, 1:4]     # Shape (1, state_dim)
+        pos_std = std[0, 1:4]
+    else:
+        # Fallback: assume last dimension is state_dim
+        pos_mean = mean[..., 1:4].reshape(-1, 3)[0]  # Take first element
+        pos_std = std[..., 1:4].reshape(-1, 3)[0]
+    
     # Denormalize positions for barrier computation
-    pos_denorm = x[:, :, 1:4] * std[0, 0, 1:4] + mean[0, 0, 1:4]
+    pos_denorm = x[:, :, 1:4] * pos_std + pos_mean
     
     # Get obstacle center on the correct device
-    center = config.get_obstacle_center(x.device).unsqueeze(0).unsqueeze(0)  # (1,1,3)
+    center = config.get_obstacle_center(device).unsqueeze(0).unsqueeze(0)  # (1,1,3)
     r = config.obstacle_radius
     
+    # Compute distances and barrier values
     dist = torch.norm(pos_denorm - center, dim=-1, keepdim=False)  # (batch, seq_len)
     excess = torch.clamp(r - dist, min=0.0)  # (batch, seq_len)
     V = (excess ** 2).sum(dim=-1)  # (batch,)
     
-    # Gradient: ∇_pos V_τ = -2 * excess_τ * (pos_τ - center) / dist_τ if dist < r else 0
+    # Gradient computation with robust division
     grad_pos_denorm = torch.zeros_like(pos_denorm)
     unsafe_mask = dist < r
-    if unsafe_mask.any():
-        direction = (pos_denorm - center) / (dist.unsqueeze(-1) + 1e-8)  # Unit vector away from center
-        grad_pos_denorm[unsafe_mask] = -2.0 * excess[unsafe_mask].unsqueeze(-1) * direction[unsafe_mask]
     
-    # Normalize gradient back to normalized space
-    grad_pos = grad_pos_denorm / std[0, 0, 1:4]
+    if unsafe_mask.any():
+        # Safe division with epsilon to avoid NaN
+        diff = pos_denorm - center
+        dist_safe = dist.unsqueeze(-1) + 1e-12  # Increased epsilon for stability
+        direction = diff / dist_safe
+        
+        # Compute gradient: ∇_pos V_τ = -2 * excess_τ * (pos_τ - center) / dist_τ
+        grad_update = -2.0 * excess.unsqueeze(-1) * direction
+        
+        # Only apply to unsafe points
+        grad_pos_denorm[unsafe_mask] = grad_update[unsafe_mask]
+    
+    # Normalize gradient back to normalized space using chain rule
+    # Since x_norm = (x_denorm - mean) / std, then dx_norm/dx_denorm = 1/std
+    # So grad_x_norm = grad_x_denorm / std
+    grad_pos = grad_pos_denorm * pos_std
     
     # Embed into full state gradient (only positions affected)
     grad_x = torch.zeros_like(x)
     grad_x[:, :, 1:4] = grad_pos
     
-    # Print grad_V information
+    # Debug information
+    print(f"=== CBF Barrier Computation ===")
+    print(f"Input x shape: {x.shape}")
+    print(f"Position range - Min: {pos_denorm.min().item():.3f}, Max: {pos_denorm.max().item():.3f}")
+    print(f"Distance range - Min: {dist.min().item():.3f}, Max: {dist.max().item():.3f}")
+    print(f"Barrier V: {V.mean().item():.6f} (per sample)")
     print(f"grad_V shape: {grad_x.shape}")
     print(f"grad_V norm: {torch.norm(grad_x):.6f}")
     print(f"grad_V min/max: {grad_x.min():.6f} / {grad_x.max():.6f}")
     print(f"Number of unsafe points: {unsafe_mask.sum().item()}")
+    print(f"Unsafe percentage: {unsafe_mask.float().mean().item()*100:.2f}%")
+    print("=" * 40)
     
     return V, grad_x
 
@@ -250,6 +326,82 @@ class DiffusionProcess:
         
         return x_t, noise
     
+    # def p_sample(self, model, x_t, t, target, action, history=None, guidance_gamma=None, mean=None, std=None, plot_step=False, step_idx=0):
+    #     """
+    #     Reverse diffusion process: p(x_{t-1} | x_t) with optional CoDiG CBF guidance.
+    #     Vectorized over batch for efficiency.
+    #     """
+    #     batch_size = x_t.size(0)
+    #     device = x_t.device
+        
+    #     with torch.no_grad():
+    #         pred_x0 = model(x_t, t, target, action, history)  # (batch, seq, state_dim)
+            
+    #         # Expand t for broadcasting
+    #         t_exp = t.view(batch_size, 1, 1) if t.dim() == 1 else t.view(-1, 1, 1)
+            
+    #         alpha_bar_t = self.alpha_bars[t_exp.squeeze(1)].view(batch_size, 1, 1)
+    #         alpha_t = self.alphas[t_exp.squeeze(1)].view(batch_size, 1, 1)
+    #         beta_t = self.betas[t_exp.squeeze(1)].view(batch_size, 1, 1)
+    #         one_minus_alpha_bar_t = 1 - alpha_bar_t
+            
+    #         # Compute predicted noise from pred_x0
+    #         sqrt_alpha_bar_t = torch.sqrt(alpha_bar_t)
+    #         sqrt_one_minus_alpha_bar_t = torch.sqrt(one_minus_alpha_bar_t)
+    #         ε_pred = (x_t - sqrt_alpha_bar_t * pred_x0) / sqrt_one_minus_alpha_bar_t
+            
+    #         # Compute score s_theta ≈ -ε_pred / sqrt(1 - α_bar_t)
+    #         sigma_t = sqrt_one_minus_alpha_bar_t
+    #         s_theta = - ε_pred / sigma_t
+            
+    #         # Apply CBF guidance if enabled
+    #         ε_guided = ε_pred.clone()
+    #         barrier_info = None
+            
+    #         if self.config.enable_cbf_guidance and guidance_gamma is not None and mean is not None and std is not None:
+    #             # Compute γ_t (scheduled: increases with t for stronger late guidance)
+    #             gamma_t = guidance_gamma * (t_exp.squeeze(1).float() / self.num_timesteps)
+                
+    #             # Compute barrier gradient ∇V with normalization handling
+    #             V, grad_V = compute_barrier_and_grad(x_t, self.config, mean, std)  # (batch, seq, state_dim)
+    #             barrier_info = {'V': V, 'grad_V': grad_V, 'gamma_t': gamma_t}
+
+    #             # Guided score: s_guided = s_theta - γ_t ∇V
+    #             s_guided = s_theta - gamma_t.view(batch_size, 1, 1) * grad_V
+                
+    #             # Guided noise
+    #             ε_guided = - s_guided * sigma_t
+            
+    #         # Compute mean μ using guided noise (standard DDPM formula)
+    #         coeff = (1 - alpha_t) / sqrt_one_minus_alpha_bar_t
+    #         mu = (1 / torch.sqrt(alpha_t)) * (x_t - coeff * ε_guided)
+            
+    #         # For t=0, return pred_x0 (or guided equivalent)
+    #         is_t_zero = (t_exp.squeeze(1) == 0).all()
+    #         if is_t_zero:
+    #             # Compute guided pred_x0 for consistency
+    #             pred_x0_guided = (x_t - sqrt_one_minus_alpha_bar_t * ε_guided) / sqrt_alpha_bar_t
+                
+    #             # if plot_step:
+    #             #     self._plot_diffusion_step(x_t, pred_x0_guided, t, step_idx, barrier_info, is_final=True)
+    #             return pred_x0_guided
+            
+    #         # Variance (DDPM posterior variance)
+    #         alpha_bar_prev = self.alpha_bars[t_exp.squeeze(1) - 1].view(batch_size, 1, 1) if t.min() > 0 else torch.ones_like(alpha_bar_t)
+    #         var = beta_t * (1 - alpha_bar_prev) / one_minus_alpha_bar_t
+    #         sigma = torch.sqrt(var)
+            
+    #         # Sample noise
+    #         z = torch.randn_like(x_t)
+            
+    #         # x_{t-1}
+    #         x_prev = mu + sigma * z
+            
+    #         # if plot_step:
+    #         #     self._plot_diffusion_step(x_t, x_prev, t, step_idx, barrier_info, is_final=False)
+            
+    #         return x_prev
+
     def p_sample(self, model, x_t, t, target, action, history=None, guidance_gamma=None, mean=None, std=None, plot_step=False, step_idx=0):
         """
         Reverse diffusion process: p(x_{t-1} | x_t) with optional CoDiG CBF guidance.
@@ -259,72 +411,85 @@ class DiffusionProcess:
         device = x_t.device
         
         with torch.no_grad():
+            # 1. 预测 x_0
             pred_x0 = model(x_t, t, target, action, history)  # (batch, seq, state_dim)
             
-            # Expand t for broadcasting
-            t_exp = t.view(batch_size, 1, 1) if t.dim() == 1 else t.view(-1, 1, 1)
+            # 2. 正确提取扩散参数
+            # 确保时间步是整数索引
+            t_indices = t.long()
             
-            alpha_bar_t = self.alpha_bars[t_exp.squeeze(1)].view(batch_size, 1, 1)
-            alpha_t = self.alphas[t_exp.squeeze(1)].view(batch_size, 1, 1)
-            beta_t = self.betas[t_exp.squeeze(1)].view(batch_size, 1, 1)
-            one_minus_alpha_bar_t = 1 - alpha_bar_t
+            # 正确广播参数
+            alpha_bar_t = self.alpha_bars[t_indices].view(batch_size, 1, 1).to(device)
+            alpha_t = self.alphas[t_indices].view(batch_size, 1, 1).to(device)
+            beta_t = self.betas[t_indices].view(batch_size, 1, 1).to(device)
+            one_minus_alpha_bar_t = 1.0 - alpha_bar_t
             
-            # Compute predicted noise from pred_x0
+            # 3. 计算预测的噪声 (标准DDPM公式)
             sqrt_alpha_bar_t = torch.sqrt(alpha_bar_t)
             sqrt_one_minus_alpha_bar_t = torch.sqrt(one_minus_alpha_bar_t)
-            ε_pred = (x_t - sqrt_alpha_bar_t * pred_x0) / sqrt_one_minus_alpha_bar_t
             
-            # Compute score s_theta ≈ -ε_pred / sqrt(1 - α_bar_t)
-            sigma_t = sqrt_one_minus_alpha_bar_t
-            s_theta = - ε_pred / sigma_t
+            # ε_θ = (x_t - √ᾱ_t * x_0) / √(1-ᾱ_t)
+            ε_pred = (x_t - sqrt_alpha_bar_t * pred_x0) / (sqrt_one_minus_alpha_bar_t + 1e-8)
             
-            # Apply CBF guidance if enabled
+            # 4. CBF引导 (如果启用)
             ε_guided = ε_pred.clone()
             barrier_info = None
+            
             if self.config.enable_cbf_guidance and guidance_gamma is not None and mean is not None and std is not None:
-                # Compute γ_t (scheduled: increases with t for stronger late guidance)
-                gamma_t = guidance_gamma * (t_exp.squeeze(1).float() / self.num_timesteps)
+                # 计算时间相关的gamma
+                gamma_t = guidance_gamma * (t_indices.float() / self.num_timesteps).view(batch_size, 1, 1)
                 
-                # Compute barrier gradient ∇V with normalization handling
-                V, grad_V = compute_barrier_and_grad(x_t, self.config, mean, std)  # (batch, seq, state_dim)
+                # 计算障碍函数梯度
+                V, grad_V = compute_barrier_and_grad(x_t, self.config, mean, std)
                 barrier_info = {'V': V, 'grad_V': grad_V, 'gamma_t': gamma_t}
 
-                # Guided score: s_guided = s_theta - γ_t ∇V
-                s_guided = s_theta - gamma_t.view(batch_size, 1, 1) * grad_V
+                # 引导的分数: s_guided = s_theta - γ_t ∇V
+                # 注意: s_theta = -ε_θ / σ_t, 其中 σ_t = √(1-ᾱ_t)
+                s_theta = -ε_pred / (sqrt_one_minus_alpha_bar_t + 1e-8)
+                s_guided = s_theta - gamma_t * grad_V
                 
-                # Guided noise
-                ε_guided = - s_guided * sigma_t
+                # 引导的噪声: ε_guided = -s_guided * σ_t
+                ε_guided = -s_guided * sqrt_one_minus_alpha_bar_t
             
-            # Compute mean μ using guided noise (standard DDPM formula)
-            coeff = (1 - alpha_t) / sqrt_one_minus_alpha_bar_t
-            mu = (1 / torch.sqrt(alpha_t)) * (x_t - coeff * ε_guided)
+            # 5. 计算后验均值 (DDPM公式)
+            # μ_θ = (1/√α_t) * [x_t - (β_t/√(1-ᾱ_t)) * ε_guided]
+            coeff = beta_t / (sqrt_one_minus_alpha_bar_t + 1e-8)
+            mu = (1.0 / torch.sqrt(alpha_t)) * (x_t - coeff * ε_guided)
             
-            # For t=0, return pred_x0 (or guided equivalent)
-            is_t_zero = (t_exp.squeeze(1) == 0).all()
-            if is_t_zero:
-                # Compute guided pred_x0 for consistency
-                pred_x0_guided = (x_t - sqrt_one_minus_alpha_bar_t * ε_guided) / sqrt_alpha_bar_t
-                
-                if plot_step:
-                    self._plot_diffusion_step(x_t, pred_x0_guided, t, step_idx, barrier_info, is_final=True)
-                return pred_x0_guided
+            # 6. 处理最后一步 (t=0)
+            if t_indices.min() == 0:
+                # 对于t=0，直接返回预测的x_0
+                is_last_step = (t_indices == 0)
+                if is_last_step.any():
+                    # 对于最后一步，使用引导的x_0预测
+                    pred_x0_guided = (x_t - sqrt_one_minus_alpha_bar_t * ε_guided) / (sqrt_alpha_bar_t + 1e-8)
+                    
+                    # 只替换最后一步的预测
+                    result = x_t.clone()
+                    result[is_last_step] = pred_x0_guided[is_last_step]
+                    
+                    # if plot_step:
+                    #     self._plot_diffusion_step(x_t, result, t, step_idx, barrier_info, is_final=True)
+                    return result
             
-            # Variance (DDPM posterior variance)
-            alpha_bar_prev = self.alpha_bars[t_exp.squeeze(1) - 1].view(batch_size, 1, 1) if t.min() > 0 else torch.ones_like(alpha_bar_t)
-            var = beta_t * (1 - alpha_bar_prev) / one_minus_alpha_bar_t
+            # 7. 计算后验方差并采样
+            # 前一个时间步的ᾱ
+            t_prev = torch.clamp(t_indices - 1, min=0)
+            alpha_bar_prev = self.alpha_bars[t_prev].view(batch_size, 1, 1).to(device)
+            
+            # 后验方差: σ_t^2 = β_t * (1-ᾱ_{t-1}) / (1-ᾱ_t)
+            var = beta_t * (1.0 - alpha_bar_prev) / (one_minus_alpha_bar_t + 1e-8)
             sigma = torch.sqrt(var)
             
-            # Sample noise
+            # 8. 采样 x_{t-1}
             z = torch.randn_like(x_t)
-            
-            # x_{t-1}
             x_prev = mu + sigma * z
             
-            if plot_step:
-                self._plot_diffusion_step(x_t, x_prev, t, step_idx, barrier_info, is_final=False)
+            # if plot_step:
+            #     self._plot_diffusion_step(x_t, x_prev, t, step_idx, barrier_info, is_final=False)
             
             return x_prev
-
+    
     def _plot_diffusion_step(self, x_t, x_prev, t, step_idx, barrier_info=None, is_final=False):
         """Plot the current diffusion step"""
         fig = plt.figure(figsize=(20, 10))
@@ -481,6 +646,12 @@ class AeroDM(nn.Module):
         print(f"CBF Guidance: {enable_guidance}")
         print(f"{'='*50}")
         
+        # Store original config setting
+        original_guidance_setting = self.config.enable_cbf_guidance
+        
+        # Override with parameter
+        self.config.enable_cbf_guidance = enable_guidance
+
         # Reverse diffusion process
         step_counter = 0
         for t_step in reversed(range(self.config.diffusion_steps)):
@@ -719,44 +890,6 @@ def generate_history_segments(trajectories, history_len=5, device=None):
     
     return torch.stack(histories)
 
-def analyze_z_axis_performance(original, reconstructed, sampled):
-    """Specifically analyze z-axis learning performance"""
-    original_z = original[0, :, 3].detach().cpu().numpy()  # z is at index 3 (1: speed, 2-4: x,y,z)
-    reconstructed_z = reconstructed[0, :, 3].detach().cpu().numpy()
-    sampled_z = sampled[0, :, 3].detach().cpu().numpy()
-    
-    z_error_recon = np.mean(np.abs(reconstructed_z - original_z))
-    z_error_sampled = np.mean(np.abs(sampled_z - original_z))
-    
-    print(f"Z-axis Mean Absolute Error - Reconstruction: {z_error_recon:.4f}")
-    print(f"Z-axis Mean Absolute Error - Sampling: {z_error_sampled:.4f}")
-    
-    # Plot z-axis specifically
-    plt.figure(figsize=(12, 4))
-    
-    plt.subplot(131)
-    plt.plot(original_z, 'b-', label='Original Z', linewidth=2)
-    plt.plot(reconstructed_z, 'r--', label='Reconstructed Z', linewidth=2)
-    plt.plot(sampled_z, 'g-.', label='Sampled Z', linewidth=2)
-    plt.title('Z-axis Comparison')
-    plt.legend()
-    plt.grid(True)
-    
-    plt.subplot(132)
-    plt.plot(np.abs(reconstructed_z - original_z), 'r-', label='Recon Error', linewidth=2)
-    plt.plot(np.abs(sampled_z - original_z), 'g-', label='Sample Error', linewidth=2)
-    plt.title('Z-axis Absolute Error')
-    plt.legend()
-    plt.grid(True)
-    
-    plt.subplot(133)
-    plt.bar(['Reconstruction', 'Sampling'], [z_error_recon, z_error_sampled])
-    plt.title('Z-axis Mean Absolute Error')
-    plt.grid(True)
-    
-    plt.tight_layout()
-    plt.show()
-
 def plot_circular_trajectory_comparison(original, reconstructed, sampled, history=None, target=None, title="Circular Trajectory Comparison", obstacle_center=None, obstacle_radius=None):
     """Enhanced visualization with history, target, and obstacle (for CBF demo)"""
     fig = plt.figure(figsize=(20, 15))
@@ -777,7 +910,7 @@ def plot_circular_trajectory_comparison(original, reconstructed, sampled, histor
         target_pos = target[0, :].detach().cpu().numpy()  # target is [x, y, z]
     
     # 1. 3D trajectory plot with history, target, and obstacle
-    ax1 = fig.add_subplot(341, projection='3d')
+    ax1 = fig.add_subplot(331, projection='3d')
     
     # Plot history (if available)
     if history_pos is not None:
@@ -839,7 +972,7 @@ def plot_circular_trajectory_comparison(original, reconstructed, sampled, histor
     ax1.grid(True)
     
     # 2. X-Y projection
-    ax2 = fig.add_subplot(342)
+    ax2 = fig.add_subplot(332)
     if history_pos is not None:
         ax2.plot(history_pos[:, 0], history_pos[:, 1], 'm-', label='History', linewidth=4, alpha=0.8, marker='o', markersize=4)
     ax2.plot(original_pos[:, 0], original_pos[:, 1], 'b-', label='Original', linewidth=3, alpha=0.8)
@@ -858,7 +991,7 @@ def plot_circular_trajectory_comparison(original, reconstructed, sampled, histor
     ax2.axis('equal')
     
     # 3. X-Z projection
-    ax3 = fig.add_subplot(343)
+    ax3 = fig.add_subplot(333)
     if history_pos is not None:
         ax3.plot(history_pos[:, 0], history_pos[:, 2], 'm-', label='History', linewidth=4, alpha=0.8, marker='o', markersize=4)
     ax3.plot(original_pos[:, 0], original_pos[:, 2], 'b-', label='Original', linewidth=3, alpha=0.8)
@@ -877,7 +1010,7 @@ def plot_circular_trajectory_comparison(original, reconstructed, sampled, histor
     ax3.axis('equal')
     
     # 4. Y-Z projection
-    ax4 = fig.add_subplot(344)
+    ax4 = fig.add_subplot(334)
     if history_pos is not None:
         ax4.plot(history_pos[:, 1], history_pos[:, 2], 'm-', label='History', linewidth=4, alpha=0.8, marker='o', markersize=4)
     ax4.plot(original_pos[:, 1], original_pos[:, 2], 'b-', label='Original', linewidth=3, alpha=0.8)
@@ -897,7 +1030,7 @@ def plot_circular_trajectory_comparison(original, reconstructed, sampled, histor
     
     # 5. Position components over time
     time_steps = np.arange(original_pos.shape[0])
-    ax5 = fig.add_subplot(345)
+    ax5 = fig.add_subplot(335)
     ax5.plot(time_steps, original_pos[:, 0], 'b-', label='Original X', linewidth=2)
     ax5.plot(time_steps, reconstructed_pos[:, 0], 'r--', label='Reconstructed X', linewidth=2)
     ax5.plot(time_steps, sampled_pos[:, 0], 'g-.', label='Sampled X', linewidth=2)
@@ -907,7 +1040,7 @@ def plot_circular_trajectory_comparison(original, reconstructed, sampled, histor
     ax5.set_title('X Position Over Time')
     ax5.grid(True)
     
-    ax6 = fig.add_subplot(346)
+    ax6 = fig.add_subplot(336)
     ax6.plot(time_steps, original_pos[:, 1], 'b-', label='Original Y', linewidth=2)
     ax6.plot(time_steps, reconstructed_pos[:, 1], 'r--', label='Reconstructed Y', linewidth=2)
     ax6.plot(time_steps, sampled_pos[:, 1], 'g-.', label='Sampled Y', linewidth=2)
@@ -917,7 +1050,7 @@ def plot_circular_trajectory_comparison(original, reconstructed, sampled, histor
     ax6.set_title('Y Position Over Time')
     ax6.grid(True)
     
-    ax7 = fig.add_subplot(347)
+    ax7 = fig.add_subplot(337)
     ax7.plot(time_steps, original_pos[:, 2], 'b-', label='Original Z', linewidth=2)
     ax7.plot(time_steps, reconstructed_pos[:, 2], 'r--', label='Reconstructed Z', linewidth=2)
     ax7.plot(time_steps, sampled_pos[:, 2], 'g-.', label='Sampled Z', linewidth=2)
@@ -932,7 +1065,7 @@ def plot_circular_trajectory_comparison(original, reconstructed, sampled, histor
     reconstructed_speed = reconstructed[0, :, 0].detach().cpu().numpy()
     sampled_speed = sampled[0, :, 0].detach().cpu().numpy()
     
-    ax8 = fig.add_subplot(348)
+    ax8 = fig.add_subplot(338)
     ax8.plot(time_steps, original_speed, 'b-', label='Original Speed', linewidth=2)
     ax8.plot(time_steps, reconstructed_speed, 'r--', label='Reconstructed Speed', linewidth=2)
     ax8.plot(time_steps, sampled_speed, 'g-.', label='Sampled Speed', linewidth=2)
@@ -946,7 +1079,7 @@ def plot_circular_trajectory_comparison(original, reconstructed, sampled, histor
     recon_error = np.linalg.norm(reconstructed_pos - original_pos, axis=1)
     sampled_error = np.linalg.norm(sampled_pos - original_pos, axis=1)
     
-    ax9 = fig.add_subplot(349)
+    ax9 = fig.add_subplot(339)
     ax9.plot(time_steps, recon_error, 'r-', label='Reconstruction Error', linewidth=2)
     ax9.plot(time_steps, sampled_error, 'g-', label='Sampling Error', linewidth=2)
     ax9.set_xlabel('Time Step')
@@ -955,49 +1088,8 @@ def plot_circular_trajectory_comparison(original, reconstructed, sampled, histor
     ax9.set_title('Position Error Over Time')
     ax9.grid(True)
     
-    # 10. Cumulative error
-    ax10 = fig.add_subplot(3,4,10)
-    ax10.plot(time_steps, np.cumsum(recon_error), 'r-', label='Cumulative Recon Error', linewidth=2)
-    ax10.plot(time_steps, np.cumsum(sampled_error), 'g-', label='Cumulative Sample Error', linewidth=2)
-    ax10.set_xlabel('Time Step')
-    ax10.set_ylabel('Cumulative Error')
-    ax10.legend()
-    ax10.set_title('Cumulative Position Error')
-    ax10.grid(True)
-    
-    # 11. Error distribution
-    ax11 = fig.add_subplot(3,4,11)
-    errors = [recon_error, sampled_error]
-    ax11.boxplot(errors, labels=['Reconstruction', 'Sampling'])
-    ax11.set_ylabel('Position Error')
-    ax11.set_title('Error Distribution')
-    ax11.grid(True)
-    
-    # 12. Summary statistics
-    ax12 = fig.add_subplot(3,4,12)
-    stats_data = [
-        np.mean(recon_error), np.std(recon_error), np.max(recon_error),
-        np.mean(sampled_error), np.std(sampled_error), np.max(sampled_error)
-    ]
-    stats_labels = ['Recon Mean', 'Recon Std', 'Recon Max', 'Sample Mean', 'Sample Std', 'Sample Max']
-    bars = ax12.bar(range(len(stats_data)), stats_data, color=['red', 'red', 'red', 'green', 'green', 'green'])
-    ax12.set_xticks(range(len(stats_data)))
-    ax12.set_xticklabels(stats_labels, rotation=45)
-    ax12.set_ylabel('Error Value')
-    ax12.set_title('Error Statistics')
-    
-    # Add value labels on bars
-    for bar, value in zip(bars, stats_data):
-        ax12.text(bar.get_x() + bar.get_width()/2, bar.get_height(), f'{value:.3f}', 
-                 ha='center', va='bottom', fontsize=8)
-    
     plt.tight_layout()
     plt.show()
-    
-    # Print detailed error analysis
-    print("\n=== Detailed Error Analysis ===")
-    print(f"Reconstruction - Total Error: {np.mean(recon_error):.4f} ± {np.std(recon_error):.4f}")
-    print(f"Sampling - Total Error: {np.mean(sampled_error):.4f} ± {np.std(sampled_error):.4f}")
 
 # Update the test function to demonstrate CBF guidance with diffusion visualization
 def test_model_performance(model, trajectories_norm, mean, std, num_test_samples=3):

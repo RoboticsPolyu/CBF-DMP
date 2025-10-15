@@ -12,7 +12,7 @@ from AeroDM_CBF import (
     generate_aerobatic_trajectories,
     normalize_trajectories, denormalize_trajectories,
     generate_target_waypoints, generate_action_styles, generate_history_segments,
-    plot_circular_trajectory_comparison, analyze_z_axis_performance
+    plot_circular_trajectory_comparison
 )
 
 def load_model(checkpoint_path, device):
@@ -48,12 +48,10 @@ def visualize_samples(model, mean, std, num_samples=3):
         history = generate_history_segments(full_traj, config.history_len, device=device)
         x_0 = full_traj[:, config.history_len:, :]
 
-        model.config.enable_cbf_guidance = False
         # Sample unguided
         sampled_unguided = model.sample(target, action, history, batch_size=1, enable_guidance=False)
         sampled_unguided_denorm = denormalize_trajectories(sampled_unguided, mean, std)
 
-        model.config.enable_cbf_guidance = True
         # Sample guided
         sampled_guided = model.sample(target, action, history, batch_size=1, enable_guidance=True, guidance_gamma=config.guidance_gamma)
         sampled_guided_denorm = denormalize_trajectories(sampled_guided, mean, std)
@@ -72,8 +70,6 @@ def visualize_samples(model, mean, std, num_samples=3):
             obstacle_center=obstacle_center,
             obstacle_radius=config.obstacle_radius
         )
-
-        analyze_z_axis_performance(x_0_denorm, sampled_unguided_denorm, sampled_guided_denorm)
 
 if __name__ == "__main__":
     # Set device
@@ -103,6 +99,8 @@ if __name__ == "__main__":
     else:
         mean = mean.to(device)
         std = std.to(device)
-
+    model.set_normalization_params(mean, std)
+    model.config.guidance_gamma = 1000.0
+    # model.config.diffusion_steps = 50
     # Visualize samples
-    visualize_samples(model, mean, std, num_samples=30)
+    visualize_samples(model, mean, std, num_samples=100)
