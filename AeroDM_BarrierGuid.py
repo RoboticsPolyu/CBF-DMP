@@ -1,3 +1,5 @@
+# AeroDM + Barrier Function (CBF) implementation
+
 import os
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
 
@@ -6,9 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 import numpy as np
-from typing import Optional, Tuple, List
 import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d import Axes3D
 
 # Configuration parameters based on the paper
 class Config:
@@ -675,7 +675,7 @@ class AeroDM(nn.Module):
         return x_t
 
 # Improved Loss Function with Balanced Z-Axis Learning
-class ImprovedAeroDMLoss(nn.Module):
+class AeroDMLoss(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
@@ -890,7 +890,7 @@ def generate_history_segments(trajectories, history_len=5, device=None):
     
     return torch.stack(histories)
 
-def plot_circular_trajectory_comparison(original, reconstructed, sampled, history=None, target=None, title="Circular Trajectory Comparison", obstacle_center=None, obstacle_radius=None):
+def plot_trajectory_comparison(original, reconstructed, sampled, history=None, target=None, title="Circular Trajectory Comparison", obstacle_center=None, obstacle_radius=None):
     """Enhanced visualization with history, target, and obstacle (for CBF demo)"""
     fig = plt.figure(figsize=(20, 15))
     fig.suptitle(title, fontsize=16)
@@ -1144,7 +1144,7 @@ def test_model_performance(model, trajectories_norm, mean, std, num_test_samples
             obstacle_center_viz = obstacle_center_original
             
             # Visualize: unguided vs guided, with obstacle
-            plot_circular_trajectory_comparison(
+            plot_trajectory_comparison(
                 x_0_denorm, sampled_unguided_denorm, sampled_guided_denorm, 
                 history=history_denorm, target=target_denorm,
                 title=f"CBF Guidance Test Sample {i+1}\n(Guided: Green avoids Red Obstacle)",
@@ -1154,7 +1154,7 @@ def test_model_performance(model, trajectories_norm, mean, std, num_test_samples
             
     model.train()
 
-def train_improved_aerodm():
+def train_aerodm_cbf():
     """Enhanced training function with z-axis improvements"""
     config = Config()
     model = AeroDM(config)
@@ -1173,7 +1173,7 @@ def train_improved_aerodm():
     model.diffusion_process.alpha_bars = model.diffusion_process.alpha_bars.to(device)
     
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
-    criterion = ImprovedAeroDMLoss(config)  # Use improved loss
+    criterion = AeroDMLoss(config)  # Use improved loss
     
     # Training parameters
     num_epochs = 50
@@ -1319,6 +1319,6 @@ if __name__ == "__main__":
     plt.show()
     
     # Train with enhanced method and CBF
-    trained_model, losses, trajectories, mean, std = train_improved_aerodm()
+    trained_model, losses, trajectories, mean, std = train_aerodm_cbf()
     
     print("Training completed! CBF guidance integrated for obstacle avoidance.")

@@ -1,5 +1,6 @@
 model/**
 Doc/**
+Figs/**
 __pycache__/
 .DS_Store
 .vscode/

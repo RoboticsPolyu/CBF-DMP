@@ -1,4 +1,4 @@
-# visualize_aerodm.py
+# Evaluation_AeroDM_CBF.py
 import os
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
 
@@ -7,12 +7,12 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 # Import your model and utility functions
-from AeroDM_CBF import (
+from AeroDM_BarrierGuid import (
     Config, AeroDM,
     generate_aerobatic_trajectories,
     normalize_trajectories, denormalize_trajectories,
     generate_target_waypoints, generate_action_styles, generate_history_segments,
-    plot_circular_trajectory_comparison
+    plot_trajectory_comparison
 )
 
 def load_model(checkpoint_path, device):
@@ -63,7 +63,7 @@ def visualize_samples(model, mean, std, num_samples=3):
 
         obstacle_center = config.get_obstacle_center('cpu').numpy()
 
-        plot_circular_trajectory_comparison(
+        plot_trajectory_comparison(
             x_0_denorm, sampled_unguided_denorm, sampled_guided_denorm,
             history=history_denorm, target=target_denorm,
             title=f"Visualization Sample {i+1} (Guided: Green avoids Red Obstacle)",

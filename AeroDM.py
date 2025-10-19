@@ -6,9 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 import numpy as np
-from typing import Optional, Tuple, List
 import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d import Axes3D
 
 # Configuration parameters based on the paper
 class Config:
@@ -268,7 +266,7 @@ class AeroDM(nn.Module):
         return x_t
 
 # Improved Loss Function with Balanced Z-Axis Learning
-class ImprovedAeroDMLoss(nn.Module):
+class AeroDMLoss(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
@@ -459,45 +457,7 @@ def generate_history_segments(trajectories, history_len=5, device=None):
     
     return torch.stack(histories)
 
-def analyze_z_axis_performance(original, reconstructed, sampled):
-    """Specifically analyze z-axis learning performance"""
-    original_z = original[0, :, 3].detach().cpu().numpy()  # z is at index 3 (1: speed, 2-4: x,y,z)
-    reconstructed_z = reconstructed[0, :, 3].detach().cpu().numpy()
-    sampled_z = sampled[0, :, 3].detach().cpu().numpy()
-    
-    z_error_recon = np.mean(np.abs(reconstructed_z - original_z))
-    z_error_sampled = np.mean(np.abs(sampled_z - original_z))
-    
-    print(f"Z-axis Mean Absolute Error - Reconstruction: {z_error_recon:.4f}")
-    print(f"Z-axis Mean Absolute Error - Sampling: {z_error_sampled:.4f}")
-    
-    # Plot z-axis specifically
-    plt.figure(figsize=(12, 4))
-    
-    plt.subplot(131)
-    plt.plot(original_z, 'b-', label='Original Z', linewidth=2)
-    plt.plot(reconstructed_z, 'r--', label='Reconstructed Z', linewidth=2)
-    plt.plot(sampled_z, 'g-.', label='Sampled Z', linewidth=2)
-    plt.title('Z-axis Comparison')
-    plt.legend()
-    plt.grid(True)
-    
-    plt.subplot(132)
-    plt.plot(np.abs(reconstructed_z - original_z), 'r-', label='Recon Error', linewidth=2)
-    plt.plot(np.abs(sampled_z - original_z), 'g-', label='Sample Error', linewidth=2)
-    plt.title('Z-axis Absolute Error')
-    plt.legend()
-    plt.grid(True)
-    
-    plt.subplot(133)
-    plt.bar(['Reconstruction', 'Sampling'], [z_error_recon, z_error_sampled])
-    plt.title('Z-axis Mean Absolute Error')
-    plt.grid(True)
-    
-    plt.tight_layout()
-    plt.show()
-
-def plot_circular_trajectory_comparison(original, reconstructed, sampled, history=None, target=None, title="Circular Trajectory Comparison"):
+def plot_trajectory_comparison(original, reconstructed, sampled, history=None, target=None, title="Circular Trajectory Comparison"):
     """Enhanced visualization with history, target, and different colors"""
     fig = plt.figure(figsize=(20, 15))
     fig.suptitle(title, fontsize=16)
@@ -842,18 +802,15 @@ def test_model_performance(model, trajectories_norm, mean, std, num_test_samples
             history_denorm = denormalize_trajectories(history, mean, std)
             
             # Visualize results with history and denormalized target
-            plot_circular_trajectory_comparison(
+            plot_trajectory_comparison(
                 x_0_denorm, reconstructed_denorm, sampled_denorm, 
                 history=history_denorm, target=target_denorm,
                 title=f"Enhanced Circular Trajectory Test Sample {i+1}\n(History: Magenta, Target: Yellow Star)"
             )
-            
-            # Z-axis specific analysis
-            analyze_z_axis_performance(x_0_denorm, reconstructed_denorm, sampled_denorm)
     
     model.train()
 
-def train_improved_aerodm():
+def train_aerodm_cbf():
     """Enhanced training function with z-axis improvements"""
     config = Config()
     model = AeroDM(config)
@@ -868,7 +825,7 @@ def train_improved_aerodm():
     model.diffusion_process.alpha_bars = model.diffusion_process.alpha_bars.to(device)
     
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
-    criterion = ImprovedAeroDMLoss(config)  # Use improved loss
+    criterion = AeroDMLoss(config)  # Use improved loss
     
     # Training parameters
     num_epochs = 50
@@ -1010,6 +967,6 @@ if __name__ == "__main__":
     plt.show()
     
     # Train with enhanced method
-    trained_model, losses, trajectories, mean, std = train_improved_aerodm()
+    trained_model, losses, trajectories, mean, std = train_aerodm_cbf()
     
     print("Training completed! Z-axis learning should be significantly improved.")

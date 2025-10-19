@@ -437,7 +437,7 @@ class AeroDM(nn.Module):
         return x_t
 
 # Improved Loss Function with Balanced Z-Axis Learning
-class ImprovedAeroDMLoss(nn.Module):
+class AeroDMLoss(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
@@ -666,7 +666,7 @@ def analyze_z_axis_performance(original, reconstructed, sampled):
     plt.tight_layout()
     plt.show()
 
-def plot_circular_trajectory_comparison(original, reconstructed, sampled, history=None, target=None, title="Circular Trajectory Comparison"):
+def plot_trajectory_comparison(original, reconstructed, sampled, history=None, target=None, title="Circular Trajectory Comparison"):
     """Enhanced visualization with history, target, and different colors"""
     fig = plt.figure(figsize=(20, 15))
     fig.suptitle(title, fontsize=16)
@@ -1011,7 +1011,7 @@ def test_model_performance(model, trajectories_norm, mean, std, num_test_samples
             history_denorm = denormalize_trajectories(history, mean, std)
             
             # Visualize results with history and denormalized target
-            plot_circular_trajectory_comparison(
+            plot_trajectory_comparison(
                 x_0_denorm, reconstructed_denorm, sampled_denorm, 
                 history=history_denorm, target=target_denorm,
                 title=f"Enhanced Circular Trajectory Test Sample {i+1}\n(History: Magenta, Target: Yellow Star)"
@@ -1024,7 +1024,7 @@ def test_model_performance(model, trajectories_norm, mean, std, num_test_samples
 
 
 # Modify the training function to use cross-attention
-def train_improved_aerodm():
+def train_aerodm_cbf():
     """Enhanced training function with cross-attention for conditions"""
     config = Config()
     model = AeroDM(config, use_cross_attention=True)  # Use cross-attention version
@@ -1040,7 +1040,7 @@ def train_improved_aerodm():
     model.diffusion_process.alpha_bars = model.diffusion_process.alpha_bars.to(device)
     
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
-    criterion = ImprovedAeroDMLoss(config)
+    criterion = AeroDMLoss(config)
     
     # Training parameters
     num_epochs = 50
@@ -1183,6 +1183,6 @@ if __name__ == "__main__":
     plt.show()
     
     # Train with cross-attention method
-    trained_model, losses, trajectories, mean, std = train_improved_aerodm()
+    trained_model, losses, trajectories, mean, std = train_aerodm_cbf()
     
     print("Training completed! Cross-attention should provide better conditional integration.")

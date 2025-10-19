@@ -1,3 +1,5 @@
+#AeroDM + Barrier Function Guidance + Obstacle Encoding
+
 import os
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
 
@@ -6,9 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 import numpy as np
-from typing import Optional, Tuple, List
 import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d import Axes3D
 
 
 # Configuration parameters based on the paper
@@ -42,9 +42,16 @@ class Config:
     guidance_gamma = 100.0  # Base gamma for barrier guidance
     obstacle_radius = 5.0  # Safe distance radius
     
+    # Plotting control
+    show_flag = True  # Set to False to save plots as SVG instead of displaying
+    
     @staticmethod
     def get_obstacle_center(device='cpu'):
         return torch.tensor([5.0, 5.0, 10.0], device=device)  # Example obstacle center
+    
+    @staticmethod
+    def set_show_flag(flag):
+        Config.show_flag = flag
 
 # Transformer positional encoding
 class PositionalEncoding(nn.Module):
@@ -148,7 +155,7 @@ class ObstacleEncoder(nn.Module):
         
         return obstacle_emb
     
-# Enhanced Condition Embedding with Obstacle Information
+# Condition Embedding with Obstacle Information
 class ConditionEmbedding(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -203,7 +210,7 @@ class ConditionEmbedding(nn.Module):
         
         return cond_emb
 
-# Enhanced Diffusion Transformer with Obstacle Awareness
+# Diffusion Transformer with Obstacle Awareness
 class ObstacleAwareDiffusionTransformer(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -215,7 +222,7 @@ class ObstacleAwareDiffusionTransformer(nn.Module):
         # Positional encoding
         self.pos_encoding = PositionalEncoding(config.latent_dim)
         
-        # Enhanced condition embedding with obstacle information
+        # condition embedding with obstacle information
         self.cond_embed = ConditionEmbedding(config)
         
         # Transformer layers
@@ -261,7 +268,7 @@ class ObstacleAwareDiffusionTransformer(nn.Module):
         # Generate causal mask for the total sequence
         memory_mask = self._generate_square_subsequent_mask(total_seq_len).to(x.device)
         
-        # Get enhanced condition embedding with obstacle information
+        # Get condition embedding with obstacle information
         cond_emb = self.cond_embed(t, target, action, obstacles_data)
         cond_seq = cond_emb.unsqueeze(1).expand(-1, total_seq_len, -1)
         
@@ -292,123 +299,7 @@ class ObstacleAwareDiffusionTransformer(nn.Module):
         mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
         return mask
 
-# Enhanced CBF Barrier Function with Multiple Obstacles
-def compute_barrier_and_grad(x, config, mean, std, obstacles_data=None):
-    """
-    Compute barrier V and its gradient ∇V for the trajectory x.
-    Extended to handle multiple spherical obstacles.
-    V = sum_τ sum_obs max(0, r_obs - ||pos_τ - center_obs||)^2
-    ∇V affects only position components (indices 1:4).
-    """
-    # Denormalize positions for barrier computation
-    pos_denorm = x[:, :, 1:4] * std[0, 0, 1:4] + mean[0, 0, 1:4]
-    
-    batch_size, seq_len, _ = pos_denorm.shape
-    
-    # Initialize barrier value and gradient
-    V_total = torch.zeros(batch_size, device=x.device)
-    grad_pos_denorm = torch.zeros_like(pos_denorm)
-    
-    # Process each obstacle
-    if obstacles_data is not None:
-        for obstacle in obstacles_data:
-            center = obstacle['center'].unsqueeze(0).unsqueeze(0).to(x.device)  # (1,1,3)
-            r = obstacle['radius']
-            
-            # Compute distance to obstacle center
-            dist = torch.norm(pos_denorm - center, dim=-1, keepdim=False)  # (batch, seq_len)
-            excess = torch.clamp(r - dist, min=0.0)  # (batch, seq_len)
-            
-            # Accumulate barrier value
-            V_total += (excess ** 2).sum(dim=-1)  # (batch,)
-            
-            # Compute gradient for this obstacle
-            unsafe_mask = dist < r
-            if unsafe_mask.any():
-                direction = (pos_denorm - center) / (dist.unsqueeze(-1) + 1e-8)  # Unit vector away from center
-                grad_pos_denorm[unsafe_mask] += -2.0 * excess[unsafe_mask].unsqueeze(-1) * direction[unsafe_mask]
-    
-    # Normalize gradient back to normalized space
-    grad_pos = grad_pos_denorm / std[0, 0, 1:4]
-    
-    # Embed into full state gradient (only positions affected)
-    grad_x = torch.zeros_like(x)
-    grad_x[:, :, 1:4] = grad_pos
-    
-    # Print grad_V information
-    print(f"grad_V shape: {grad_x.shape}")
-    print(f"grad_V norm: {torch.norm(grad_x):.6f}")
-    print(f"grad_V min/max: {grad_x.min():.6f} / {grad_x.max():.6f}")
-    print(f"Total barrier value V: {V_total.mean().item():.6f}")
-    
-    return V_total, grad_x
-
-def generate_random_obstacles(trajectory, num_obstacles_range=(0, 10), radius_range=(0.01, 0.30), device='cpu'):
-    """
-    Generate random spherical obstacles around the trajectory without collisions between them.
-    Ensures no two obstacles overlap by checking distance >= sum of radii during placement.
-    Returns list of obstacle dictionaries with center and radius.
-    """
-    # Randomly determine the number of obstacles to generate
-    num_obstacles = np.random.randint(num_obstacles_range[0], num_obstacles_range[1] + 1)
-    obstacles = []
-    
-    # Extract trajectory positions (x, y, z) and move to CPU for numpy operations
-    traj_pos = trajectory[:, 1:4].cpu().numpy()
-    # Compute bounding box of the trajectory
-    min_bounds = traj_pos.min(axis=0)
-    max_bounds = traj_pos.max(axis=0)
-    
-    # Calculate the range of the bounds
-    bounds_range = max_bounds - min_bounds
-    # Expand the placement area by 50% of the trajectory range to allow space around it
-    expanded_min = min_bounds - 0.5 * bounds_range
-    expanded_max = max_bounds + 0.5 * bounds_range
-    
-    # print(f"Generating {num_obstacles} random non-colliding obstacles around trajectory")
-    
-    for i in range(num_obstacles):
-        attempts = 0
-        max_attempts = 100  # Prevent infinite loop in crowded spaces
-        collision = True
-        
-        while collision and attempts < max_attempts:
-            # Sample a random center within the expanded bounds
-            center = np.random.uniform(expanded_min, expanded_max)
-            # Sample a random radius within the given range
-            radius = np.random.uniform(radius_range[0], radius_range[1])
-            
-            # Check for collisions with existing obstacles
-            collision = False
-            for prev_obstacle in obstacles:
-                prev_center = prev_obstacle['center'].cpu().numpy()
-                prev_radius = prev_obstacle['radius']
-                # Compute Euclidean distance between centers
-                dist = np.linalg.norm(center - prev_center)
-                # Check if distance < sum of radii (collision)
-                if dist < radius + prev_radius:
-                    collision = True
-                    break
-            
-            attempts += 1
-        
-        if collision:
-            print(f"Warning: Could not place obstacle {i} without collision after {max_attempts} attempts. Skipping.")
-            continue
-        
-        # Create obstacle dictionary
-        obstacle = {
-            'center': torch.tensor(center, dtype=torch.float32, device=device),  
-            'radius': radius,
-            'id': i
-        }
-        obstacles.append(obstacle)
-        
-        # print(f"Placed Obstacle {i}: center={center}, radius={radius:.3f}")
-    
-    return obstacles
-
-# Enhanced Diffusion Process with Obstacle-Aware Sampling
+# Diffusion Process with Obstacle-Aware Sampling
 class ObstacleAwareDiffusionProcess:
     def __init__(self, config):
         self.config = config
@@ -648,7 +539,15 @@ class ObstacleAwareDiffusionProcess:
                 verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
         
         plt.tight_layout()
-        plt.show()
+        
+        # Modified display/save logic
+        if self.config.show_flag:
+            plt.show()
+        else:
+            # Save as SVG with descriptive filename
+            filename = f"Figs/diffusion_step_{step_idx:03d}_t_{t[0].item():03d}.svg"
+            plt.savefig(filename, format='svg', bbox_inches='tight')
+            plt.close()  # Close the figure to free memory
         
         # Print step information (normalized stats for debugging)
         print(f"\n=== Diffusion Step {step_idx} (t={t[0].item()}) ===")
@@ -658,7 +557,7 @@ class ObstacleAwareDiffusionProcess:
         if barrier_info is not None:
             print(f"CBF - Barrier V: {barrier_info['V'][0].item():.4f}, Gamma_t: {barrier_info['gamma_t'][0].item():.4f}")
             
-# Enhanced AeroDM with Obstacle Awareness
+# AeroDM with Obstacle Awareness
 class AeroDM(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -937,37 +836,63 @@ def denormalize_obstacle(obstacle_norm, mean, std):
     obstacle_denorm = obstacle_norm * pos_std + pos_mean
     return obstacle_denorm
 
-def plot_training_losses(losses):
-    """Plot training losses over epochs"""
-    plt.figure(figsize=(10, 6))
+def plot_training_losses(losses, use_obstacle_loss, show_flag=True):
+    """Plot training losses with optional obstacle loss visualization"""
+    plt.figure(figsize=(12, 8))
     epochs = range(len(losses['total']))
-    
+
+    # Always plot main losses
+    plt.subplot(2, 1, 1)
     plt.plot(epochs, losses['total'], 'b-', label='Total Loss', linewidth=2)
     plt.plot(epochs, losses['position'], 'r--', label='Position Loss', linewidth=2)
     plt.plot(epochs, losses['vel'], 'g-.', label='Velocity Loss', linewidth=2)
     plt.xlabel('Epoch')
     plt.ylabel('Loss')
-    plt.title('Training Losses')
+    plt.title('Training Losses - Main Components')
     plt.legend()
     plt.grid(True)
-    plt.show()
 
+    # Always plot obstacle (even if 0)
+    plt.subplot(2, 1, 2)
+    plt.plot(epochs, losses['obstacle'], 'm-', label='Obstacle Loss', linewidth=2)
+    plt.plot(epochs, losses['continuity'], 'c-', label='Continuity Loss', linewidth=2)
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.title('Obstacle and Continuity Losses')
+    plt.legend()
+    plt.grid(True)
+
+    plt.tight_layout()
+    
+    # Modified display/save logic
+    if show_flag:
+        plt.show()
+    else:
+        filename = "Figs/training_losses.svg"
+        plt.savefig(filename, format='svg', bbox_inches='tight')
+        plt.close()
+
+# Aerobatic Trajectory Generation
 def generate_aerobatic_trajectories(num_trajectories=100, seq_len=60, radius=10.0, height=0.0):
     """Generate diverse aerobatic trajectories based on eleven maneuver styles:
     (a) Power Loop, (b) Barrel Roll, (c) Split-S, (d) Immelmann Turn, (e) Wall Ride,
     (f) Eight Figure, (g) Patrick, (h) Star, (i) Half Moon, (j) Sphinx, (k) Clover."""
     trajectories = []
-    maneuver_styles = ['power_loop', 'barrel_roll', 'split_s', 'immelmann', 'wall_ride',
-                      'eight_figure', 'star', 'half_moon', 'sphinx', 'clover']
+    maneuver_styles = ['power_loop', 'barrel_roll', 'split_s', 'immelmann', 'wall_ride', 'eight_figure', 'star', 'half_moon', 'sphinx', 'clover']
+    
+    # maneuver_styles = ['barrel_roll']
+    
+    # def smooth_trajectory(positions, smoothing_factor=0.1):
+    #     """Apply smoothing to trajectory positions using a simple moving average"""
+    #     smoothed = np.zeros_like(positions)
+    #     for i in range(len(positions)):
+    #         start_idx = max(0, i - 1)
+    #         end_idx = min(len(positions), i + 2)
+    #         smoothed[i] = np.mean(positions[start_idx:end_idx], axis=0)
+    #     return smoothing_factor * smoothed + (1 - smoothing_factor) * positions
     
     def smooth_trajectory(positions, smoothing_factor=0.1):
-        """Apply smoothing to trajectory positions using a simple moving average"""
-        smoothed = np.zeros_like(positions)
-        for i in range(len(positions)):
-            start_idx = max(0, i - 1)
-            end_idx = min(len(positions), i + 2)
-            smoothed[i] = np.mean(positions[start_idx:end_idx], axis=0)
-        return smoothing_factor * smoothed + (1 - smoothing_factor) * positions
+        return positions
     
     for i in range(num_trajectories):
         # Randomly select a maneuver style
@@ -979,10 +904,7 @@ def generate_aerobatic_trajectories(num_trajectories=100, seq_len=60, radius=10.
         center_z = height + np.random.uniform(-10, 10)
         
         current_radius = radius * np.random.uniform(0.8, 1.2)
-        
-        # Fixed period of 1 for all trajectories
-        period = 1.0
-        angular_velocity = 1.0 / period  # This ensures exactly one period
+        angular_velocity = np.random.uniform(0.5, 2.0)
         
         # Normalize time steps to [0, 1] - exactly one period
         norm_t = np.linspace(0, 1, seq_len)
@@ -990,54 +912,55 @@ def generate_aerobatic_trajectories(num_trajectories=100, seq_len=60, radius=10.
         # Compute positions and velocities based on style
         if style == 'power_loop':
             # Full vertical loop in xz plane, starting at bottom with forward velocity
-            theta = 2 * np.pi * norm_t
+            theta = 2 * np.pi * norm_t * angular_velocity
             x = center_x + current_radius * np.sin(theta)
             y = np.full(seq_len, center_y)
             z = center_z - current_radius * np.cos(theta)
-            vx = current_radius * 2 * np.pi * np.cos(theta)
+            vx = current_radius * angular_velocity * 2 * np.pi * np.cos(theta)
             vy = np.zeros(seq_len)
-            vz = current_radius * 2 * np.pi * np.sin(theta)
+            vz = current_radius * angular_velocity * 2 * np.pi * np.sin(theta)
         
         elif style == 'barrel_roll':
-            # Helical path (corkscrew) along x - exactly one full rotation
-            theta = 2 * np.pi * norm_t
-            forward_distance = current_radius * 2  # Control forward movement to match period
-            x = center_x + forward_distance * norm_t
+            # Helical path (corkscrew) along x
+            theta = 2 * np.pi * norm_t * angular_velocity
+            forward_speed = np.random.uniform(5.0, 15.0)  # Forward component
+            x = center_x + forward_speed * norm_t
             y = center_y + current_radius * np.cos(theta)
             z = center_z + current_radius * np.sin(theta)
-            vx = np.full(seq_len, forward_distance)
-            vy = -current_radius * 2 * np.pi * np.sin(theta)
-            vz = current_radius * 2 * np.pi * np.cos(theta)
+            vx = np.full(seq_len, forward_speed)
+            vy = -current_radius * angular_velocity * 2 * np.pi * np.sin(theta)
+            vz = current_radius * angular_velocity * 2 * np.pi * np.cos(theta)
         
         elif style == 'split_s':
-            # Descending half-loop (semicircle down) in xz plane - exactly one half period
-            theta = np.pi * norm_t
+            # Descending half-loop (semicircle down) in xz plane
+            theta = np.pi * norm_t * angular_velocity
             x = center_x - current_radius * (1 - np.cos(theta))
             y = np.full(seq_len, center_y)
             z = center_z - current_radius * np.sin(theta)
-            vx = -current_radius * np.pi * np.sin(theta)
+            vx = -current_radius * angular_velocity * np.pi * np.sin(theta)
             vy = np.zeros(seq_len)
-            vz = -current_radius * np.pi * np.cos(theta)
+            vz = -current_radius * angular_velocity * np.pi * np.cos(theta)
         
         elif style == 'immelmann':
-            # Ascending half-loop (semicircle up) in xz plane - exactly one half period
-            theta = np.pi * norm_t
+            # Ascending half-loop (semicircle up) in xz plane
+            theta = np.pi * norm_t * angular_velocity
             x = center_x - current_radius * (1 - np.cos(theta))
             y = np.full(seq_len, center_y)
             z = center_z + current_radius * np.sin(theta)
-            vx = -current_radius * np.pi * np.sin(theta)
+            vx = -current_radius * angular_velocity * np.pi * np.sin(theta)
             vy = np.zeros(seq_len)
-            vz = current_radius * np.pi * np.cos(theta)
+            vz = current_radius * angular_velocity * np.pi * np.cos(theta)
         
         elif style == 'wall_ride':
-            # Vertical helix climb (spiral up) - exactly one full rotation
-            theta = 2 * np.pi * norm_t
-            climb_height = current_radius * 2
+            # Vertical helix climb (spiral up)
+            turns = np.random.uniform(0.5, 1.5)  # Number of turns
+            climb_height = np.random.uniform(20.0, 40.0)
+            theta = 2 * np.pi * turns * norm_t * angular_velocity
             x = center_x + current_radius * np.cos(theta)
             y = center_y + current_radius * np.sin(theta)
             z = center_z + climb_height * norm_t
-            vx = -current_radius * 2 * np.pi * np.sin(theta)
-            vy = current_radius * 2 * np.pi * np.cos(theta)
+            vx = -current_radius * (2 * np.pi * turns * angular_velocity) * np.sin(theta)
+            vy = current_radius * (2 * np.pi * turns * angular_velocity) * np.cos(theta)
             vz = np.full(seq_len, climb_height)
         
         elif style == 'eight_figure':
@@ -1150,15 +1073,6 @@ def generate_aerobatic_trajectories(num_trajectories=100, seq_len=60, radius=10.
             vz = np.gradient(z_smooth, dt)
             x, y, z = x_smooth, y_smooth, z_smooth
         
-        # Ensure all trajectories are properly periodic
-        if style not in ['split_s', 'immelmann', 'half_moon']:  # These are half-period maneuvers
-            # Check and enforce periodicity for full-period maneuvers
-            if not np.allclose([x[0], y[0], z[0]], [x[-1], y[-1], z[-1]], atol=1e-2):
-                # Adjust to make periodic
-                x = x - (x[-1] - x[0]) * norm_t
-                y = y - (y[-1] - y[0]) * norm_t
-                z = z - (z[-1] - z[0]) * norm_t
-        
         # Compute speed and direction
         speed = np.sqrt(vx**2 + vy**2 + vz**2)
         direction = np.stack([vx, vy, vz], axis=-1)
@@ -1173,6 +1087,123 @@ def generate_aerobatic_trajectories(num_trajectories=100, seq_len=60, radius=10.
         trajectories.append(state)
     
     return torch.tensor(trajectories, dtype=torch.float32)
+
+# CBF Barrier Function with Multiple Obstacles
+def compute_barrier_and_grad(x, config, mean, std, obstacles_data=None):
+    """
+    Compute barrier V and its gradient ∇V for the trajectory x.
+    Extended to handle multiple spherical obstacles.
+    V = sum_τ sum_obs max(0, r_obs - ||pos_τ - center_obs||)^2
+    ∇V affects only position components (indices 1:4).
+    """
+    # Denormalize positions for barrier computation
+    pos_denorm = x[:, :, 1:4] * std[0, 0, 1:4] + mean[0, 0, 1:4]
+    
+    batch_size, seq_len, _ = pos_denorm.shape
+    
+    # Initialize barrier value and gradient
+    V_total = torch.zeros(batch_size, device=x.device)
+    grad_pos_denorm = torch.zeros_like(pos_denorm)
+    
+    # Process each obstacle
+    if obstacles_data is not None:
+        for obstacle in obstacles_data:
+            center = obstacle['center'].unsqueeze(0).unsqueeze(0).to(x.device)  # (1,1,3)
+            r = obstacle['radius']
+            
+            # Compute distance to obstacle center
+            dist = torch.norm(pos_denorm - center, dim=-1, keepdim=False)  # (batch, seq_len)
+            excess = torch.clamp(r - dist, min=0.0)  # (batch, seq_len)
+            
+            # Accumulate barrier value
+            V_total += (excess ** 2).sum(dim=-1)  # (batch,)
+            
+            # Compute gradient for this obstacle
+            unsafe_mask = dist < r
+            if unsafe_mask.any():
+                direction = (pos_denorm - center) / (dist.unsqueeze(-1) + 1e-8)  # Unit vector away from center
+                grad_pos_denorm[unsafe_mask] += -2.0 * excess[unsafe_mask].unsqueeze(-1) * direction[unsafe_mask]
+    
+    # Normalize gradient back to normalized space
+    grad_pos = grad_pos_denorm / std[0, 0, 1:4]
+    
+    # Embed into full state gradient (only positions affected)
+    grad_x = torch.zeros_like(x)
+    grad_x[:, :, 1:4] = grad_pos
+    
+    # Print grad_V information
+    print(f"grad_V shape: {grad_x.shape}")
+    print(f"grad_V norm: {torch.norm(grad_x):.6f}")
+    print(f"grad_V min/max: {grad_x.min():.6f} / {grad_x.max():.6f}")
+    print(f"Total barrier value V: {V_total.mean().item():.6f}")
+    
+    return V_total, grad_x
+
+# Generate random spherical obstacles around trajectory without collisions (max tries)
+def generate_random_obstacles(trajectory, num_obstacles_range=(0, 10), radius_range=(0.01, 0.30), device='cpu'):
+    """
+    Generate random spherical obstacles around the trajectory without collisions between them.
+    Ensures no two obstacles overlap by checking distance >= sum of radii during placement.
+    Returns list of obstacle dictionaries with center and radius.
+    """
+    # Randomly determine the number of obstacles to generate
+    num_obstacles = np.random.randint(num_obstacles_range[0], num_obstacles_range[1] + 1)
+    obstacles = []
+    
+    # Extract trajectory positions (x, y, z) and move to CPU for numpy operations
+    traj_pos = trajectory[:, 1:4].cpu().numpy()
+    # Compute bounding box of the trajectory
+    min_bounds = traj_pos.min(axis=0)
+    max_bounds = traj_pos.max(axis=0)
+    
+    # Calculate the range of the bounds
+    bounds_range = max_bounds - min_bounds
+    # Expand the placement area by 50% of the trajectory range to allow space around it
+    expanded_min = min_bounds - 0.5 * bounds_range
+    expanded_max = max_bounds + 0.5 * bounds_range
+    
+    # print(f"Generating {num_obstacles} random non-colliding obstacles around trajectory")
+    
+    for i in range(num_obstacles):
+        attempts = 0
+        max_attempts = 100  # Prevent infinite loop in crowded spaces
+        collision = True
+        
+        while collision and attempts < max_attempts:
+            # Sample a random center within the expanded bounds
+            center = np.random.uniform(expanded_min, expanded_max)
+            # Sample a random radius within the given range
+            radius = np.random.uniform(radius_range[0], radius_range[1])
+            
+            # Check for collisions with existing obstacles
+            collision = False
+            for prev_obstacle in obstacles:
+                prev_center = prev_obstacle['center'].cpu().numpy()
+                prev_radius = prev_obstacle['radius']
+                # Compute Euclidean distance between centers
+                dist = np.linalg.norm(center - prev_center)
+                # Check if distance < sum of radii (collision)
+                if dist < radius + prev_radius:
+                    collision = True
+                    break
+            
+            attempts += 1
+        
+        if collision:
+            print(f"Warning: Could not place obstacle {i} without collision after {max_attempts} attempts. Skipping.")
+            continue
+        
+        # Create obstacle dictionary
+        obstacle = {
+            'center': torch.tensor(center, dtype=torch.float32, device=device),  
+            'radius': radius,
+            'id': i
+        }
+        obstacles.append(obstacle)
+        
+        # print(f"Placed Obstacle {i}: center={center}, radius={radius:.3f}")
+    
+    return obstacles
 
 def generate_target_waypoints(trajectories):
     """Generate target waypoints from trajectories (usually the trajectory endpoint)"""
@@ -1215,9 +1246,9 @@ def generate_history_segments(trajectories, history_len=5, device=None):
     return torch.stack(histories)
 
 # Update the test function to demonstrate CBF guidance with diffusion visualization
-def test_model_performance(model, trajectories_norm, mean, std, num_test_samples=3):
-    """Enhanced testing with obstacle-aware transformer"""
-    print("\nTesting enhanced obstacle-aware model performance...")
+def test_model_performance(model, trajectories_norm, mean, std, num_test_samples=3, show_flag=True):
+    """testing with obstacle-aware transformer"""
+    print("\nTesting obstacle-aware model performance...")
     config = model.config
     device = next(model.parameters()).device
     
@@ -1245,7 +1276,7 @@ def test_model_performance(model, trajectories_norm, mean, std, num_test_samples
             model.set_obstacles_data(obstacles)
             
             print(f"\n{'='*60}")
-            print(f"ENHANCED TEST SAMPLE {i+1}")
+            print(f"TEST SAMPLE {i+1}")
             print(f"Generated {len(obstacles)} random obstacles")
             print(f"Obstacle information integrated into transformer via MLP encoder")
             print(f"{'='*60}")
@@ -1264,18 +1295,19 @@ def test_model_performance(model, trajectories_norm, mean, std, num_test_samples
             sampled_unguided_denorm = denormalize_trajectories(sampled_unguided, mean, std)
             history_denorm = denormalize_trajectories(history, mean, std)
             
-            # Enhanced visualization with obstacles
+            # visualization with obstacles
             plot_trajectory_comparison(
                 x_0_denorm, sampled_unguided_denorm, sampled_guided_denorm, 
                 history=history_denorm, target=target_denorm, obstacles=obstacles,
-                title=f"Enhanced Obstacle-Aware Test Sample {i+1}\n(Transformer + CBF Guidance)"
+                title=f"Figs/Obstacle-Aware Test Sample {i+1}\n(Transformer + CBF Guidance)",
+                show_flag=show_flag
             )
 
     model.train()
 
 def plot_trajectory_comparison(original, sampled_unguided_denorm, sampled_guided_denorm, history=None, 
-                                      target=None, obstacles=None, title="Enhanced Trajectory Comparison"):
-    """Enhanced visualization with multiple obstacles and trajectory comparison"""
+                                      target=None, obstacles=None, title="Figs/Trajectory Comparison", show_flag=True):
+    """visualization with multiple obstacles and trajectory comparison"""
     fig = plt.figure(figsize=(20, 15))
     fig.suptitle(title, fontsize=16)
     
@@ -1513,123 +1545,47 @@ def plot_trajectory_comparison(original, sampled_unguided_denorm, sampled_guided
     ax9.grid(True)
     
     plt.tight_layout()
-    plt.show()
-
-# Enhanced Loss Function with Obstacle Distance Term
-class ObstacleAwareAeroDMLoss(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.config = config
-        self.mse_loss = nn.MSELoss()
-        self.obstacle_weight = 10.0  # Weight for obstacle distance term
-        self.pos_weight = 2.0
-        self.vel_weight = 0.5
-        self.last_pos_weight = 10.0  # Weight for last time step position error
-
-    def compute_obstacle_distance_loss(self, pred_trajectory, obstacles_data, mean, std):
-        """
-        Compute obstacle distance loss to encourage obstacle avoidance.
-        Loss = sum over obstacles and time steps of max(0, safety_margin - distance)^2
-        """
-        if not obstacles_data or len(obstacles_data) == 0:
-            return torch.tensor(0.0, device=pred_trajectory.device)
-        
-        batch_size, seq_len, _ = pred_trajectory.shape
-        obstacle_loss = torch.tensor(0.0, device=pred_trajectory.device)
-        
-        # Denormalize positions for distance computation
-        pred_pos_denorm = pred_trajectory[:, :, 1:4] * std[0, 0, 1:4] + mean[0, 0, 1:4]
-        
-        for batch_idx in range(batch_size):
-            # Get obstacles for this batch sample
-            if isinstance(obstacles_data, list):
-                obstacles = obstacles_data[batch_idx] if batch_idx < len(obstacles_data) else []
-            else:
-                obstacles = obstacles_data
-                
-            for obstacle in obstacles:
-                center = obstacle['center'].to(pred_trajectory.device)
-                radius = obstacle['radius']
-                safety_margin = radius * 1.2  # Add 20% safety margin
-                
-                # Compute distances from trajectory to obstacle center
-                distances = torch.norm(pred_pos_denorm[batch_idx] - center, dim=1)
-                
-                # Effective distance considering obstacle radius
-                effective_distances = distances - radius
-                
-                # Penalize trajectories that get too close to obstacles
-                closeness_penalty = torch.clamp(safety_margin - effective_distances, min=0.0)
-                obstacle_loss += torch.sum(closeness_penalty ** 2)
-        
-        # Normalize by batch size and sequence length
-        if batch_size > 0 and len(obstacles_data) > 0:
-            obstacle_loss = obstacle_loss / (batch_size * seq_len)
-            
-        return obstacle_loss
     
-    def forward(self, pred_trajectory, gt_trajectory, obstacles_data=None, mean=None, std=None):
-        # Separate position dimensions for balanced learning
-        pred_pos = pred_trajectory[:, :, 1:4]
-        gt_pos = gt_trajectory[:, :, 1:4]
+    # Modified display/save logic
+    if show_flag:
+        plt.show()
+    else:
+        # Create filename from title
+        filename = title.replace(' ', '_').replace('\n', '_').replace(':', '') + ".svg"
+        plt.savefig(filename, format='svg', bbox_inches='tight')
+        plt.close()
 
-        # Basic loss components
-        x_loss = self.mse_loss(pred_pos[:, :, 0], gt_pos[:, :, 0])
-        y_loss = self.mse_loss(pred_pos[:, :, 1], gt_pos[:, :, 1])
-        z_loss = self.mse_loss(pred_pos[:, :, 2], gt_pos[:, :, 2])
-
-        # Last time step losses with higher weight
-        last_x_loss = self.mse_loss(pred_pos[:, -1, 0], gt_pos[:, -1, 0])
-        last_y_loss = self.mse_loss(pred_pos[:, -1, 1], gt_pos[:, -1, 1])
-        last_z_loss = self.mse_loss(pred_pos[:, -1, 2], gt_pos[:, -1, 2])
-
-        # Combined position loss
-        position_loss = (x_loss + y_loss + z_loss + 
-                         self.last_pos_weight * (last_x_loss + last_y_loss + last_z_loss))
-        
-        # Velocity regularization
-        pred_vel = pred_pos[:, 1:, :] - pred_pos[:, :-1, :]
-        gt_vel = gt_pos[:, 1:, :] - gt_pos[:, :-1, :]
-        
-        vel_x_loss = self.mse_loss(pred_vel[:, :, 0], gt_vel[:, :, 0])
-        vel_y_loss = self.mse_loss(pred_vel[:, :, 1], gt_vel[:, :, 1])
-        vel_z_loss = self.mse_loss(pred_vel[:, :, 2], gt_vel[:, :, 2])
-        vel_loss = vel_x_loss + vel_y_loss + vel_z_loss
-        
-        # Other state components
-        other_components_loss = self.mse_loss(
-            torch.cat([pred_trajectory[:, :, :1], pred_trajectory[:, :, 4:]], dim=2),
-            torch.cat([gt_trajectory[:, :, :1], gt_trajectory[:, :, 4:]], dim=2)
-        )
-        
-        # Obstacle distance loss (if obstacles and normalization params are provided)
-        obstacle_loss = torch.tensor(0.0, device=pred_trajectory.device)
-        if obstacles_data is not None and mean is not None and std is not None:
-            obstacle_loss = self.compute_obstacle_distance_loss(
-                pred_trajectory, obstacles_data, mean, std
-            )
-        
-        # Total loss with obstacle term
-        total_loss = (self.pos_weight * position_loss + 
-                     self.vel_weight * vel_loss + 
-                     other_components_loss + 
-                     self.obstacle_weight * obstacle_loss)
-        
-        return total_loss, position_loss, vel_loss, obstacle_loss
-
-def train_aerodm(use_obstacle_loss=True):
+# Training Function with Obstacle-Aware Transformer
+def train_aerodm(use_obstacle_loss=True, show_flag=True):
     """
-    Enhanced training function with obstacle-aware transformer and configurable loss function
+    training function with obstacle-aware transformer and configurable loss function
     
     Args:
         use_obstacle_loss: Boolean flag to use obstacle-aware loss or basic loss
+        show_flag: Boolean flag to display plots (True) or save as SVG (False)
     """
     config = Config()
+    config.set_show_flag(show_flag)  # Set the show_flag in config
+    
     model = AeroDM(config)
     
     # Set device
-    device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
-    model = model.to(device)
+    if torch.backends.mps.is_available():
+        print("Using Apple Silicon GPU (MPS) for training")
+        device = torch.device("mps")
+    elif torch.cuda.is_available():
+        print("Using single NVIDIA GPU (CUDA) for training")
+        device = torch.device("cuda")
+    else:
+        print("Using CPU for training")
+        device = torch.device("cpu")
+    
+    model.to(device)
+    # Multi-GPU data parallelism (if your model supports it)
+    if torch.cuda.is_available() and torch.cuda.device_count() > 1:
+        print(f"Using {torch.cuda.device_count()} GPUs for data parallel training")
+        model = nn.DataParallel(model)
+
     model.config = config
     
     # Disable CBF guidance during training (obstacle info still goes to transformer)
@@ -1654,9 +1610,9 @@ def train_aerodm(use_obstacle_loss=True):
     print(f"Using AeroDMLoss (obstacle term: {use_obstacle_loss})")
     
     # Training parameters
-    num_epochs = 50
+    num_epochs = 20
     batch_size = 8
-    num_trajectories = 20000
+    num_trajectories = 2000
     
     print("Generating training data with obstacle-aware transformer...")
     trajectories = generate_aerobatic_trajectories(
@@ -1689,7 +1645,7 @@ def train_aerodm(use_obstacle_loss=True):
     losses = {'total': [], 'position': [], 'vel': [], 'obstacle': [], 'continuity': []}
     
     mode_str = "with obstacle-aware loss" if use_obstacle_loss else "with basic loss"
-    print(f"Starting enhanced training {mode_str}...")
+    print(f"Starting training {mode_str}...")
     
     for epoch in range(num_epochs):
         epoch_total_loss = 0
@@ -1720,7 +1676,7 @@ def train_aerodm(use_obstacle_loss=True):
                 obstacles = generate_random_obstacles(
                     traj_denorm[0], 
                     num_obstacles_range=(0, 10), 
-                    radius_range=(0.5, 1.30), 
+                    radius_range=(1.50, 3.00), 
                     device=device
                 )            
                 obstacles_for_batch.append(obstacles)
@@ -1796,46 +1752,12 @@ def train_aerodm(use_obstacle_loss=True):
         # if avg_position < 0.10:
         #     print("Early stopping as position loss is below threshold.")
         #     break
-
-    def plot_enhanced_training_losses(losses, use_obstacle_loss):
-        """Plot training losses with optional obstacle loss visualization"""
-        # In the function:
-        plt.figure(figsize=(12, 8))
-        epochs = range(len(losses['total']))
-
-        # Always plot main losses
-        plt.subplot(2, 1, 1)
-        plt.plot(epochs, losses['total'], 'b-', label='Total Loss', linewidth=2)
-        plt.plot(epochs, losses['position'], 'r--', label='Position Loss', linewidth=2)
-        plt.plot(epochs, losses['vel'], 'g-.', label='Velocity Loss', linewidth=2)
-        plt.xlabel('Epoch')
-        plt.ylabel('Loss')
-        plt.title('Training Losses - Main Components')
-        plt.legend()
-        plt.grid(True)
-
-        # Always plot obstacle (even if 0)
-        plt.subplot(2, 1, 2)
-        plt.plot(epochs, losses['obstacle'], 'm-', label='Obstacle Loss', linewidth=2)
-        plt.plot(epochs, losses['continuity'], 'c-', label='Continuity Loss', linewidth=2)
-        plt.xlabel('Epoch')
-        plt.ylabel('Loss')
-        plt.title('Obstacle and Continuity Losses')
-        plt.legend()
-        plt.grid(True)
-
-        plt.tight_layout()
-        plt.show()
-
     
-    # Plot training losses
-    plot_enhanced_training_losses(losses, use_obstacle_loss)
+    # Plot training losses with show_flag
+    plot_training_losses(losses, use_obstacle_loss, show_flag=show_flag)
     
     # Enable CBF guidance for inference
     model.config.enable_cbf_guidance = True
-    
-    # Test enhanced model performance on test set
-    test_model_performance(model, test_norm, mean, std, num_test_samples=30)
     
     # Save model checkpoint
     checkpoint = {
@@ -1853,75 +1775,84 @@ def train_aerodm(use_obstacle_loss=True):
     else:
         torch.save(checkpoint, "model/enhanced_basic_aerodm.pth")
 
+    # Test model performance on test set
+    test_model_performance(model, test_norm, mean, std, num_test_samples=100, show_flag=show_flag)
+
     return model, losses, trajectories, mean, std
+
+def plot_figures_demo():
+    # Generate example circular trajectories for demonstration
+    print("Generating example circular trajectories...")
+    demo_trajectories = generate_aerobatic_trajectories(num_trajectories=18, seq_len=60)
+    
+    # Visualize some training data with z-axis focus
+    plt.style.use('seaborn-v0_8-whitegrid')  # Use a clean style
+    fig = plt.figure(figsize=(18, 12))
+    fig.suptitle('3D Circular Trajectories Visualization\nTraining Dataset Overview', 
+                fontsize=16, fontweight='bold', y=0.95)
+
+    for i in range(6):
+        # First row
+        ax = fig.add_subplot(3, 6, i+1, projection='3d')
+        trajectory = demo_trajectories[i, :, 1:4].numpy()
+        ax.plot(trajectory[:, 0], trajectory[:, 1], trajectory[:, 2], 'b-', linewidth=2.5, alpha=0.8)
+        ax.scatter(trajectory[::10, 0], trajectory[::10, 1], trajectory[::10, 2], 
+                color='red', s=20, alpha=0.6, marker='o')  # Add sample points
+        ax.set_title(f'Trajectory {i+1}', fontsize=12, fontweight='bold', pad=10)
+        ax.set_xlabel('X', fontsize=10, fontweight='bold')
+        ax.set_ylabel('Y', fontsize=10, fontweight='bold')
+        ax.set_zlabel('Z', fontsize=10, fontweight='bold')
+        ax.grid(True, alpha=0.3)
+        ax.xaxis.pane.fill = False
+        ax.yaxis.pane.fill = False
+        ax.zaxis.pane.fill = False
+        ax.xaxis.pane.set_edgecolor('w')
+        ax.yaxis.pane.set_edgecolor('w')
+        ax.zaxis.pane.set_edgecolor('w')
+        
+        # Second row
+        ax = fig.add_subplot(3, 6, i+6+1, projection='3d')
+        trajectory = demo_trajectories[i+6, :, 1:4].numpy()
+        ax.plot(trajectory[:, 0], trajectory[:, 1], trajectory[:, 2], 'g-', linewidth=2.5, alpha=0.8)
+        ax.scatter(trajectory[::10, 0], trajectory[::10, 1], trajectory[::10, 2], 
+                color='orange', s=20, alpha=0.6, marker='o')
+        ax.set_title(f'Trajectory {i+7}', fontsize=12, fontweight='bold', pad=10)
+        ax.set_xlabel('X', fontsize=10, fontweight='bold')
+        ax.set_ylabel('Y', fontsize=10, fontweight='bold')
+        ax.set_zlabel('Z', fontsize=10, fontweight='bold')
+        ax.grid(True, alpha=0.3)
+        ax.xaxis.pane.fill = False
+        ax.yaxis.pane.fill = False
+        ax.zaxis.pane.fill = False
+        
+        # Third row
+        ax = fig.add_subplot(3, 6, i+12+1, projection='3d')
+        trajectory = demo_trajectories[i+12, :, 1:4].numpy()
+        ax.plot(trajectory[:, 0], trajectory[:, 1], trajectory[:, 2], 'purple', linewidth=2.5, alpha=0.8)
+        ax.scatter(trajectory[::10, 0], trajectory[::10, 1], trajectory[::10, 2], 
+                color='cyan', s=20, alpha=0.6, marker='o')
+        ax.set_title(f'Trajectory {i+13}', fontsize=12, fontweight='bold', pad=10)
+        ax.set_xlabel('X', fontsize=10, fontweight='bold')
+        ax.set_ylabel('Y', fontsize=10, fontweight='bold')
+        ax.set_zlabel('Z', fontsize=10, fontweight='bold')
+        ax.grid(True, alpha=0.3)
+        ax.xaxis.pane.fill = False
+        ax.yaxis.pane.fill = False
+        ax.zaxis.pane.fill = False
+
+    plt.tight_layout(rect=[0, 0.05, 1, 0.93])  # Adjust layout to accommodate title and text
+    plt.show()
 
 # Update the main execution
 if __name__ == "__main__":
-    print("Training Enhanced Obstacle-Aware AeroDM with Transformer Integration and Obstacle-Aware Loss...")
+    print("Training Obstacle-Aware AeroDM with Transformer Integration and Obstacle-Aware Loss...")
     
-    # # Generate example enhanced circular trajectories for demonstration
-    # print("Generating example enhanced circular trajectories...")
-    # demo_trajectories = generate_aerobatic_trajectories(num_trajectories=18, seq_len=60)
+    # Set show_flag here - change to False to save plots as SVG
+    show_flag = False  # Set to False to save all plots as SVG files
     
-    # # Visualize some training data with z-axis focus
-    # plt.style.use('seaborn-v0_8-whitegrid')  # Use a clean style
-    # fig = plt.figure(figsize=(18, 12))
-    # fig.suptitle('3D Enhanced Circular Trajectories Visualization\nTraining Dataset Overview', 
-    #             fontsize=16, fontweight='bold', y=0.95)
-
-    # for i in range(6):
-    #     # First row
-    #     ax = fig.add_subplot(3, 6, i+1, projection='3d')
-    #     trajectory = demo_trajectories[i, :, 1:4].numpy()
-    #     ax.plot(trajectory[:, 0], trajectory[:, 1], trajectory[:, 2], 'b-', linewidth=2.5, alpha=0.8)
-    #     ax.scatter(trajectory[::10, 0], trajectory[::10, 1], trajectory[::10, 2], 
-    #             color='red', s=20, alpha=0.6, marker='o')  # Add sample points
-    #     ax.set_title(f'Trajectory {i+1}', fontsize=12, fontweight='bold', pad=10)
-    #     ax.set_xlabel('X', fontsize=10, fontweight='bold')
-    #     ax.set_ylabel('Y', fontsize=10, fontweight='bold')
-    #     ax.set_zlabel('Z', fontsize=10, fontweight='bold')
-    #     ax.grid(True, alpha=0.3)
-    #     ax.xaxis.pane.fill = False
-    #     ax.yaxis.pane.fill = False
-    #     ax.zaxis.pane.fill = False
-    #     ax.xaxis.pane.set_edgecolor('w')
-    #     ax.yaxis.pane.set_edgecolor('w')
-    #     ax.zaxis.pane.set_edgecolor('w')
-        
-    #     # Second row
-    #     ax = fig.add_subplot(3, 6, i+6+1, projection='3d')
-    #     trajectory = demo_trajectories[i+6, :, 1:4].numpy()
-    #     ax.plot(trajectory[:, 0], trajectory[:, 1], trajectory[:, 2], 'g-', linewidth=2.5, alpha=0.8)
-    #     ax.scatter(trajectory[::10, 0], trajectory[::10, 1], trajectory[::10, 2], 
-    #             color='orange', s=20, alpha=0.6, marker='o')
-    #     ax.set_title(f'Trajectory {i+7}', fontsize=12, fontweight='bold', pad=10)
-    #     ax.set_xlabel('X', fontsize=10, fontweight='bold')
-    #     ax.set_ylabel('Y', fontsize=10, fontweight='bold')
-    #     ax.set_zlabel('Z', fontsize=10, fontweight='bold')
-    #     ax.grid(True, alpha=0.3)
-    #     ax.xaxis.pane.fill = False
-    #     ax.yaxis.pane.fill = False
-    #     ax.zaxis.pane.fill = False
-        
-    #     # Third row
-    #     ax = fig.add_subplot(3, 6, i+12+1, projection='3d')
-    #     trajectory = demo_trajectories[i+12, :, 1:4].numpy()
-    #     ax.plot(trajectory[:, 0], trajectory[:, 1], trajectory[:, 2], 'purple', linewidth=2.5, alpha=0.8)
-    #     ax.scatter(trajectory[::10, 0], trajectory[::10, 1], trajectory[::10, 2], 
-    #             color='cyan', s=20, alpha=0.6, marker='o')
-    #     ax.set_title(f'Trajectory {i+13}', fontsize=12, fontweight='bold', pad=10)
-    #     ax.set_xlabel('X', fontsize=10, fontweight='bold')
-    #     ax.set_ylabel('Y', fontsize=10, fontweight='bold')
-    #     ax.set_zlabel('Z', fontsize=10, fontweight='bold')
-    #     ax.grid(True, alpha=0.3)
-    #     ax.xaxis.pane.fill = False
-    #     ax.yaxis.pane.fill = False
-    #     ax.zaxis.pane.fill = False
-
-    # plt.tight_layout(rect=[0, 0.05, 1, 0.93])  # Adjust layout to accommodate title and text
-    # plt.show()
-
-    # Train with enhanced obstacle-aware model and loss
-    trained_model, losses, trajectories, mean, std = train_aerodm()
+    # plot_figures_demo()
     
-    print("Training completed! Obstacle information integrated into both transformer and loss function.")
+    # Train with obstacle-aware model and loss, passing show_flag
+    trained_model, losses, trajectories, mean, std = train_aerodm(show_flag=show_flag)
+    
+    print("Training completed!")

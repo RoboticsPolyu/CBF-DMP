@@ -9,7 +9,7 @@ from mpl_toolkits.mplot3d import Axes3D
 from typing import List, Dict
 
 # Import your model and utility functions
-from AeroDM_CBF_OBSMLP_v2 import (
+from v2 import (
     Config, AeroDM,
     generate_aerobatic_trajectories,
     normalize_trajectories, denormalize_trajectories,
@@ -38,7 +38,7 @@ def plot_obstacle_aware_trajectory_comparison(
 ):
     """
     Plot 3D trajectory comparison with multiple spherical obstacles.
-    Imitates plot_circular_trajectory_comparison but supports multiple obstacles.
+    Imitates plot_trajectory_comparison but supports multiple obstacles.
     """
     fig = plt.figure(figsize=(15, 5 * num_subplots))
     fig.suptitle(title, fontsize=16)
