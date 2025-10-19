@@ -1,5 +1,4 @@
 # AeroDM + Barrier Function (CBF) implementation
-
 import os
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
 
@@ -36,7 +35,7 @@ class Config:
     enable_cbf_guidance = False  # Disabled by default; toggle for inference
     guidance_gamma = 100.0  # Base gamma for barrier guidance
     obstacle_radius = 5.0  # Safe distance radius
-    
+
     @staticmethod
     def get_obstacle_center(device='cpu'):
         return torch.tensor([5.0, 5.0, 10.0], device=device)  # Example obstacle center
@@ -184,47 +183,6 @@ class DiffusionTransformer(nn.Module):
         mask = (torch.triu(torch.ones(sz, sz)) == 1).transpose(0, 1)
         mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
         return mask
-
-# CBF Barrier Function (from CoDiG: quadratic barrier for obstacle avoidance)
-# def compute_barrier_and_grad(x, config, mean, std):
-#     """
-#     Compute barrier V and its gradient ∇V for the trajectory x.
-#     Example: Quadratic barrier for spherical obstacle avoidance.
-#     V = sum_τ max(0, r - ||pos_τ - center||)^2
-#     ∇V affects only position components (indices 1:4).
-#     """
-#     # Denormalize positions for barrier computation
-#     pos_denorm = x[:, :, 1:4] * std[0, 0, 1:4] + mean[0, 0, 1:4]
-    
-#     # Get obstacle center on the correct device
-#     center = config.get_obstacle_center(x.device).unsqueeze(0).unsqueeze(0)  # (1,1,3)
-#     r = config.obstacle_radius
-    
-#     dist = torch.norm(pos_denorm - center, dim=-1, keepdim=False)  # (batch, seq_len)
-#     excess = torch.clamp(r - dist, min=0.0)  # (batch, seq_len)
-#     V = (excess ** 2).sum(dim=-1)  # (batch,)
-    
-#     # Gradient: ∇_pos V_τ = -2 * excess_τ * (pos_τ - center) / dist_τ if dist < r else 0
-#     grad_pos_denorm = torch.zeros_like(pos_denorm)
-#     unsafe_mask = dist < r
-#     if unsafe_mask.any():
-#         direction = (pos_denorm - center) / (dist.unsqueeze(-1) + 1e-8)  # Unit vector away from center
-#         grad_pos_denorm[unsafe_mask] = -2.0 * excess[unsafe_mask].unsqueeze(-1) * direction[unsafe_mask]
-    
-#     # Normalize gradient back to normalized space
-#     grad_pos = grad_pos_denorm / std[0, 0, 1:4]
-    
-#     # Embed into full state gradient (only positions affected)
-#     grad_x = torch.zeros_like(x)
-#     grad_x[:, :, 1:4] = grad_pos
-    
-#     # Print grad_V information
-#     print(f"grad_V shape: {grad_x.shape}")
-#     print(f"grad_V norm: {torch.norm(grad_x):.6f}")
-#     print(f"grad_V min/max: {grad_x.min():.6f} / {grad_x.max():.6f}")
-#     print(f"Number of unsafe points: {unsafe_mask.sum().item()}")
-    
-#     return V, grad_x
 
 def compute_barrier_and_grad(x, config, mean, std):
     """
@@ -676,29 +634,35 @@ class AeroDM(nn.Module):
 
 # Improved Loss Function with Balanced Z-Axis Learning
 class AeroDMLoss(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, continuity_weight=10.0,  position_weight=3.0, vel_weight=2.0, last_pos_weight=10.0):
         super().__init__()
         self.config = config
+        # loss weights
+        self.continuity_weight = continuity_weight
+        self.position_weight = position_weight
+        self.vel_weight = vel_weight
+        self.last_pos_weight = last_pos_weight
         self.mse_loss = nn.MSELoss()
         
-    def forward(self, pred_trajectory, gt_trajectory):
+    def forward(self, pred_trajectory, gt_trajectory, history=None):
         # Separate position dimensions for balanced learning
         pred_pos = pred_trajectory[:, :, 1:4]
         gt_pos = gt_trajectory[:, :, 1:4]
+        device = pred_trajectory.device
 
-        # 基础损失
+        # Basic losses
         x_loss = self.mse_loss(pred_pos[:, :, 0], gt_pos[:, :, 0])
         y_loss = self.mse_loss(pred_pos[:, :, 1], gt_pos[:, :, 1])
         z_loss = self.mse_loss(pred_pos[:, :, 2], gt_pos[:, :, 2])
 
-        # 最后一个时间步的所有维度损失
+        # All dimensional losses in the last time step
         last_x_loss = self.mse_loss(pred_pos[:, -1, 0], gt_pos[:, -1, 0])
         last_y_loss = self.mse_loss(pred_pos[:, -1, 1], gt_pos[:, -1, 1])
         last_z_loss = self.mse_loss(pred_pos[:, -1, 2], gt_pos[:, -1, 2])
 
-        # 组合损失，最后一个点权重更高
+        # Combination loss, with the last point having a higher weight
         position_loss = (x_loss + y_loss + z_loss + 
-                         10.0 * (last_x_loss + last_y_loss + last_z_loss))  # 最后一个点权重加倍
+                         self.last_pos_weight * (last_x_loss + last_y_loss + last_z_loss))  
         
         # Velocity regularization with dimension balancing
         pred_vel = pred_pos[:, 1:, :] - pred_pos[:, :-1, :]
@@ -715,7 +679,20 @@ class AeroDMLoss(nn.Module):
             torch.cat([gt_trajectory[:, :, :1], gt_trajectory[:, :, 4:]], dim=2)
         )
         
-        total_loss = 2.0 * position_loss + 1.5 * vel_loss + other_components_loss
+        # New: Continuity loss (MSE between last history and first pred timestep)
+        continuity_loss = torch.tensor(0.0, device=device, requires_grad=True)
+        if history is not None and pred_trajectory.size(1) > 0:
+            # Focus on position components (indices 1:4) for smoothness
+            last_history_pos = history[:, -1, 1:4]
+            first_pred_pos = pred_trajectory[:, 0, 1:4]
+            continuity_loss = self.mse_loss(first_pred_pos, last_history_pos)
+            # Optional: Add velocity continuity (delta from last history to first pred)
+            if history.size(1) > 1:
+                last_history_vel = history[:, -1, 1:4] - history[:, -2, 1:4]
+                first_pred_vel = pred_trajectory[:, 0, 1:4] - last_history_pos  # Approx
+                continuity_loss += self.mse_loss(first_pred_vel, last_history_vel)
+
+        total_loss = self.position_weight * position_loss + self.vel_weight * vel_loss + self.continuity_weight * continuity_loss + other_components_loss
         
         return total_loss, position_loss, vel_loss
 
@@ -762,11 +739,27 @@ def plot_training_losses(losses):
     plt.grid(True)
     plt.show()
 
+# Aerobatic Trajectory Generation
 def generate_aerobatic_trajectories(num_trajectories=100, seq_len=60, radius=10.0, height=0.0):
-    """Generate diverse aerobatic trajectories based on five maneuver styles:
-    (a) Power Loop, (b) Barrel Roll, (c) Split-S, (d) Immelmann Turn, (e) Wall Ride."""
+    """Generate diverse aerobatic trajectories based on eleven maneuver styles:
+    (a) Power Loop, (b) Barrel Roll, (c) Split-S, (d) Immelmann Turn, (e) Wall Ride,
+    (f) Eight Figure, (g) Patrick, (h) Star, (i) Half Moon, (j) Sphinx, (k) Clover."""
     trajectories = []
-    maneuver_styles = ['power_loop', 'barrel_roll', 'split_s', 'immelmann', 'wall_ride']
+    maneuver_styles = ['power_loop', 'barrel_roll', 'split_s', 'immelmann', 'wall_ride', 'eight_figure', 'star', 'half_moon', 'sphinx', 'clover']
+    
+    # maneuver_styles = ['barrel_roll']
+    
+    # def smooth_trajectory(positions, smoothing_factor=0.1):
+    #     """Apply smoothing to trajectory positions using a simple moving average"""
+    #     smoothed = np.zeros_like(positions)
+    #     for i in range(len(positions)):
+    #         start_idx = max(0, i - 1)
+    #         end_idx = min(len(positions), i + 2)
+    #         smoothed[i] = np.mean(positions[start_idx:end_idx], axis=0)
+    #     return smoothing_factor * smoothed + (1 - smoothing_factor) * positions
+    
+    def smooth_trajectory(positions, smoothing_factor=0.1):
+        return positions
     
     for i in range(num_trajectories):
         # Randomly select a maneuver style
@@ -780,7 +773,7 @@ def generate_aerobatic_trajectories(num_trajectories=100, seq_len=60, radius=10.
         current_radius = radius * np.random.uniform(0.8, 1.2)
         angular_velocity = np.random.uniform(0.5, 2.0)
         
-        # Normalize time steps to [0, 1]
+        # Normalize time steps to [0, 1] - exactly one period
         norm_t = np.linspace(0, 1, seq_len)
         
         # Compute positions and velocities based on style
@@ -836,6 +829,116 @@ def generate_aerobatic_trajectories(num_trajectories=100, seq_len=60, radius=10.
             vx = -current_radius * (2 * np.pi * turns * angular_velocity) * np.sin(theta)
             vy = current_radius * (2 * np.pi * turns * angular_velocity) * np.cos(theta)
             vz = np.full(seq_len, climb_height)
+        
+        elif style == 'eight_figure':
+            # Lemniscate (infinity symbol) in xy plane - exactly one period
+            theta = 2 * np.pi * norm_t
+            a = current_radius
+            denom = 1 + np.sin(theta)**2
+            x = center_x + a * np.cos(theta) / denom
+            y = center_y + a * np.sin(theta) * np.cos(theta) / denom
+            z = center_z + current_radius * 0.1 * np.sin(2 * theta)  # Smooth vertical variation
+            
+            # Numerical derivatives for smooth velocity
+            dt = 1.0 / seq_len
+            x_smooth = smooth_trajectory(x)
+            y_smooth = smooth_trajectory(y)
+            z_smooth = smooth_trajectory(z)
+            vx = np.gradient(x_smooth, dt)
+            vy = np.gradient(y_smooth, dt)
+            vz = np.gradient(z_smooth, dt)
+            x, y, z = x_smooth, y_smooth, z_smooth
+        
+        elif style == 'patrick':
+            # Complex 3D star-like pattern - exactly one period
+            freq1, freq2, freq3 = 2.0, 3.0, 1.5  # Fixed frequencies for period control
+            theta = 2 * np.pi * norm_t
+            x = center_x + current_radius * np.sin(freq1 * theta) * np.cos(freq2 * theta)
+            y = center_y + current_radius * np.sin(freq2 * theta) * np.cos(freq3 * theta)
+            z = center_z + current_radius * np.sin(freq3 * theta) * np.cos(freq1 * theta)
+            
+            # Apply smoothing and compute derivatives
+            x_smooth = smooth_trajectory(x, 0.2)
+            y_smooth = smooth_trajectory(y, 0.2)
+            z_smooth = smooth_trajectory(z, 0.2)
+            dt = 1.0 / seq_len
+            vx = np.gradient(x_smooth, dt)
+            vy = np.gradient(y_smooth, dt)
+            vz = np.gradient(z_smooth, dt)
+            x, y, z = x_smooth, y_smooth, z_smooth
+        
+        elif style == 'star':
+            # 5-point star pattern in xy plane with vertical oscillation - exactly one period
+            points = 5
+            theta = 2 * np.pi * norm_t
+            r = current_radius * (1 + 0.3 * np.sin(points * theta))  # Smoother star shape
+            x = center_x + r * np.cos(theta)
+            y = center_y + r * np.sin(theta)
+            z = center_z + current_radius * 0. * np.sin(3 * theta)
+            
+            # Apply smoothing
+            positions = np.column_stack([x, y, z])
+            smoothed_positions = smooth_trajectory(positions)
+            x, y, z = smoothed_positions[:, 0], smoothed_positions[:, 1], smoothed_positions[:, 2]
+            dt = 1.0 / seq_len
+            vx = np.gradient(x, dt)
+            vy = np.gradient(y, dt)
+            vz = np.gradient(z, dt)
+        
+        elif style == 'half_moon':
+            # Crescent moon shape in xy plane - exactly one half period
+            theta = np.pi * norm_t
+            r = current_radius * (1 + 0.3 * np.cos(2 * theta))  # Smoother crescent
+            x = center_x + r * np.cos(theta)
+            y = center_y + r * np.sin(theta)
+            z = center_z + current_radius * 0.1 * np.sin(2 * theta)  # Smooth vertical variation
+            
+            # Apply smoothing
+            x_smooth = smooth_trajectory(x)
+            y_smooth = smooth_trajectory(y)
+            z_smooth = smooth_trajectory(z)
+            dt = 1.0 / seq_len
+            vx = np.gradient(x_smooth, dt)
+            vy = np.gradient(y_smooth, dt)
+            vz = np.gradient(z_smooth, dt)
+            x, y, z = x_smooth, y_smooth, z_smooth
+        
+        elif style == 'sphinx':
+            # Pyramid-like triangular pattern - exactly one period
+            theta = 2 * np.pi * norm_t
+            # Smoother triangular wave using sine approximation
+            triangle_wave = 0.5 * np.sin(2 * theta) + 0.3 * np.sin(4 * theta)
+            x = center_x + current_radius * np.cos(theta)
+            y = center_y + current_radius * np.sin(theta)
+            z = center_z + current_radius * 0.3 * triangle_wave
+            
+            # Apply smoothing
+            positions = np.column_stack([x, y, z])
+            smoothed_positions = smooth_trajectory(positions, 0.15)
+            x, y, z = smoothed_positions[:, 0], smoothed_positions[:, 1], smoothed_positions[:, 2]
+            dt = 1.0 / seq_len
+            vx = np.gradient(x, dt)
+            vy = np.gradient(y, dt)
+            vz = np.gradient(z, dt)
+        
+        elif style == 'clover':
+            # 4-leaf clover pattern - exactly one period
+            leaves = 4
+            theta = 2 * np.pi * norm_t
+            r = current_radius * (1 + 0.2 * np.sin(leaves * theta))  # Smoother clover
+            x = center_x + r * np.cos(theta)
+            y = center_y + r * np.sin(theta)
+            z = center_z + current_radius * 0.0 * np.cos(2 * theta)
+            
+            # Apply smoothing
+            x_smooth = smooth_trajectory(x)
+            y_smooth = smooth_trajectory(y)
+            z_smooth = smooth_trajectory(z)
+            dt = 1.0 / seq_len
+            vx = np.gradient(x_smooth, dt)
+            vy = np.gradient(y_smooth, dt)
+            vz = np.gradient(z_smooth, dt)
+            x, y, z = x_smooth, y_smooth, z_smooth
         
         # Compute speed and direction
         speed = np.sqrt(vx**2 + vy**2 + vz**2)
@@ -1178,7 +1281,7 @@ def train_aerodm_cbf():
     # Training parameters
     num_epochs = 50
     batch_size = 8
-    num_trajectories = 20000
+    num_trajectories = 10000
     
     print("Generating enhanced circular trajectory data...")
     # Generate enhanced training data
@@ -1265,7 +1368,7 @@ def train_aerodm_cbf():
     model.config.enable_cbf_guidance = True
     
     # Test model performance with CBF and diffusion visualization
-    test_model_performance(model, trajectories_norm, mean, std, num_test_samples=1)  # Reduced for demonstration
+    test_model_performance(model, trajectories_norm, mean, std, num_test_samples=30)  # Reduced for demonstration
     
     torch.save({
         'model_state_dict': model.state_dict(),
@@ -1282,43 +1385,7 @@ def train_aerodm_cbf():
 if __name__ == "__main__":
     print("Training Improved AeroDM with CBF Guidance Integration...")
     
-    # Generate example enhanced circular trajectories for demonstration
-    print("Generating example enhanced circular trajectories...")
-    demo_trajectories = generate_aerobatic_trajectories(num_trajectories=18, seq_len=60)
-    
-    # Visualize some training data with z-axis focus
-    fig = plt.figure(figsize=(15, 10))
-    for i in range(6):
-        ax = fig.add_subplot(3, 6, i+1, projection='3d')
-        trajectory = demo_trajectories[i, :, 1:4].numpy()
-        ax.plot(trajectory[:, 0], trajectory[:, 1], trajectory[:, 2], 'b-', linewidth=2)
-        ax.set_title(f'Enhanced Circular Trajectory {i+1}')
-        ax.set_xlabel('X')
-        ax.set_ylabel('Y')
-        ax.set_zlabel('Z')
-        ax.grid(True)
-        
-        ax = fig.add_subplot(3, 6, i+6+1, projection='3d')
-        trajectory = demo_trajectories[i+6, :, 1:4].numpy()
-        ax.plot(trajectory[:, 0], trajectory[:, 1], trajectory[:, 2], 'b-', linewidth=2)
-        ax.set_title(f'Enhanced Circular Trajectory {i+7}')
-        ax.set_xlabel('X')
-        ax.set_ylabel('Y')
-        ax.set_zlabel('Z')
-        ax.grid(True)
-
-        ax = fig.add_subplot(3, 6, i+12+1, projection='3d')
-        trajectory = demo_trajectories[i+12, :, 1:4].numpy()
-        ax.plot(trajectory[:, 0], trajectory[:, 1], trajectory[:, 2], 'b-', linewidth=2)
-        ax.set_title(f'Enhanced Circular Trajectory {i+13}')
-        ax.set_xlabel('X')
-        ax.set_ylabel('Y')
-        ax.set_zlabel('Z')
-        ax.grid(True)
-    plt.tight_layout()
-    plt.show()
-    
     # Train with enhanced method and CBF
     trained_model, losses, trajectories, mean, std = train_aerodm_cbf()
     
-    print("Training completed! CBF guidance integrated for obstacle avoidance.")
+    print("Training completed!")

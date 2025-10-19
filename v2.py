@@ -36,6 +36,7 @@ class Config:
     # Obstacle parameters
     max_obstacles = 10  # Maximum number of obstacles to process
     obstacle_feat_dim = 4  # [x, y, z, radius]
+    enable_obstacle_encoding = False  # Toggle obstacle encoding in the model
 
     # CBF Guidance parameters (from CoDiG paper)
     enable_cbf_guidance = True  # Disabled by default; toggle for inference
@@ -98,11 +99,15 @@ class ObstacleEncoder(nn.Module):
         """
         Encode obstacle information into a latent representation.
         """
-        if obstacles_data is None or len(obstacles_data) == 0:
+        if obstacles_data is None:
             # No obstacles, return zero embedding
             batch_size = 1
             return torch.zeros(batch_size, self.config.latent_dim, device=next(self.parameters()).device)
-        
+        if obstacles_data is not None and len(obstacles_data) == 0:
+            # No obstacles, return zero embedding
+            batch_size = 1
+            return torch.zeros(batch_size, self.config.latent_dim, device=next(self.parameters()).device)
+
         device = next(self.parameters()).device
         batch_size = 1
         
@@ -199,7 +204,7 @@ class ConditionEmbedding(nn.Module):
         action_emb = self.action_embed(action)
         
         # Obstacle embedding
-        if obstacles_data is not None:
+        if obstacles_data is not None and self.config.enable_obstacle_encoding:
             obstacle_emb = self.obstacle_encoder(obstacles_data)
         else:
             obstacle_emb = torch.zeros_like(t_emb)
@@ -1140,7 +1145,7 @@ def compute_barrier_and_grad(x, config, mean, std, obstacles_data=None):
     return V_total, grad_x
 
 # Generate random spherical obstacles around trajectory without collisions (max tries)
-def generate_random_obstacles(trajectory, num_obstacles_range=(0, 10), radius_range=(0.01, 0.30), device='cpu'):
+def generate_random_obstacles(trajectory, num_obstacles_range=(0, 10), radius_range=(0.01, 0.30), check_collision=False, device='cpu'):
     """
     Generate random spherical obstacles around the trajectory without collisions between them.
     Ensures no two obstacles overlap by checking distance >= sum of radii during placement.
@@ -1168,31 +1173,35 @@ def generate_random_obstacles(trajectory, num_obstacles_range=(0, 10), radius_ra
         attempts = 0
         max_attempts = 100  # Prevent infinite loop in crowded spaces
         collision = True
-        
-        while collision and attempts < max_attempts:
-            # Sample a random center within the expanded bounds
+        if check_collision:
+            while collision and attempts < max_attempts:
+                # Sample a random center within the expanded bounds
+                center = np.random.uniform(expanded_min, expanded_max)
+                # Sample a random radius within the given range
+                radius = np.random.uniform(radius_range[0], radius_range[1])
+                
+                # Check for collisions with existing obstacles
+                collision = False
+                for prev_obstacle in obstacles:
+                    prev_center = prev_obstacle['center'].cpu().numpy()
+                    prev_radius = prev_obstacle['radius']
+                    # Compute Euclidean distance between centers
+                    dist = np.linalg.norm(center - prev_center)
+                    # Check if distance < sum of radii (collision)
+                    if dist < radius + prev_radius:
+                        collision = True
+                        break
+                
+                attempts += 1
+            
+            if collision:
+                print(f"Warning: Could not place obstacle {i} without collision after {max_attempts} attempts. Skipping.")
+                continue
+        else:
             center = np.random.uniform(expanded_min, expanded_max)
             # Sample a random radius within the given range
             radius = np.random.uniform(radius_range[0], radius_range[1])
-            
-            # Check for collisions with existing obstacles
-            collision = False
-            for prev_obstacle in obstacles:
-                prev_center = prev_obstacle['center'].cpu().numpy()
-                prev_radius = prev_obstacle['radius']
-                # Compute Euclidean distance between centers
-                dist = np.linalg.norm(center - prev_center)
-                # Check if distance < sum of radii (collision)
-                if dist < radius + prev_radius:
-                    collision = True
-                    break
-            
-            attempts += 1
-        
-        if collision:
-            print(f"Warning: Could not place obstacle {i} without collision after {max_attempts} attempts. Skipping.")
-            continue
-        
+
         # Create obstacle dictionary
         obstacle = {
             'center': torch.tensor(center, dtype=torch.float32, device=device),  
@@ -1270,7 +1279,7 @@ def test_model_performance(model, trajectories_norm, mean, std, num_test_samples
             target_denorm = target_norm * std[0, 0, 1:4] + mean[0, 0, 1:4]
             
             # Generate random obstacles
-            obstacles = generate_random_obstacles(x_0_denorm[0], num_obstacles_range=(0, 10), radius_range=(0.35, 0.80))
+            obstacles = generate_random_obstacles(x_0_denorm[0], num_obstacles_range=(0, 10), radius_range=(0.35, 0.80), check_collision=False, device=device)
 
             # Set obstacles data for model input
             model.set_obstacles_data(obstacles)
@@ -1556,7 +1565,7 @@ def plot_trajectory_comparison(original, sampled_unguided_denorm, sampled_guided
         plt.close()
 
 # Training Function with Obstacle-Aware Transformer
-def train_aerodm(use_obstacle_loss=True, show_flag=True):
+def train_aerodm(use_obstacle_loss=False, show_flag=True):
     """
     training function with obstacle-aware transformer and configurable loss function
     
@@ -1610,9 +1619,9 @@ def train_aerodm(use_obstacle_loss=True, show_flag=True):
     print(f"Using AeroDMLoss (obstacle term: {use_obstacle_loss})")
     
     # Training parameters
-    num_epochs = 20
+    num_epochs = 50
     batch_size = 8
-    num_trajectories = 2000
+    num_trajectories = 10000
     
     print("Generating training data with obstacle-aware transformer...")
     trajectories = generate_aerobatic_trajectories(
@@ -1853,6 +1862,6 @@ if __name__ == "__main__":
     # plot_figures_demo()
     
     # Train with obstacle-aware model and loss, passing show_flag
-    trained_model, losses, trajectories, mean, std = train_aerodm(show_flag=show_flag)
+    trained_model, losses, trajectories, mean, std = train_aerodm(use_obstacle_loss=False, show_flag=show_flag)
     
     print("Training completed!")
