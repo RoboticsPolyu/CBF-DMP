@@ -44,7 +44,7 @@ class Config:
     obstacle_radius = 5.0  # Safe distance radius
     
     # Plotting control
-    show_flag = True  # Set to False to save plots as SVG instead of displaying
+    show_flag = False  # Set to False to save plots as SVG instead of displaying
     
     @staticmethod
     def get_obstacle_center(device='cpu'):
@@ -653,7 +653,7 @@ class AeroDMLoss(nn.Module):
     Supports switching obstacle term via flag; always returns 4 values for consistency.
     Fixes: Proper safety margin for obstacles, Z-weighting, normalization by avg obstacles.
     """
-    def __init__(self, config, enable_obstacle_term=False, safe_extra_factor=0.2, z_weight=1.5, obstacle_weight=10.0, continuity_weight=5.0):
+    def __init__(self, config, enable_obstacle_term=False, safe_extra_factor=0.2, z_weight=1.5, obstacle_weight=10.0, continuity_weight=15.0):
         super().__init__()
         self.config = config
         # Flag to enable/disable obstacle distance penalty in total loss

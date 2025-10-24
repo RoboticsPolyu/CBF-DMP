@@ -39,7 +39,7 @@ class Config:
     @staticmethod
     def get_obstacle_center(device='cpu'):
         return torch.tensor([5.0, 5.0, 10.0], device=device)  # Example obstacle center
-
+    
 # Transformer positional encoding
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model, max_len=5000):
@@ -448,6 +448,7 @@ class DiffusionProcess:
             
             return x_prev
     
+    # Plotting function for diffusion steps for debugging
     def _plot_diffusion_step(self, x_t, x_prev, t, step_idx, barrier_info=None, is_final=False):
         """Plot the current diffusion step"""
         fig = plt.figure(figsize=(20, 10))
@@ -634,7 +635,7 @@ class AeroDM(nn.Module):
 
 # Improved Loss Function with Balanced Z-Axis Learning
 class AeroDMLoss(nn.Module):
-    def __init__(self, config, continuity_weight=10.0,  position_weight=3.0, vel_weight=2.0, last_pos_weight=10.0):
+    def __init__(self, config, continuity_weight=10.0,  position_weight=2.0, vel_weight=1.0, last_pos_weight=10.0):
         super().__init__()
         self.config = config
         # loss weights
@@ -685,12 +686,12 @@ class AeroDMLoss(nn.Module):
             # Focus on position components (indices 1:4) for smoothness
             last_history_pos = history[:, -1, 1:4]
             first_pred_pos = pred_trajectory[:, 0, 1:4]
-            continuity_loss = self.mse_loss(first_pred_pos, last_history_pos)
+            continuity_loss = self.position_weight * self.mse_loss(first_pred_pos, last_history_pos)
             # Optional: Add velocity continuity (delta from last history to first pred)
             if history.size(1) > 1:
                 last_history_vel = history[:, -1, 1:4] - history[:, -2, 1:4]
                 first_pred_vel = pred_trajectory[:, 0, 1:4] - last_history_pos  # Approx
-                continuity_loss += self.mse_loss(first_pred_vel, last_history_vel)
+                continuity_loss += self.vel_weight* self.mse_loss(first_pred_vel, last_history_vel)
 
         total_loss = self.position_weight * position_loss + self.vel_weight * vel_loss + self.continuity_weight * continuity_loss + other_components_loss
         
@@ -724,7 +725,7 @@ def denormalize_obstacle(obstacle_norm, mean, std):
     obstacle_denorm = obstacle_norm * pos_std + pos_mean
     return obstacle_denorm
 
-def plot_training_losses(losses):
+def plot_training_losses(losses, show_flag=False):
     """Plot training losses over epochs"""
     plt.figure(figsize=(10, 6))
     epochs = range(len(losses['total']))
@@ -737,7 +738,13 @@ def plot_training_losses(losses):
     plt.title('Training Losses')
     plt.legend()
     plt.grid(True)
-    plt.show()
+    
+    if show_flag:
+        plt.show()
+    else:
+        filename = "Figs/training_losses_bg.svg"
+        plt.savefig(filename, format='svg', bbox_inches='tight')
+        plt.close()
 
 # Aerobatic Trajectory Generation
 def generate_aerobatic_trajectories(num_trajectories=100, seq_len=60, radius=10.0, height=0.0):
@@ -993,7 +1000,7 @@ def generate_history_segments(trajectories, history_len=5, device=None):
     
     return torch.stack(histories)
 
-def plot_trajectory_comparison(original, reconstructed, sampled, history=None, target=None, title="Circular Trajectory Comparison", obstacle_center=None, obstacle_radius=None):
+def plot_trajectory_comparison(original, reconstructed, sampled, history=None, target=None, title="Figs/Barrier Guidance Trajectory Comparison", obstacle_center=None, obstacle_radius=None, show_flag=False):
     """Enhanced visualization with history, target, and obstacle (for CBF demo)"""
     fig = plt.figure(figsize=(20, 15))
     fig.suptitle(title, fontsize=16)
@@ -1192,10 +1199,17 @@ def plot_trajectory_comparison(original, reconstructed, sampled, history=None, t
     ax9.grid(True)
     
     plt.tight_layout()
-    plt.show()
+    
+    if show_flag:
+        plt.show()
+    else:
+        # Create filename from title
+        filename = title.replace(' ', '_').replace('\n', '_').replace(':', '') + ".svg"
+        plt.savefig(filename, format='svg', bbox_inches='tight')
+        plt.close()
 
 # Update the test function to demonstrate CBF guidance with diffusion visualization
-def test_model_performance(model, trajectories_norm, mean, std, num_test_samples=3):
+def test_model_performance(model, trajectories_norm, mean, std, num_test_samples=3, show_flag=False):
     """Enhanced testing with history, target, and CBF guidance visualization"""
     print("\nTesting model performance with CBF guidance...")
     config = model.config  # Access config from model
@@ -1250,14 +1264,15 @@ def test_model_performance(model, trajectories_norm, mean, std, num_test_samples
             plot_trajectory_comparison(
                 x_0_denorm, sampled_unguided_denorm, sampled_guided_denorm, 
                 history=history_denorm, target=target_denorm,
-                title=f"CBF Guidance Test Sample {i+1}\n(Guided: Green avoids Red Obstacle)",
+                title=f"Figs/CBF Guidance Test Sample {i+1}\n(Guided: Green avoids Red Obstacle)",
                 obstacle_center=obstacle_center_viz,
-                obstacle_radius=config.obstacle_radius
+                obstacle_radius=config.obstacle_radius,
+                show_flag=show_flag
             )
             
     model.train()
 
-def train_aerodm_cbf():
+def train_aerodm_cbf(show_flag=False):
     """Enhanced training function with z-axis improvements"""
     config = Config()
     model = AeroDM(config)
@@ -1362,13 +1377,13 @@ def train_aerodm_cbf():
             break
 
     # Plot training losses
-    plot_training_losses(losses)
+    plot_training_losses(losses, show_flag=show_flag)
     
     # Enable CBF guidance for inference/testing
     model.config.enable_cbf_guidance = True
     
     # Test model performance with CBF and diffusion visualization
-    test_model_performance(model, trajectories_norm, mean, std, num_test_samples=30)  # Reduced for demonstration
+    test_model_performance(model, trajectories_norm, mean, std, num_test_samples=30, show_flag=show_flag)  # Reduced for demonstration
     
     torch.save({
         'model_state_dict': model.state_dict(),
@@ -1385,7 +1400,9 @@ def train_aerodm_cbf():
 if __name__ == "__main__":
     print("Training Improved AeroDM with CBF Guidance Integration...")
     
+    show_flag = False 
+
     # Train with enhanced method and CBF
-    trained_model, losses, trajectories, mean, std = train_aerodm_cbf()
+    trained_model, losses, trajectories, mean, std = train_aerodm_cbf(show_flag=show_flag)
     
     print("Training completed!")
