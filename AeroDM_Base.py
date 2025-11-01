@@ -29,6 +29,8 @@ class Config:
     # Condition dimensions
     target_dim = 3  # p_t ∈ R^3
     action_dim = 5   # 5 maneuver styles
+    
+    contraction_weight = 0.01
 
 # Transformer positional encoding
 class PositionalEncoding(nn.Module):
@@ -184,20 +186,31 @@ class DiffusionProcess:
         self.betas = torch.linspace(config.beta_start, config.beta_end, config.diffusion_steps)
         self.alphas = 1.0 - self.betas
         self.alpha_bars = torch.cumprod(self.alphas, dim=0)
-        
+
     def q_sample(self, x_0, t, noise=None):
         """Forward diffusion process: q(x_t | x_0)"""
         if noise is None:
             noise = torch.randn_like(x_0)
         
         if t.dim() == 1:
+            # t is a batch of timesteps, ensure correct shape
             t = t.view(-1, 1, 1)
         
-        alpha_bar_t = self.alpha_bars[t].to(x_0.device)
+        # --- FIX APPLIED HERE ---
+        # 1. Get the alpha_bars tensor and move it to the device of x_0 (e.g., 'mps' or 'cuda')
+        alpha_bars_on_device = self.alpha_bars.to(x_0.device)
+        
+        # 2. Now indexing works because both tensors are on the same device
+        alpha_bar_t = alpha_bars_on_device[t] 
+        
+        # Original line was: alpha_bar_t = self.alpha_bars[t].to(x_0.device) 
+        # It was trying to index the CPU tensor with a GPU index first, then move the result.
+        
+        # 3. Complete the sampling formula
         x_t = torch.sqrt(alpha_bar_t) * x_0 + torch.sqrt(1 - alpha_bar_t) * noise
         
         return x_t, noise
-    
+        
     def p_sample(self, model, x_t, t, target, action, history=None):
         """Reverse diffusion process: p(x_{t-1} | x_t)"""
         with torch.no_grad():

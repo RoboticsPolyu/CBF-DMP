@@ -9,7 +9,7 @@ from mpl_toolkits.mplot3d import Axes3D
 from typing import List, Dict
 
 # Import your model and utility functions
-from v2 import (
+from AeroDM_SafeTrj_v2 import (
     Config, AeroDM,
     generate_aerobatic_trajectories,
     normalize_trajectories, denormalize_trajectories,
