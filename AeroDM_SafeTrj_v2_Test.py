@@ -40,7 +40,7 @@ class Config:
 
     # CBF Guidance parameters (from CoDiG paper)
     enable_cbf_guidance = False  # Disabled by default; toggle for inference
-    guidance_gamma = 100.0  # Base gamma for barrier guidance
+    guidance_gamma = 10.0  # Base gamma for barrier guidance
     obstacle_radius = 5.0  # Safe distance radius
     
     # Plotting control
@@ -394,7 +394,7 @@ class ObstacleAwareDiffusionProcess:
         self.config = config
         self.num_timesteps = config.diffusion_steps
         
-        # Linear noise schedule
+        # Linear noise schedule - initialize on CPU, will move to device when needed
         self.betas = torch.linspace(config.beta_start, config.beta_end, config.diffusion_steps)
         self.alphas = 1.0 - self.betas
         self.alpha_bars = torch.cumprod(self.alphas, dim=0)
@@ -407,7 +407,9 @@ class ObstacleAwareDiffusionProcess:
         if t.dim() == 1:
             t = t.view(-1, 1, 1)
         
-        alpha_bar_t = self.alpha_bars[t].to(x_0.device)
+        # Move alpha_bars to the same device as x_0
+        alpha_bars = self.alpha_bars.to(x_0.device)
+        alpha_bar_t = alpha_bars[t]
         x_t = torch.sqrt(alpha_bar_t) * x_0 + torch.sqrt(1 - alpha_bar_t) * noise
         
         return x_t, noise
@@ -427,9 +429,14 @@ class ObstacleAwareDiffusionProcess:
             # Expand t for broadcasting
             t_exp = t.view(batch_size, 1, 1) if t.dim() == 1 else t.view(-1, 1, 1)
             
-            alpha_bar_t = self.alpha_bars[t_exp.squeeze(1)].view(batch_size, 1, 1)
-            alpha_t = self.alphas[t_exp.squeeze(1)].view(batch_size, 1, 1)
-            beta_t = self.betas[t_exp.squeeze(1)].view(batch_size, 1, 1)
+            # Move diffusion parameters to the same device as x_t
+            alphas = self.alphas.to(x_t.device)
+            betas = self.betas.to(x_t.device)
+            alpha_bars = self.alpha_bars.to(x_t.device)
+            
+            alpha_bar_t = alpha_bars[t_exp.squeeze(1)].view(batch_size, 1, 1)
+            alpha_t = alphas[t_exp.squeeze(1)].view(batch_size, 1, 1)
+            beta_t = betas[t_exp.squeeze(1)].view(batch_size, 1, 1)
             one_minus_alpha_bar_t = 1 - alpha_bar_t
             
             # Compute predicted noise from pred_x0
@@ -473,7 +480,7 @@ class ObstacleAwareDiffusionProcess:
                 return pred_x0_guided
             
             # Variance (DDPM posterior variance)
-            alpha_bar_prev = self.alpha_bars[t_exp.squeeze(1) - 1].view(batch_size, 1, 1) if t.min() > 0 else torch.ones_like(alpha_bar_t)
+            alpha_bar_prev = alpha_bars[t_exp.squeeze(1) - 1].view(batch_size, 1, 1) if t.min() > 0 else torch.ones_like(alpha_bar_t)
             var = beta_t * (1 - alpha_bar_prev) / one_minus_alpha_bar_t
             sigma = torch.sqrt(var)
             
@@ -1542,7 +1549,7 @@ if __name__ == "__main__":
     print("Training Obstacle-Aware AeroDM with Transformer Integration and Obstacle-Aware Loss...")
     
     # Device setup
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("mps" if torch.mps.is_available() else "cpu")
     print(f"Using device: {device}")
     
     # Configuration
@@ -1562,8 +1569,8 @@ if __name__ == "__main__":
     
     # Training parameters
     num_epochs = 50
-    batch_size = 8
-    num_trajectories = 10000
+    batch_size = 16
+    num_trajectories = 30000
     
     print("Generating training data with obstacle-aware transformer...")
     trajectories = generate_aerobatic_trajectories(
@@ -1715,4 +1722,4 @@ if __name__ == "__main__":
     # plot_trajectories_demo(trajectories[:18], rows=3, cols=6)
     
     # Run the visualization test
-    test_model_performance(model, test_norm, mean, std, num_test_samples=3, show_flag=config.show_flag)
+    test_model_performance(model, test_norm, mean, std, num_test_samples=100, show_flag=config.show_flag)
