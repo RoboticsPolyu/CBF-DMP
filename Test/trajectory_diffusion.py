@@ -38,7 +38,7 @@ def generate_trajectories(batch_size, T):
     """Generate batch of sine wave trajectories."""
     t = np.linspace(0, 2 * np.pi, T)
     trajectories = np.sin(t)[None, :] + np.random.normal(0, 0.1, (batch_size, T))
-    return torch.tensor(trajectories, dtype=torch.float32).to(device)
+    return torch.tensor(np.stack(trajectories), dtype=torch.float32).to(device)
 
 # Forward diffusion process
 def forward_diffusion(trajectories, k):

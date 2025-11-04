@@ -960,7 +960,7 @@ def generate_aerobatic_trajectories(num_trajectories=100, seq_len=60, radius=10.
         state = np.column_stack([speed, x, y, z, attitude])
         trajectories.append(state)
     
-    return torch.tensor(trajectories, dtype=torch.float32)
+    return torch.tensor(np.stack(trajectories), dtype=torch.float32)
 
 def generate_target_waypoints(trajectories):
     """Generate target waypoints from trajectories (usually the trajectory endpoint)"""

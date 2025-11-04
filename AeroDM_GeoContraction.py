@@ -26,7 +26,7 @@ except ImportError:
         history_len = 10
         target_dim = 6
         action_dim = 4
-        diffusion_steps = 100
+        diffusion_steps = 30
         beta_start = 1e-4
         beta_end = 0.02
         contraction_weight = 0.01 # Added for pie chart
@@ -129,7 +129,7 @@ except ImportError:
     def test_model_performance(model, trajectories_norm, mean, std):
         print("\n--- Testing Model Performance ---")
         # Just run a single sample
-        sample = trajectories_norm[0:1]
+        sample = trajectories_norm[0:30]
         target = generate_target_waypoints(sample).squeeze(1) # Ensure [1, D]
         action = generate_action_styles(1, model.config.action_dim, device=sample.device)
         history = generate_history_segments(sample, model.config.history_len, device=sample.device)
@@ -458,7 +458,7 @@ def train_aerodm_with_geometric_contraction():
     
     num_epochs = 50
     batch_size = 8
-    num_trajectories = 100 # Reduced for faster demo
+    num_trajectories = 3000 # Reduced for faster demo
     
     print("Generating trajectory data...")
     trajectories = generate_aerobatic_trajectories(

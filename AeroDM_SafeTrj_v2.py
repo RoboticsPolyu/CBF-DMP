@@ -36,7 +36,7 @@ class Config:
     # Obstacle parameters
     max_obstacles = 10  # Maximum number of obstacles to process
     obstacle_feat_dim = 4  # [x, y, z, radius]
-    enable_obstacle_encoding = False  # Toggle obstacle encoding in the model
+    enable_obstacle_encoding = True  # Toggle obstacle encoding in the model
 
     # CBF Guidance parameters (from CoDiG paper)
     enable_cbf_guidance = True  # Disabled by default; toggle for inference
@@ -1091,7 +1091,7 @@ def generate_aerobatic_trajectories(num_trajectories=100, seq_len=60, radius=10.
         state = np.column_stack([speed, x, y, z, attitude])
         trajectories.append(state)
     
-    return torch.tensor(trajectories, dtype=torch.float32)
+    return torch.tensor(np.stack(trajectories), dtype=torch.float32)
 
 # CBF Barrier Function with Multiple Obstacles
 def compute_barrier_and_grad(x, config, mean, std, obstacles_data=None):
@@ -1279,7 +1279,7 @@ def test_model_performance(model, trajectories_norm, mean, std, num_test_samples
             target_denorm = target_norm * std[0, 0, 1:4] + mean[0, 0, 1:4]
             
             # Generate random obstacles
-            obstacles = generate_random_obstacles(x_0_denorm[0], num_obstacles_range=(0, 10), radius_range=(0.35, 0.80), check_collision=False, device=device)
+            obstacles = generate_random_obstacles(x_0_denorm[0], num_obstacles_range=(0, 10), radius_range=(0.35, 0.80), check_collision=True, device=device)
 
             # Set obstacles data for model input
             model.set_obstacles_data(obstacles)
