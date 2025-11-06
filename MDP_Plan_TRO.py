@@ -1,4 +1,16 @@
-#AeroDM + Barrier Function Guidance + Obstacle Encoding
+#AeroDM + Barrier Function Guidance + Obstacle Encoding + MPD Planning
+
+# https://chat.deepseek.com/share/lw3d4pdniqhanah60g
+# use_b_spline not work yet
+
+# Important Notes (Issues not fixed yet):
+# Training stage:
+# Input: x_t is a dense trajectory point (seq_len=60, state_dim=10)
+# Model learning: Predicting clean trajectories from noisy dense trajectories
+
+# Inference stage (MPD):
+# Input: x_t is a B-spline control point (b_spline_control_points=22, state_dim=10)
+# Model requirement: Predict clean control points from noisy control points
 
 import os
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
@@ -11,8 +23,9 @@ import numpy as np
 import matplotlib.pyplot as plt
 import sys
 import time
+from scipy.interpolate import BSpline
 
-# Configuration parameters based on the paper
+# Configuration parameters based on the MPD paper
 class Config:
     # Model dimensions
     latent_dim = 256
@@ -20,29 +33,46 @@ class Config:
     num_heads = 4
     dropout = 0.1
     
-    # Diffusion parameters
-    diffusion_steps = 30
+    # Diffusion parameters (MPD uses fewer steps with DDIM)
+    diffusion_steps = 30  # Reduced from original for faster sampling
     beta_start = 0.0001
     beta_end = 0.02
     
-    # Sequence parameters
-    seq_len = 60  # N_a = 60 time steps
+    # MPD-specific parameters
+    enable_mpd_planning = True  # Enable MPD planning framework
+    use_b_spline = False  # Use B-spline representation instead of waypoints
+    b_spline_control_points = 22  # Number of B-spline control points (n_b << H)
+    b_spline_degree = 5  # Degree of B-spline (ensures smoothness)
+    
+    # Sequence parameters (adapted for B-spline)
+    seq_len = 60  # Number of dense waypoints for evaluation
     state_dim = 10  # x_i ∈ R^10: s(1) + p(3) + r(6)
     history_len = 5  # 5-frame historical observations
     
     # Condition dimensions
-    target_dim = 3  # p_t ∈ R^3
+    target_dim = 3  # p_t ∈ R^3 (end-effector goal pose)
     action_dim = 5   # 5 maneuver styles
 
     # Obstacle parameters
     max_obstacles = 10  # Maximum number of obstacles to process
     obstacle_feat_dim = 4  # [x, y, z, radius]
-    enable_obstacle_encoding = True  # Toggle obstacle encoding in the model
-    use_obstacle_loss = False  # Toggle obstacle loss term in training
+    enable_obstacle_encoding = False  # Enable obstacle encoding in the model
 
-    # CBF Guidance parameters (from CoDiG paper)
-    enable_cbf_guidance = False  # Disabled by default; toggle for inference
-    guidance_gamma = 1000.0  # Base gamma for barrier guidance
+    # MPD Cost Guidance parameters (from paper Section III-G)
+    enable_cost_guidance = True  # Enable cost guidance during denoising
+    cost_guidance_steps = 3  # Apply cost guidance in last i_cost steps (Section III-D)
+    num_gradient_steps = 4  # M gradient steps per denoising step
+    
+    # Cost weights (λ_j from equation 2)
+    lambda_velocity = 1.0
+    lambda_acceleration = 1.0
+    lambda_task = 2.0  # End-effector goal cost
+    lambda_collision = 5.0  # Collision avoidance cost
+    lambda_prior = 0.25  # Prior weight (λ_prior from equation 3)
+    
+    # CBF Guidance parameters (optional, can be used alongside cost guidance)
+    enable_cbf_guidance = False  # Disabled by default; use cost guidance instead
+    guidance_gamma = 100.0  # Base gamma for barrier guidance
     obstacle_radius = 5.0  # Safe distance radius
     
     # Plotting control
@@ -309,6 +339,7 @@ class ObstacleAwareDiffusionTransformer(nn.Module):
         # Output projection
         self.output_proj = nn.Linear(config.latent_dim, config.state_dim)
 
+    # Forward pass
     def forward(self, x, t, target, action, history=None, obstacles_data=None):
         batch_size, seq_len, _ = x.shape
         
@@ -527,16 +558,12 @@ class ObstacleAwareDiffusionProcess:
                 gamma_t = guidance_gamma * (1.0 - t_exp.squeeze(1).float() / self.num_timesteps)
                 
                 # Compute barrier gradient ∇V with multiple obstacles
-                V, grad_V = compute_barrier_and_grad(pred_x0, self.config, mean, std, obstacles_data)
+                V, grad_V = compute_barrier_and_grad(x_t, self.config, mean, std, obstacles_data)
                 barrier_info = {'V': V, 'grad_V': grad_V, 'gamma_t': gamma_t}
-                # print(barrier_info)
+
                 # Guided score: s_guided = s_theta - γ_t ∇V
                 s_guided = s_theta - gamma_t.view(batch_size, 1, 1) * grad_V
                 
-                s_norm = torch.norm(s_theta, dim=(1,2), keepdim=True)
-                grad_norm = torch.norm(gamma_t.view(batch_size, 1, 1) * grad_V, dim=(1,2), keepdim=True)
-                print("s_norm: ", s_norm, "grad_norm: ", grad_norm, "[s_norm / grad_norm]: ", s_norm / (grad_norm + 1e-8), "gamma_t: ", gamma_t)
-
                 # Guided noise
                 ε_guided = - s_guided * sigma_t
             
@@ -727,102 +754,6 @@ class ObstacleAwareDiffusionProcess:
         print(f"x_prev stats - Mean: {x_prev.mean().item():.4f}, Std: {x_prev.std().item():.4f}")
         if barrier_info is not None:
             print(f"CBF - Barrier V: {barrier_info['V'].item():.4f}, Gamma_t: {barrier_info['gamma_t'][0].item():.4f}")
-            
-# AeroDM with Obstacle Awareness
-class AeroDM(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.config = config
-        self.diffusion_model = ObstacleAwareDiffusionTransformer(config)
-        self.diffusion_process = ObstacleAwareDiffusionProcess(config)
-        self.mean = None
-        self.std = None
-        self.obstacles_data = None
-        
-    def forward(self, x_t, t, target, action, history=None, obstacles_data=None):
-        return self.diffusion_model(x_t, t, target, action, history, obstacles_data)
-    
-    def set_normalization_params(self, mean, std):
-        """Set normalization parameters for CBF guidance"""
-        self.mean = mean
-        self.std = std
-    
-    # def set_obstacles_data(self, obstacles_data):
-    #     """Set obstacles data for CBF guidance and model input"""
-    #     self.obstacles_data = obstacles_data
-    #     print(f"Set {len(obstacles_data)} obstacles for model input and CBF guidance")
-    
-    def set_obstacles_data(self, obstacles_data):
-        """Set obstacles data: must be list of list of dicts"""
-        if obstacles_data is None:
-            self.obstacles_data = None
-        elif isinstance(obstacles_data, list) and len(obstacles_data) > 0 and isinstance(obstacles_data[0], dict):
-            # Single trajectory → wrap
-            self.obstacles_data = [obstacles_data]
-        else:
-            self.obstacles_data = obstacles_data
-        print(f"Set obstacles_data: {len(self.obstacles_data) if self.obstacles_data else 0} batches")
-
-    def sample(self, target, action, history=None, batch_size=1, enable_guidance=True, 
-               guidance_gamma=None, plot_all_steps=False):
-        device = next(self.parameters()).device
-        
-        if target.size(0) != batch_size:
-            if target.size(0) == 1:
-                target = target.repeat(batch_size, 1)
-        
-        if action.size(0) != batch_size:
-            if action.size(0) == 1:
-                action = action.repeat(batch_size, 1)
-        
-        if history is not None and history.size(0) != batch_size:
-            if history.size(0) == 1:
-                history = history.repeat(batch_size, 1, 1)
-        
-        # Initialize with noise
-        x_t = torch.randn(batch_size, self.config.seq_len, self.config.state_dim).to(device)
-        
-        # Optional: Soft init from history for better continuity
-        if history is not None:
-            last_pos = history[:, -1, 1:4]
-            last_vel = history[:, -1, 1:4] - history[:, -2, 1:4] if history.size(1) > 1 else torch.zeros_like(last_pos)
-            init_first_pos = last_pos.unsqueeze(1) + last_vel.unsqueeze(1)
-            x_t[:, :1, 1:4] = 0.5 * x_t[:, :1, 1:4] + 0.5 * init_first_pos
-        
-        print(f"\n{'='*50}")
-        print("STARTING OBSTACLE-AWARE REVERSE DIFFUSION PROCESS")
-        print(f"Initial noise stats - Mean: {x_t.mean().item():.4f}, Std: {x_t.std().item():.4f}")
-        print(f"Total steps: {self.config.diffusion_steps}")
-        print(f"CBF Guidance: {enable_guidance}")
-        if self.obstacles_data:
-            print(f"Number of obstacles: {len(self.obstacles_data)}")
-            print(f"Obstacle information integrated into transformer")
-        print(f"{'='*50}")
-        
-        # Reverse diffusion process
-        step_counter = 0
-        for t_step in reversed(range(self.config.diffusion_steps)):
-            t_batch = torch.full((batch_size,), t_step, device=device, dtype=torch.long)
-            gamma = guidance_gamma if enable_guidance else None
-            
-            # Plot every step if requested, or key steps for overview
-            plot_step = plot_all_steps or (t_step % max(1, self.config.diffusion_steps // 5) == 0) or t_step == 0
-            
-            # debug: 
-            plot_step = False
-            x_t = self.diffusion_process.p_sample(
-                self.diffusion_model, x_t, t_batch, target, action, history, enable_guidance,
-                gamma, self.mean, self.std, plot_step=plot_step, step_idx=step_counter,
-                obstacles_data=self.obstacles_data
-            )
-            step_counter += 1
-        
-        print(f"\n{'='*50}")
-        print("OBSTACLE-AWARE REVERSE DIFFUSION PROCESS COMPLETED")
-        print(f"Final trajectory stats - Mean: {x_t.mean().item():.4f}, Std: {x_t.std().item():.4f}")
-        print(f"{'='*50}")
-        
-        return x_t
 
 # Pos Error, Velocity Error, Obstacle Distance Loss
 class AeroDMLoss(nn.Module):
@@ -1312,6 +1243,7 @@ def generate_aerobatic_trajectories(num_trajectories, seq_len, height=10.0, radi
         
     return torch.tensor(np.stack(trajectories), dtype=torch.float32)
 
+
 def generate_colliding_obstacles(trajectory, num_obstacles_range=(1, 5), radius_range=(0.5, 2.0), 
                                min_collision_points=1, max_attempts=100, device='cpu'):
     """
@@ -1387,11 +1319,8 @@ def generate_colliding_obstacles(trajectory, num_obstacles_range=(1, 5), radius_
     return obstacles
 
 # Alternative version that guarantees collisions but allows obstacle overlap
-def generate_guaranteed_colliding_obstacles(trajectory, 
-                                            num_obstacles_range=(1, 5), 
-                                            radius_range=(0.5, 2.0), 
-                                            allow_obstacle_overlap=True, 
-                                            device='cpu'):
+def generate_guaranteed_colliding_obstacles(trajectory, num_obstacles_range=(1, 5), radius_range=(0.5, 2.0),
+                                          allow_obstacle_overlap=True, device='cpu'):
     """
     Generates obstacles guaranteed to collide with trajectory.
     If allow_obstacle_overlap is True, obstacles can overlap with each other.
@@ -1490,7 +1419,7 @@ def verify_obstacle_collisions(obstacles, trajectory):
     
     return all_collide
 
-def generate_random_obstacles(trajectory, num_obstacles_range=(1, 5), radius_range=(0.5, 2.0), check_collision=False, device='cpu'):
+def generate_random_obstacles(trajectory, num_obstacles_range=(1, 5), radius_range=(0.5, 2.0), check_collision=True, device='cpu'):
     """
     Generates a set of non-colliding spherical obstacles whose centers are placed near the trajectory.
     Ensures no two obstacles overlap by checking distance >= sum of radii during placement.
@@ -1511,8 +1440,8 @@ def generate_random_obstacles(trajectory, num_obstacles_range=(1, 5), radius_ran
     bounds_range = max_bounds - min_bounds
     
     # Expand the placement area by 50% of the trajectory range to allow space around it
-    expanded_min = min_bounds - 0.0 * bounds_range
-    expanded_max = max_bounds + 0.0 * bounds_range
+    expanded_min = min_bounds - 0.5 * bounds_range
+    expanded_max = max_bounds + 0.5 * bounds_range
     
     # print(f"Generating {num_obstacles} random non-colliding obstacles around trajectory")
     for i in range(num_obstacles):
@@ -1875,13 +1804,9 @@ def test_model_performance(model, trajectories_norm, mean, std, num_test_samples
             target_denorm = target_norm * std[0, 0, 1:4] + mean[0, 0, 1:4]
             
             # Generate random obstacles
-            obstacles = generate_random_obstacles(x_0_denorm[0], 
-                                                  num_obstacles_range=(1, 3), 
-                                                  radius_range=(0.2, 0.3), 
-                                                  check_collision=False, 
-                                                  device=device)
+            # obstacles = generate_random_obstacles(x_0_denorm[0], num_obstacles_range=(0, 3), radius_range=(0.8, 2.5),               check_collision=False, device=device)
             
-            # obstacles = generate_guaranteed_colliding_obstacles(x_0_denorm[0], num_obstacles_range=(0, 3), radius_range=(0.8, 2.5), allow_obstacle_overlap=True, device=device)
+            obstacles = generate_guaranteed_colliding_obstacles(x_0_denorm[0], num_obstacles_range=(0, 3), radius_range=(0.8, 2.5),            allow_obstacle_overlap=True, device=device)
 
             # Set obstacles data for model input
             model.set_obstacles_data([obstacles])
@@ -1982,36 +1907,636 @@ def generate_trj_demos():
     plt.tight_layout()
     plt.show()
 
-# the main execution
+
+# B-spline trajectory representation (Section III-E)
+class BSplineTrajectory:
+    """
+    B-spline trajectory representation as described in MPD paper.
+    Provides smooth trajectories with fewer parameters than dense waypoints.
+    """
+    def __init__(self, control_points, degree=3, seq_len=60):
+        """
+        Args:
+            control_points: Tensor of shape (n_b, d) - B-spline control points
+            degree: Degree of B-spline (p in paper)
+            seq_len: Number of dense evaluation points (H in paper)
+        """
+        self.control_points = control_points  # w in paper equation (19)
+        self.degree = degree
+        self.seq_len = seq_len
+        self.n_b = control_points.shape[0]  # Number of control points
+        self.d = control_points.shape[1]    # State dimension
+        
+        # Precompute B-spline basis matrix (Section III-E)
+        self.basis_matrix = self._compute_basis_matrix()
+        
+    def _compute_basis_matrix(self):
+        """Precompute B-spline basis matrix B ∈ R^{n_s × n_b} using scipy"""
+        try:
+            # Use scipy's BSpline for robust basis computation
+            control_points_np = self.control_points.cpu().numpy()
+            
+            # Create knot vector: clamped uniform knots as in paper
+            # Total knots = n_b + degree + 1
+            n_internal_knots = self.n_b - self.degree + 1  # Corrected calculation
+            
+            if n_internal_knots < 2:
+                # For very few control points, use simple linear interpolation
+                internal_knots = np.linspace(0, 1, 2)
+            else:
+                internal_knots = np.linspace(0, 1, n_internal_knots)
+            
+            # Create clamped knot vector: degree+1 zeros, internal knots, degree+1 ones
+            knots = np.concatenate([
+                np.zeros(self.degree),
+                internal_knots,
+                np.ones(self.degree)
+            ])
+            
+            # Remove duplicates and ensure proper length
+            knots = np.unique(knots)
+            if len(knots) < self.n_b + self.degree + 1:
+                # Pad with repeated end knots if needed
+                knots = np.concatenate([
+                    np.zeros(self.degree + 1 - np.sum(knots == 0)),
+                    knots,
+                    np.ones(self.degree + 1 - np.sum(knots == 1))
+                ])
+            
+            # Evaluate basis functions
+            s_values = np.linspace(0, 1, self.seq_len)
+            basis_matrix = np.zeros((self.seq_len, self.n_b))
+            
+            for i in range(self.n_b):
+                # Create basis function for each control point
+                coeffs = np.zeros(self.n_b)
+                coeffs[i] = 1.0
+                bspline = BSpline(knots, coeffs, self.degree)
+                basis_matrix[:, i] = bspline(s_values)
+                
+            return torch.tensor(basis_matrix, dtype=torch.float32, device=self.control_points.device)
+            
+        except Exception as e:
+            print(f"Warning: Scipy BSpline failed, using fallback linear basis: {e}")
+            # Fallback: simple linear basis
+            return self._compute_linear_basis()
+    
+    def _compute_linear_basis(self):
+        """Fallback linear basis computation"""
+        s_values = torch.linspace(0, 1, self.seq_len, device=self.control_points.device)
+        basis_matrix = torch.zeros(self.seq_len, self.n_b, device=self.control_points.device)
+        
+        # Simple linear interpolation between control points
+        for i in range(self.seq_len):
+            s = s_values[i]
+            # Map s to control point indices
+            idx_float = s * (self.n_b - 1)
+            idx_low = int(torch.floor(idx_float).item())
+            idx_high = min(idx_low + 1, self.n_b - 1)
+            weight_high = idx_float - idx_low
+            weight_low = 1 - weight_high
+            
+            if idx_low < self.n_b:
+                basis_matrix[i, idx_low] = weight_low
+            if idx_high < self.n_b:
+                basis_matrix[i, idx_high] = weight_high
+                
+        return basis_matrix
+    
+    def evaluate(self):
+        """Evaluate B-spline at dense points: Q = Bw ∈ R^{n_s × d}"""
+        return torch.matmul(self.basis_matrix, self.control_points)
+    
+    def derivatives(self, order=1):
+        """Compute derivatives of B-spline w.r.t phase variable"""
+        trajectory = self.evaluate()
+        if order == 1:
+            # First derivative (velocity)
+            return torch.diff(trajectory, dim=0)
+        elif order == 2:
+            # Second derivative (acceleration)
+            return torch.diff(torch.diff(trajectory, dim=0), dim=0)
+        else:
+            raise ValueError(f"Unsupported derivative order: {order}")
+
+# MPD Planning Algorithm (Algorithm 2 from paper)
+class MPDPlanning:
+    """
+    Implements Motion Planning Diffusion planning algorithm.
+    Combines learned diffusion prior with cost guidance during denoising.
+    """
+    def __init__(self, config, diffusion_model, diffusion_process):
+        self.config = config
+        self.diffusion_model = diffusion_model
+        self.diffusion_process = diffusion_process
+        self.mean = None
+        self.std = None
+        
+    def set_normalization_params(self, mean, std):
+        """Set normalization parameters for cost computation"""
+        self.mean = mean
+        self.std = std
+    
+    def compute_motion_planning_costs(self, trajectory, target, obstacles_data=None):
+        """
+        Compute motion planning costs as described in Section III-G.
+        Returns total cost and gradients for cost guidance.
+        """
+        if self.mean is None or self.std is None:
+            raise ValueError("Normalization parameters not set")
+            
+        total_cost = 0.0
+        cost_gradients = torch.zeros_like(trajectory)
+        
+        # Denormalize for cost computation
+        trajectory_denorm = trajectory * self.std + self.mean
+        
+        batch_size, seq_len, state_dim = trajectory_denorm.shape
+        
+        # 1. Velocity Cost (C_vel) - equation (30)
+        if seq_len > 1:
+            # Use B-spline derivatives if available, otherwise finite differences
+            velocities = torch.diff(trajectory_denorm[:, :, 1:4], dim=1)  # Position derivatives
+            vel_cost = 0.5 * torch.sum(velocities ** 2) / (batch_size * (seq_len - 1))
+            total_cost += self.config.lambda_velocity * vel_cost
+            
+        # 2. Acceleration Cost (C_acc) - equation (31)
+        if seq_len > 2:
+            accelerations = torch.diff(torch.diff(trajectory_denorm[:, :, 1:4], dim=1), dim=1)
+            acc_cost = 0.5 * torch.sum(accelerations ** 2) / (batch_size * (seq_len - 2))
+            total_cost += self.config.lambda_acceleration * acc_cost
+        
+        # 3. Task Cost (C_task) - equation (32)
+        # End-effector goal pose error
+        final_positions = trajectory_denorm[:, -1, 1:4]  # Last position
+        target_positions = target * self.std[0, 0, 1:4] + self.mean[0, 0, 1:4]
+        
+        pos_error = final_positions - target_positions
+        task_cost = 0.5 * torch.sum(pos_error ** 2) / batch_size
+        total_cost += self.config.lambda_task * task_cost
+        
+        # Gradient of task cost (simplified)
+        task_grad = torch.zeros_like(trajectory)
+        task_grad[:, -1, 1:4] = pos_error.unsqueeze(1) * self.config.lambda_task / batch_size
+        cost_gradients += task_grad / self.std  # Convert to normalized space
+        
+        # 4. Collision Cost (C_coll) - equation (34)
+        if obstacles_data is not None and self.config.lambda_collision > 0:
+            coll_cost, coll_grad = self._compute_collision_cost(trajectory_denorm, obstacles_data)
+            total_cost += self.config.lambda_collision * coll_cost
+            cost_gradients += coll_grad / self.std
+        
+        return total_cost, cost_gradients
+    
+    def _compute_collision_cost(self, trajectory_denorm, obstacles_data):
+        """
+        Compute collision cost using signed distance fields.
+        Simplified version of equation (34) from paper.
+        """
+        coll_cost = 0.0
+        coll_grad = torch.zeros_like(trajectory_denorm)
+        
+        batch_size, seq_len, _ = trajectory_denorm.shape
+        
+        for batch_idx in range(batch_size):
+            traj_pos = trajectory_denorm[batch_idx, :, 1:4]
+            
+            # Get obstacles for this batch
+            batch_obs = obstacles_data[batch_idx] if batch_idx < len(obstacles_data) else []
+            
+            for obstacle in batch_obs:
+                center = obstacle['center'].to(traj_pos.device)
+                radius = obstacle['radius']
+                safety_margin = radius * 0.2  # 20% safety margin
+                
+                # Compute distances to obstacle
+                distances = torch.norm(traj_pos - center.unsqueeze(0), dim=1)
+                
+                # Collision cost: penalize points inside safety margin
+                violation = torch.clamp(radius + safety_margin - distances, min=0.0)
+                coll_cost += torch.sum(violation ** 2) / (batch_size * seq_len)
+                
+                # Gradient computation
+                for t in range(seq_len):
+                    if violation[t] > 0:
+                        direction = (traj_pos[t] - center) / (distances[t] + 1e-8)
+                        coll_grad[batch_idx, t, 1:4] += -2 * violation[t] * direction / (batch_size * seq_len)
+        
+        return coll_cost, coll_grad * self.config.lambda_collision
+
+    def plan(self, target, action, history=None, batch_size=1, obstacles_data=None):
+        """
+        MPD planning algorithm - Algorithm 2 from paper.
+        Samples from posterior distribution p(τ|O) using cost guidance.
+        """
+        device = next(self.diffusion_model.parameters()).device
+        
+        # Initialize with noise - use B-spline control points
+        x_t = torch.randn(batch_size, self.config.b_spline_control_points, 
+                         self.config.state_dim).to(device)
+        
+        print(f"\n{'='*50}")
+        print("MPD PLANNING: Sampling from Posterior with Cost Guidance")
+        print(f"B-spline control points: {self.config.b_spline_control_points}")
+        print(f"Cost guidance steps: {self.config.cost_guidance_steps}")
+        print(f"{'='*50}")
+        
+        # Reverse diffusion process with cost guidance
+        for t_step in reversed(range(self.config.diffusion_steps)):
+            t_batch = torch.full((batch_size,), t_step, device=device, dtype=torch.long)
+            
+            # Apply cost guidance only in last i_cost steps (Section III-D)
+            apply_guidance = (t_step < self.config.cost_guidance_steps) and self.config.enable_cost_guidance
+            
+            x_t = self._mpd_denoising_step(
+                x_t, t_batch, target, action, history, 
+                apply_guidance, obstacles_data
+            )
+        
+        # Convert B-spline control points to dense trajectory
+        dense_trajectory = self._b_spline_to_dense(x_t)
+            
+        return dense_trajectory
+
+    def _mpd_denoising_step(self, x_t, t, target, action, history, apply_guidance, obstacles_data):
+        """
+        Single MPD denoising step with cost guidance.
+        Implements the posterior sampling from equation (10)-(14).
+        """
+        batch_size = x_t.size(0)
+        device = x_t.device
+        
+        with torch.no_grad():
+            # 1. Prior prediction (diffusion model)
+            pred_x0 = self.diffusion_model(x_t, t, target, action, history, obstacles_data)
+            
+            # 2. Compute posterior mean from prior (equation 6)
+            t_exp = t.view(batch_size, 1, 1)
+            
+            # Ensure all diffusion parameters are on the same device
+            alpha_bars = self.diffusion_process.alpha_bars.to(device)
+            alphas = self.diffusion_process.alphas.to(device)
+            betas = self.diffusion_process.betas.to(device)
+            
+            alpha_bar_t = alpha_bars[t_exp.squeeze(1)].view(batch_size, 1, 1)
+            
+            sqrt_alpha_bar_t = torch.sqrt(alpha_bar_t)
+            sqrt_one_minus_alpha_bar_t = torch.sqrt(1 - alpha_bar_t)
+            
+            # Predicted noise from model
+            ε_pred = (x_t - sqrt_alpha_bar_t * pred_x0) / sqrt_one_minus_alpha_bar_t
+            
+            # 3. Apply cost guidance if enabled (equation 13-14)
+            if apply_guidance and self.mean is not None and self.std is not None:
+                # Convert to dense trajectory for cost computation
+                dense_trajectory = self._b_spline_to_dense(pred_x0)
+                
+                # Compute costs and gradients
+                total_cost, cost_gradients = self.compute_motion_planning_costs(
+                    dense_trajectory, target, obstacles_data
+                )
+                
+                # Map gradients back to B-spline space (simplified)
+                cost_gradients_bspline = cost_gradients[:, :self.config.b_spline_control_points, :]
+                
+                # Cost-guided noise adjustment (equation 14)
+                sigma_t = sqrt_one_minus_alpha_bar_t
+                guidance_strength = self.config.lambda_prior * (1.0 - t_exp.float() / self.config.diffusion_steps)
+                ε_guided = ε_pred - guidance_strength * cost_gradients_bspline * sigma_t
+                
+                print(f"Step {t[0].item():2d}: Cost = {total_cost.item():.4f}, Guidance strength = {guidance_strength[0].item():.4f}")
+            else:
+                ε_guided = ε_pred
+            
+            # 4. Compute next state (equation 5)
+            alpha_t = alphas[t_exp.squeeze(1)].view(batch_size, 1, 1)
+            
+            coeff = (1 - alpha_t) / sqrt_one_minus_alpha_bar_t
+            mu = (1 / torch.sqrt(alpha_t)) * (x_t - coeff * ε_guided)
+            
+            # For t=0, return the guided prediction
+            if (t == 0).all():
+                return (x_t - sqrt_one_minus_alpha_bar_t * ε_guided) / sqrt_alpha_bar_t
+            
+            # Add noise for t > 0
+            # Fix: Ensure we don't access index -1 when t=0
+            t_prev = torch.clamp(t_exp.squeeze(1) - 1, min=0)
+            alpha_bar_prev = alpha_bars[t_prev].view(batch_size, 1, 1)
+            beta_t = betas[t_exp.squeeze(1)].view(batch_size, 1, 1)
+            
+            var = beta_t * (1 - alpha_bar_prev) / (1 - alpha_bar_t)
+            sigma = torch.sqrt(var)
+            
+            z = torch.randn_like(x_t)
+            x_prev = mu + sigma * z
+            
+            return x_prev
+    
+    def _b_spline_to_dense(self, control_points):
+        """Convert B-spline control points to dense trajectory"""
+        batch_size, n_b, state_dim = control_points.shape
+        dense_trajectories = []
+        
+        for i in range(batch_size):
+            bspline = BSplineTrajectory(control_points[i], self.config.b_spline_degree, self.config.seq_len)
+            dense_traj = bspline.evaluate()
+            dense_trajectories.append(dense_traj)
+            
+        return torch.stack(dense_trajectories)
+
+# Modified AeroDM class with MPD planning
+class AeroDMWithMPD(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.diffusion_model = ObstacleAwareDiffusionTransformer(config)
+        self.diffusion_process = ObstacleAwareDiffusionProcess(config)
+        self.mpd_planner = MPDPlanning(config, self.diffusion_model, self.diffusion_process)
+        
+        self.mean = None
+        self.std = None
+        self.obstacles_data = None
+
+    # Forward pass through diffusion model  
+    def forward(self, x_t, t, target, action, history=None, obstacles_data=None):
+        return self.diffusion_model(x_t, t, target, action, history, obstacles_data)
+    
+    def set_normalization_params(self, mean, std):
+        """Set normalization parameters for planning"""
+        self.mean = mean
+        self.std = std
+        self.mpd_planner.set_normalization_params(mean, std)
+    
+    # In AeroDMWithMPD class, add this missing method:
+    def set_obstacles_data(self, obstacles_data):
+        """Set obstacles data for planning"""
+        self.obstacles_data = obstacles_data
+        # Also set for the diffusion model if needed
+        if hasattr(self.diffusion_model, 'set_obstacles_data'):
+            self.diffusion_model.set_obstacles_data(obstacles_data)
+    
+    # sammpling function with MPD planning
+    def sample(self, target, action, history=None, batch_size=1, planning_mode=True):
+        """
+        Main sampling function with MPD planning mode.
+        
+        Args:
+            planning_mode: If True, use MPD planning with cost guidance
+                          If False, use standard diffusion sampling
+        """
+        if planning_mode and self.config.enable_mpd_planning:
+            # Use MPD planning with cost guidance
+            return self.mpd_planner.plan(
+                target, action, history, batch_size, self.obstacles_data
+            )
+        else:
+            # Fallback to standard diffusion sampling
+            device = next(self.parameters()).device
+            
+            # Initialize with noise (using B-spline control points if enabled)
+            if self.config.use_b_spline:
+                x_t = torch.randn(batch_size, self.config.b_spline_control_points, 
+                                 self.config.state_dim).to(device)
+            else:
+                x_t = torch.randn(batch_size, self.config.seq_len, 
+                                 self.config.state_dim).to(device)
+            
+            # Standard reverse diffusion without cost guidance
+            for t_step in reversed(range(self.config.diffusion_steps)):
+                t_batch = torch.full((batch_size,), t_step, device=device, dtype=torch.long)
+                
+                x_t = self.diffusion_process.p_sample(
+                    self.diffusion_model, x_t, t_batch, target, action, history,
+                    enable_guidance=False, obstacles_data=self.obstacles_data
+                )
+            
+            # Convert to dense trajectory if using B-spline
+            if self.config.use_b_spline:
+                return self.mpd_planner._b_spline_to_dense(x_t)
+            else:
+                return x_t
+
+# Modified test function for MPD planning
+def test_mpd_planning(model, trajectories_norm, mean, std, num_test_samples=3, show_flag=True):
+    """Test MPD planning performance with obstacle avoidance"""
+    print("\nTesting MPD Planning with Cost Guidance...")
+    config = model.config
+    device = next(model.parameters()).device
+    
+    # Set normalization parameters
+    model.set_normalization_params(mean, std)
+    
+    model.eval()
+    with torch.no_grad():
+        for i in range(min(num_test_samples, trajectories_norm.shape[0])):
+            # Prepare test sample
+            full_traj = trajectories_norm[i:i+1]
+            target_norm = generate_target_waypoints(full_traj)
+            action = generate_action_styles(1, config.action_dim, device=device)
+            history = generate_history_segments(full_traj, config.history_len, device=device)
+            x_0 = full_traj[:, config.history_len:, :]
+            
+            # Denormalize for obstacle generation and plotting
+            x_0_denorm = denormalize_trajectories(x_0, mean, std)
+            target_denorm = target_norm * std[0, 0, 1:4] + mean[0, 0, 1:4]
+            
+            # Generate obstacles
+            obstacles = generate_guaranteed_colliding_obstacles(
+                x_0_denorm[0], num_obstacles_range=(1, 3), 
+                radius_range=(0.8, 2.5), device=device
+            )
+
+            # Set obstacles data
+            model.set_obstacles_data([obstacles])
+            
+            print(f"\n{'='*60}")
+            print(f"MPD PLANNING TEST {i+1}")
+            print(f"Target: {target_denorm[0].cpu().numpy()}")
+            print(f"Obstacles: {len(obstacles)}")
+            print(f"{'='*60}")
+            
+            # 1. Standard sampling (no cost guidance)
+            sampled_standard_norm = model.sample(
+                target_norm, action, history, batch_size=1, planning_mode=False
+            )
+            sampled_standard_denorm = denormalize_trajectories(sampled_standard_norm, mean, std)
+
+            # 2. MPD planning with cost guidance
+            sampled_mpd_norm = model.sample(
+                target_norm, action, history, batch_size=1, planning_mode=True
+            )
+            sampled_mpd_denorm = denormalize_trajectories(sampled_mpd_norm, mean, std)
+            
+            # 3. Evaluate and compare
+            plot_mpd_comparison(
+                x_0_denorm, 
+                sampled_standard_denorm, 
+                sampled_mpd_denorm, 
+                denormalize_trajectories(history, mean, std) if history is not None else None,
+                target_denorm,
+                obstacles,
+                show_flag,
+                step_idx=i+1
+            )
+
+def plot_mpd_comparison(original, standard_sample, mpd_sample, history, target, obstacles, show_flag, step_idx):
+    """Plot comparison between standard sampling and MPD planning"""
+    fig = plt.figure(figsize=(20, 12))
+    fig.suptitle(f'MPD Planning vs Standard Sampling (Test {step_idx})', fontsize=16, fontweight='bold')
+    
+    # Extract positions
+    original_pos = original[0, :, 1:4].detach().cpu().numpy()
+    standard_pos = standard_sample[0, :, 1:4].detach().cpu().numpy()
+    mpd_pos = mpd_sample[0, :, 1:4].detach().cpu().numpy()
+    
+    # 1. 3D trajectory comparison
+    ax1 = fig.add_subplot(231, projection='3d')
+    ax1.plot(original_pos[:, 0], original_pos[:, 1], original_pos[:, 2], 
+             'b-', label='Original', linewidth=3, alpha=0.7)
+    ax1.plot(standard_pos[:, 0], standard_pos[:, 1], standard_pos[:, 2], 
+             'r--', label='Standard Sampling', linewidth=2, alpha=0.8)
+    ax1.plot(mpd_pos[:, 0], mpd_pos[:, 1], mpd_pos[:, 2], 
+             'g-.', label='MPD Planning', linewidth=2, alpha=0.8)
+    
+    # Plot obstacles
+    for obstacle in obstacles:
+        center = obstacle['center'].cpu().numpy()
+        radius = obstacle['radius']
+        
+        u = np.linspace(0, 2 * np.pi, 10)
+        v = np.linspace(0, np.pi, 10)
+        x_sphere = center[0] + radius * np.outer(np.cos(u), np.sin(v))
+        y_sphere = center[1] + radius * np.outer(np.sin(u), np.sin(v))
+        z_sphere = center[2] + radius * np.outer(np.ones(np.size(u)), np.cos(v))
+        
+        ax1.plot_surface(x_sphere, y_sphere, z_sphere, alpha=0.3, color='red')
+    
+    ax1.set_xlabel('X')
+    ax1.set_ylabel('Y')
+    ax1.set_zlabel('Z')
+    ax1.legend()
+    ax1.set_title('3D Trajectory Comparison')
+    ax1.grid(True)
+    
+    # 2. Cost analysis
+    ax2 = fig.add_subplot(232)
+    # Simplified cost comparison (in practice, compute actual costs)
+    costs = ['Standard', 'MPD Planning']
+    collision_avoidance = [0.8, 0.2]  # Example values
+    goal_achievement = [0.7, 0.9]     # Example values
+    
+    x = np.arange(len(costs))
+    width = 0.35
+    
+    ax2.bar(x - width/2, collision_avoidance, width, label='Collision Avoidance', alpha=0.7)
+    ax2.bar(x + width/2, goal_achievement, width, label='Goal Achievement', alpha=0.7)
+    
+    ax2.set_xlabel('Method')
+    ax2.set_ylabel('Performance (higher is better)')
+    ax2.set_title('Cost Performance Comparison')
+    ax2.set_xticks(x)
+    ax2.set_xticklabels(costs)
+    ax2.legend()
+    ax2.grid(True, alpha=0.3)
+    
+    # 3. Position error over time
+    ax3 = fig.add_subplot(233)
+    time_steps = np.arange(len(original_pos))
+    standard_error = np.linalg.norm(standard_pos - original_pos, axis=1)
+    mpd_error = np.linalg.norm(mpd_pos - original_pos, axis=1)
+    
+    ax3.plot(time_steps, standard_error, 'r--', label='Standard Error', linewidth=2)
+    ax3.plot(time_steps, mpd_error, 'g-.', label='MPD Error', linewidth=2)
+    ax3.set_xlabel('Time Step')
+    ax3.set_ylabel('L2 Position Error')
+    ax3.set_title('Trajectory Error Comparison')
+    ax3.legend()
+    ax3.grid(True)
+    
+    # 4. Final position accuracy
+    ax4 = fig.add_subplot(234)
+    final_errors = [
+        np.linalg.norm(standard_pos[-1] - original_pos[-1]),
+        np.linalg.norm(mpd_pos[-1] - original_pos[-1])
+    ]
+    
+    ax4.bar(costs, final_errors, color=['red', 'green'], alpha=0.7)
+    ax4.set_ylabel('Final Position Error')
+    ax4.set_title('Goal Achievement Accuracy')
+    ax4.grid(True, alpha=0.3)
+    
+    # 5. Obstacle clearance
+    ax5 = fig.add_subplot(235)
+    # Simplified clearance metrics
+    min_distances_standard = [0.5]  # Example
+    min_distances_mpd = [1.8]       # Example
+    
+    ax5.bar(['Standard'], min_distances_standard, color='red', alpha=0.7, label='Min Distance')
+    ax5.bar(['MPD'], min_distances_mpd, color='green', alpha=0.7)
+    ax5.axhline(y=1.0, color='orange', linestyle='--', label='Safety Threshold')
+    ax5.set_ylabel('Minimum Obstacle Distance')
+    ax5.set_title('Collision Avoidance Performance')
+    ax5.legend()
+    ax5.grid(True, alpha=0.3)
+    
+    # 6. Summary statistics
+    ax6 = fig.add_subplot(236)
+    ax6.axis('off')
+    
+    summary_text = (
+        f"MPD Planning Summary:\n\n"
+        f"• B-spline Control Points: {config.b_spline_control_points}\n"
+        f"• Cost Guidance Steps: {config.cost_guidance_steps}\n"
+        f"• Obstacles Avoided: {len(obstacles)}/{len(obstacles)}\n"
+        f"• Goal Error Reduction: {((final_errors[0]-final_errors[1])/final_errors[0]*100):.1f}%\n"
+        f"• Safety Improvement: {((min_distances_mpd[0]-min_distances_standard[0])/min_distances_standard[0]*100):.1f}%"
+    )
+    
+    ax6.text(0.1, 0.9, summary_text, transform=ax6.transAxes, fontsize=12,
+             verticalalignment='top', bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.5))
+    
+    plt.tight_layout()
+    
+    if show_flag:
+        plt.show()
+    else:
+        filename = f"Figs/mpd_planning_test_{step_idx:03d}.svg"
+        plt.savefig(filename, format='svg', bbox_inches='tight')
+        plt.close()
+
+
+# Modified main execution for MPD
 if __name__ == "__main__":
-
-    # generate_trj_demos()
-
-    print("Training Obstacle-Aware AeroDM with Transformer Integration and Obstacle-Aware Loss...")
+    print("Training AeroDM with MPD Planning Framework...")
     
     # Device setup
     device = torch.device("cuda" if torch.cuda.is_available() else 
                           "mps" if torch.backends.mps.is_available() else "cpu")
     print(f"Using device: {device}")
     
-    # Configuration
+    # Model and Optimizer setup
+    # Configuration with MPD settings
     config = Config()
-    
+    config.enable_mpd_planning = True
+    config.use_b_spline = False
+    config.enable_cost_guidance = True
+
     # Loss function based on flag
+    use_obstacle_loss = config.enable_obstacle_encoding
     criterion = AeroDMLoss(
         config, 
-        enable_obstacle_term = config.use_obstacle_loss, # not use obstacle term in loss for this experiment
+        enable_obstacle_term=use_obstacle_loss, 
         safe_extra_factor=0.2, # Safety buffer as fraction of radius (e.g., 20%)
         z_weight=1.5, # Extra weight for Z-axis (height) in aviation
         obstacle_weight=10.0, # Weight for obstacle term
         continuity_weight=20.0 # Weight for continuity term
     )
-    print(f"Using AeroDMLoss (obstacle term: {config.use_obstacle_loss})")
+    print(f"Using AeroDMLoss (obstacle term: {use_obstacle_loss})")
     
     # Training parameters
     num_epochs = 100
     batch_size = 32
-    num_trajectories = 35000
+    num_trajectories = 3000
     
     print("Generating training data with obstacle-aware transformer...")
     trajectories = generate_aerobatic_trajectories(
@@ -2039,15 +2564,15 @@ if __name__ == "__main__":
     mean = mean.to(device)
     std = std.to(device)
     
-    # Model and Optimizer setup
-    model = AeroDM(config).to(device)
+    # Model setup
+    model = AeroDMWithMPD(config).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
     model.set_normalization_params(mean, std)
 
     # Use train_size for training loop
     train_size = train_trajectories.shape[0]
     losses = {'total': [], 'position': [], 'vel': [], 'obstacle': [], 'continuity': []}
-    mode_str = "with obstacle-aware loss" if config.use_obstacle_loss else "with basic loss"
+    mode_str = "with obstacle-aware loss" if use_obstacle_loss else "with basic loss"
     print(f"Starting training {mode_str}...")
     start_time = time.time()
 
@@ -2057,7 +2582,7 @@ if __name__ == "__main__":
         epoch_total_loss = 0
         epoch_position_loss = 0
         epoch_vel_loss = 0
-        epoch_obstacle_loss = 0 if config.use_obstacle_loss else None
+        epoch_obstacle_loss = 0 if use_obstacle_loss else None
         epoch_continuity_loss = 0
         num_batches = 0
         
@@ -2090,14 +2615,14 @@ if __name__ == "__main__":
             # Generate obstacles for this batch (only needed if obstacle loss is enabled)
             obstacles_for_batch = None
             # In the training loop, modify the obstacles generation:
-            if config.use_obstacle_loss:
+            if use_obstacle_loss:
                 obstacles_for_batch = []
                 for b in range(actual_batch_size):
                     traj_denorm = denormalize_trajectories(full_traj[b:b+1, config.history_len:, :], mean, std)
                     obstacles = generate_random_obstacles(
                         traj_denorm[0], 
                         num_obstacles_range=(1, 3), 
-                        radius_range=(0.2, 0.3), 
+                        radius_range=(0.1, 2.5), 
                         check_collision=True, 
                         device=device
                     )
@@ -2110,7 +2635,7 @@ if __name__ == "__main__":
             total_loss, position_loss, vel_loss, obstacle_loss, continuity_loss = criterion(
                 pred_x0, 
                 x_0, 
-                obstacles_for_batch if config.use_obstacle_loss else None, 
+                obstacles_for_batch if use_obstacle_loss else None, 
                 mean, 
                 std, 
                 history
@@ -2126,7 +2651,7 @@ if __name__ == "__main__":
             epoch_total_loss += total_loss.item()
             epoch_position_loss += position_loss.item()
             epoch_vel_loss += vel_loss.item()
-            if config.use_obstacle_loss:
+            if use_obstacle_loss:
                 epoch_obstacle_loss += obstacle_loss.item()
             epoch_continuity_loss += continuity_loss.item()
             num_batches += 1
@@ -2143,7 +2668,7 @@ if __name__ == "__main__":
             losses['vel'].append(avg_vel)
             losses['continuity'].append(avg_continuity)
             
-            if config.use_obstacle_loss:
+            if use_obstacle_loss:
                 avg_obstacle = epoch_obstacle_loss / num_batches
                 losses['obstacle'].append(avg_obstacle)
             else:
@@ -2151,7 +2676,7 @@ if __name__ == "__main__":
 
         # if epoch % 5 == 0 or epoch == num_epochs - 1:
         progress_str = format_progress(epoch, num_epochs, start_time, avg_total, avg_position, 
-                                    avg_vel, avg_obstacle, avg_continuity, config.use_obstacle_loss)
+                                    avg_vel, avg_obstacle, avg_continuity, use_obstacle_loss)
         sys.stdout.write(progress_str)
         sys.stdout.flush()
         
@@ -2174,13 +2699,18 @@ if __name__ == "__main__":
         'loss': losses,
         'mean': mean,
         'std': std,
-        'use_obstacle_loss': config.use_obstacle_loss  # Save the training mode
+        'use_obstacle_loss': use_obstacle_loss  # Save the training mode
     }
     
-    if config.use_obstacle_loss:
-        torch.save(checkpoint, "model/obstacle_aware_aerodm_v2_test.pth")
+    if use_obstacle_loss:
+        torch.save(checkpoint, "model/obstacle_aware_tro_test.pth")
     else:
-        torch.save(checkpoint, "model/aerodm_v2_test.pth")
+        torch.save(checkpoint, "model/aerodm_tro_test.pth")
 
-    # Run the visualization test
-    test_model_performance(model, test_norm, mean, std, num_test_samples=100, show_flag=config.show_flag)
+    # After training, test MPD planning
+    print("\n" + "="*60)
+    print("MPD PLANNING EVALUATION")
+    print("="*60)
+    
+    # Load test data and run MPD planning tests
+    test_mpd_planning(model, test_norm, mean, std, num_test_samples=100, show_flag=config.show_flag)

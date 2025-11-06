@@ -283,82 +283,6 @@ class DiffusionProcess:
         x_t = torch.sqrt(alpha_bar_t) * x_0 + torch.sqrt(1 - alpha_bar_t) * noise
         
         return x_t, noise
-    
-    # def p_sample(self, model, x_t, t, target, action, history=None, guidance_gamma=None, mean=None, std=None, plot_step=False, step_idx=0):
-    #     """
-    #     Reverse diffusion process: p(x_{t-1} | x_t) with optional CoDiG CBF guidance.
-    #     Vectorized over batch for efficiency.
-    #     """
-    #     batch_size = x_t.size(0)
-    #     device = x_t.device
-        
-    #     with torch.no_grad():
-    #         pred_x0 = model(x_t, t, target, action, history)  # (batch, seq, state_dim)
-            
-    #         # Expand t for broadcasting
-    #         t_exp = t.view(batch_size, 1, 1) if t.dim() == 1 else t.view(-1, 1, 1)
-            
-    #         alpha_bar_t = self.alpha_bars[t_exp.squeeze(1)].view(batch_size, 1, 1)
-    #         alpha_t = self.alphas[t_exp.squeeze(1)].view(batch_size, 1, 1)
-    #         beta_t = self.betas[t_exp.squeeze(1)].view(batch_size, 1, 1)
-    #         one_minus_alpha_bar_t = 1 - alpha_bar_t
-            
-    #         # Compute predicted noise from pred_x0
-    #         sqrt_alpha_bar_t = torch.sqrt(alpha_bar_t)
-    #         sqrt_one_minus_alpha_bar_t = torch.sqrt(one_minus_alpha_bar_t)
-    #         ε_pred = (x_t - sqrt_alpha_bar_t * pred_x0) / sqrt_one_minus_alpha_bar_t
-            
-    #         # Compute score s_theta ≈ -ε_pred / sqrt(1 - α_bar_t)
-    #         sigma_t = sqrt_one_minus_alpha_bar_t
-    #         s_theta = - ε_pred / sigma_t
-            
-    #         # Apply CBF guidance if enabled
-    #         ε_guided = ε_pred.clone()
-    #         barrier_info = None
-            
-    #         if self.config.enable_cbf_guidance and guidance_gamma is not None and mean is not None and std is not None:
-    #             # Compute γ_t (scheduled: increases with t for stronger late guidance)
-    #             gamma_t = guidance_gamma * (t_exp.squeeze(1).float() / self.num_timesteps)
-                
-    #             # Compute barrier gradient ∇V with normalization handling
-    #             V, grad_V = compute_barrier_and_grad(x_t, self.config, mean, std)  # (batch, seq, state_dim)
-    #             barrier_info = {'V': V, 'grad_V': grad_V, 'gamma_t': gamma_t}
-
-    #             # Guided score: s_guided = s_theta - γ_t ∇V
-    #             s_guided = s_theta - gamma_t.view(batch_size, 1, 1) * grad_V
-                
-    #             # Guided noise
-    #             ε_guided = - s_guided * sigma_t
-            
-    #         # Compute mean μ using guided noise (standard DDPM formula)
-    #         coeff = (1 - alpha_t) / sqrt_one_minus_alpha_bar_t
-    #         mu = (1 / torch.sqrt(alpha_t)) * (x_t - coeff * ε_guided)
-            
-    #         # For t=0, return pred_x0 (or guided equivalent)
-    #         is_t_zero = (t_exp.squeeze(1) == 0).all()
-    #         if is_t_zero:
-    #             # Compute guided pred_x0 for consistency
-    #             pred_x0_guided = (x_t - sqrt_one_minus_alpha_bar_t * ε_guided) / sqrt_alpha_bar_t
-                
-    #             # if plot_step:
-    #             #     self._plot_diffusion_step(x_t, pred_x0_guided, t, step_idx, barrier_info, is_final=True)
-    #             return pred_x0_guided
-            
-    #         # Variance (DDPM posterior variance)
-    #         alpha_bar_prev = self.alpha_bars[t_exp.squeeze(1) - 1].view(batch_size, 1, 1) if t.min() > 0 else torch.ones_like(alpha_bar_t)
-    #         var = beta_t * (1 - alpha_bar_prev) / one_minus_alpha_bar_t
-    #         sigma = torch.sqrt(var)
-            
-    #         # Sample noise
-    #         z = torch.randn_like(x_t)
-            
-    #         # x_{t-1}
-    #         x_prev = mu + sigma * z
-            
-    #         # if plot_step:
-    #         #     self._plot_diffusion_step(x_t, x_prev, t, step_idx, barrier_info, is_final=False)
-            
-    #         return x_prev
 
     def p_sample(self, model, x_t, t, target, action, history=None, guidance_gamma=None, mean=None, std=None, plot_step=False, step_idx=0):
         """
@@ -398,7 +322,7 @@ class DiffusionProcess:
                 gamma_t = guidance_gamma * (t_indices.float() / self.num_timesteps).view(batch_size, 1, 1)
                 
                 # 计算障碍函数梯度
-                V, grad_V = compute_barrier_and_grad(x_t, self.config, mean, std)
+                V, grad_V = compute_barrier_and_grad(pred_x0, self.config, mean, std)
                 barrier_info = {'V': V, 'grad_V': grad_V, 'gamma_t': gamma_t}
 
                 # 引导的分数: s_guided = s_theta - γ_t ∇V

@@ -7,7 +7,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 # Import your model and utility functions
-from AeroDM_SafeTrj import (
+from AeroDM_SafeTrj_v1 import (
     Config, AeroDM,
     generate_aerobatic_trajectories,
     normalize_trajectories, denormalize_trajectories,
