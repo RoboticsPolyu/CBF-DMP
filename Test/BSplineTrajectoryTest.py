@@ -6,6 +6,272 @@ import numpy as np
 import matplotlib.pyplot as plt
 from scipy.interpolate import BSpline
 
+
+def generate_aerobatic_trajectories(num_trajectories, seq_len, height=10.0, radius=5.0):
+    """Generates synthetic aerobatic trajectories (Power Loop, Barrel Roll, Split S, Immelmann, Wall Ride, Figure Eight, Star, Half Moon, Sphinx, Clover)."""
+    trajectories = []
+    maneuver_styles = ['power_loop', 'barrel_roll', 'split_s', 'immelmann', 'wall_ride', 'eight_figure', 'star', 'half_moon', 'sphinx', 'clover', 'spiral_inward', 'spiral_outward', 'spiral_vertical_up', 'spiral_vertical_down' ]
+    
+    def smooth_trajectory(positions, smoothing_factor=0.1):
+        # """Apply smoothing to trajectory positions using a simple moving average"""
+        # smoothed = np.zeros_like(positions)
+        # for i in range(len(positions)):
+        #     start_idx = max(0, i - 1)
+        #     end_idx = min(len(positions), i + 2)
+        #     smoothed[i] = np.mean(positions[start_idx:end_idx], axis=0)
+        # return smoothing_factor * smoothed + (1 - smoothing_factor) * positions
+        return positions # Keeping the original simple implementation
+        
+    for i in range(num_trajectories):
+        # Randomly select a maneuver style
+        style = 'spiral_vertical_down' # np.random.choice(maneuver_styles)
+        
+        # Random centers and scales
+        center_x = np.random.uniform(-20, 20)
+        center_y = np.random.uniform(-20, 20)
+        center_z = height + np.random.uniform(-10, 10)
+        current_radius = radius * np.random.uniform(0.8, 1.2)
+        angular_velocity = np.random.uniform(0.5, 2.0)
+        
+        # Normalize time steps to [0, 1] - exactly one period
+        norm_t = np.linspace(0, 1, seq_len)
+        
+        # Compute positions and velocities based on style
+        if style == 'power_loop':
+            # Full vertical loop in xz plane, starting at bottom with forward velocity
+            theta = np.pi * norm_t * angular_velocity
+            x = center_x - current_radius * (1 - np.cos(theta))
+            y = np.full(seq_len, center_y)
+            z = center_z + current_radius * np.sin(theta)
+            vx = -current_radius * angular_velocity * np.pi * np.sin(theta)
+            vy = np.zeros(seq_len)
+            vz = current_radius * angular_velocity * np.pi * np.cos(theta)
+
+        elif style == 'barrel_roll':
+            # Helical motion
+            pitch = np.random.uniform(5.0, 10.0)
+            theta = 2 * np.pi * norm_t * angular_velocity
+            x = center_x + current_radius * np.cos(theta)
+            y = center_y + current_radius * np.sin(theta)
+            z = center_z + pitch * norm_t
+            vx = -current_radius * angular_velocity * 2 * np.pi * np.sin(theta)
+            vy = current_radius * angular_velocity * 2 * np.pi * np.cos(theta)
+            vz = np.full(seq_len, pitch)
+
+        elif style == 'split_s':
+            # Half loop down, then inverted flight and recovery
+            theta = np.pi * norm_t
+            x = center_x + current_radius * np.sin(theta)
+            y = np.full(seq_len, center_y)
+            z = center_z - current_radius * (1 - np.cos(theta))
+            vx = current_radius * np.pi * np.cos(theta)
+            vy = np.zeros(seq_len)
+            vz = -current_radius * np.pi * np.sin(theta)
+
+        elif style == 'immelmann':
+            # Half loop up, then half roll to recover
+            theta = np.pi * norm_t
+            x = center_x + current_radius * np.sin(theta)
+            y = np.full(seq_len, center_y)
+            z = center_z + current_radius * (1 - np.cos(theta))
+            vx = current_radius * np.pi * np.cos(theta)
+            vy = np.zeros(seq_len)
+            vz = current_radius * np.pi * np.sin(theta)
+
+        elif style == 'wall_ride':
+            # Vertical helix climb (spiral up)
+            turns = np.random.uniform(0.5, 1.5) # Number of turns
+            climb_height = np.random.uniform(20.0, 40.0)
+            theta = 2 * np.pi * turns * norm_t * angular_velocity
+            x = center_x + current_radius * np.cos(theta)
+            y = center_y + current_radius * np.sin(theta)
+            z = center_z + climb_height * norm_t
+            vx = -current_radius * angular_velocity * 2 * np.pi * turns * np.sin(theta)
+            vy = current_radius * angular_velocity * 2 * np.pi * turns * np.cos(theta)
+            vz = np.full(seq_len, climb_height)
+        
+        elif style == 'eight_figure':
+            # Figure eight in the xy plane
+            theta = 2 * np.pi * norm_t
+            x = center_x + current_radius * np.sin(theta)
+            y = center_y + 0.5 * current_radius * np.sin(2 * theta)
+            z = np.full(seq_len, center_z)
+            vx = current_radius * 2 * np.pi * np.cos(theta)
+            vy = 0.5 * current_radius * 4 * np.pi * np.cos(2 * theta)
+            vz = np.zeros(seq_len)
+
+        elif style == 'star':
+            # 3D Star/Lissajous-like curve
+            alpha = 2.0
+            beta = 3.0
+            x = center_x + current_radius * np.sin(2 * np.pi * alpha * norm_t)
+            y = center_y + current_radius * np.cos(2 * np.pi * beta * norm_t)
+            z = center_z + current_radius * 0.5 * np.sin(2 * np.pi * (alpha + beta) * norm_t)
+            vx = current_radius * 2 * np.pi * alpha * np.cos(2 * np.pi * alpha * norm_t)
+            vy = -current_radius * 2 * np.pi * beta * np.sin(2 * np.pi * beta * norm_t)
+            vz = current_radius * 0.5 * 2 * np.pi * (alpha + beta) * np.cos(2 * np.pi * (alpha + beta) * norm_t)
+
+        elif style == 'half_moon':
+            # Semicircle arc, primarily in xy plane, with some small z variation
+            theta = np.pi * norm_t
+            x = center_x + current_radius * np.cos(theta)
+            y = center_y + current_radius * np.sin(theta)
+            z = center_z + 0.1 * current_radius * np.sin(theta)
+            vx = -current_radius * np.pi * np.sin(theta)
+            vy = current_radius * np.pi * np.cos(theta)
+            vz = 0.1 * current_radius * np.pi * np.cos(theta)
+
+        elif style == 'sphinx':
+            # Similar to wall ride, but with pitch variation for 'nose-up' maneuver
+            turns = np.random.uniform(0.5, 1.5)
+            climb_height = np.random.uniform(10.0, 30.0)
+            theta = 2 * np.pi * turns * norm_t * angular_velocity
+            x = center_x + current_radius * np.cos(theta)
+            y = center_y + current_radius * np.sin(theta)
+            z = center_z + climb_height * norm_t + 5 * np.sin(np.pi * norm_t) # Pitch variation
+            vx = -current_radius * angular_velocity * 2 * np.pi * turns * np.sin(theta)
+            vy = current_radius * angular_velocity * 2 * np.pi * turns * np.cos(theta)
+            vz = np.full(seq_len, climb_height) + 5 * np.pi * np.cos(np.pi * norm_t)
+
+        elif style == 'clover':
+            # Four leaf clover shape (like two overlapping figure eights)
+            alpha = 2.0
+            x = center_x + current_radius * np.cos(2 * np.pi * norm_t) * np.cos(2 * np.pi * alpha * norm_t)
+            y = center_y + current_radius * np.cos(2 * np.pi * norm_t) * np.sin(2 * np.pi * alpha * norm_t)
+            z = np.full(seq_len, center_z)
+            # Use gradient for velocity approximation (too complex to derive analytically)
+            x_smooth = smooth_trajectory(x)
+            y_smooth = smooth_trajectory(y)
+            z_smooth = smooth_trajectory(z)
+            dt = 1.0 / seq_len
+            vx = np.gradient(x_smooth, dt)
+            vy = np.gradient(y_smooth, dt)
+            vz = np.gradient(z_smooth, dt)
+            x, y, z = x_smooth, y_smooth, z_smooth
+
+        elif style == 'spiral_inward':
+            # Horizontal spiral moving inward (contracting spiral)
+            turns = np.random.uniform(1.0, 3.0)  # Number of turns
+            start_radius = current_radius * np.random.uniform(1.5, 2.5)
+            end_radius = current_radius * 0.2
+            theta = 2 * np.pi * turns * norm_t * angular_velocity
+            
+            # Radius decreases over time
+            radius_t = start_radius + (end_radius - start_radius) * norm_t
+            
+            x = center_x + radius_t * np.cos(theta)
+            y = center_y + radius_t * np.sin(theta)
+            z = np.full(seq_len, center_z)
+            
+            # Analytical velocities
+            dr_dt = (end_radius - start_radius)  # Constant rate of radius change
+            vx = dr_dt * np.cos(theta) - radius_t * angular_velocity * 2 * np.pi * turns * np.sin(theta)
+            vy = dr_dt * np.sin(theta) + radius_t * angular_velocity * 2 * np.pi * turns * np.cos(theta)
+            vz = np.zeros(seq_len)
+
+        elif style == 'spiral_outward':
+            # Horizontal spiral moving outward (expanding spiral)
+            turns = np.random.uniform(1.0, 3.0)  # Number of turns
+            start_radius = current_radius * 0.2
+            end_radius = current_radius * np.random.uniform(1.5, 2.5)
+            theta = 2 * np.pi * turns * norm_t * angular_velocity
+            
+            # Radius increases over time
+            radius_t = start_radius + (end_radius - start_radius) * norm_t
+            
+            x = center_x + radius_t * np.cos(theta)
+            y = center_y + radius_t * np.sin(theta)
+            z = np.full(seq_len, center_z)
+            
+            # Analytical velocities
+            dr_dt = (end_radius - start_radius)  # Constant rate of radius change
+            vx = dr_dt * np.cos(theta) - radius_t * angular_velocity * 2 * np.pi * turns * np.sin(theta)
+            vy = dr_dt * np.sin(theta) + radius_t * angular_velocity * 2 * np.pi * turns * np.cos(theta)
+            vz = np.zeros(seq_len)
+
+        elif style == 'spiral_vertical_up':
+            # Vertical spiral moving upward (in xz or yz plane)
+            plane_choice = np.random.choice(['xz', 'yz'])
+            turns = np.random.uniform(1.0, 3.0)  # Number of turns
+            climb_height = np.random.uniform(15.0, 35.0)
+            theta = 2 * np.pi * turns * norm_t * angular_velocity
+            
+            if plane_choice == 'xz':
+                # Spiral in xz plane
+                x = center_x + current_radius * np.cos(theta)
+                y = np.full(seq_len, center_y)
+                z = center_z + climb_height * norm_t
+                vx = -current_radius * angular_velocity * 2 * np.pi * turns * np.sin(theta)
+                vy = np.zeros(seq_len)
+                vz = np.full(seq_len, climb_height)
+            else:
+                # Spiral in yz plane
+                x = np.full(seq_len, center_x)
+                y = center_y + current_radius * np.cos(theta)
+                z = center_z + climb_height * norm_t
+                vx = np.zeros(seq_len)
+                vy = -current_radius * angular_velocity * 2 * np.pi * turns * np.sin(theta)
+                vz = np.full(seq_len, climb_height)
+
+        elif style == 'spiral_vertical_down':
+            # Vertical spiral moving downward (in xz or yz plane)
+            plane_choice = np.random.choice(['xz', 'yz'])
+            turns = np.random.uniform(1.0, 3.0)  # Number of turns
+            descent_height = np.random.uniform(15.0, 35.0)
+            theta = 2 * np.pi * turns * norm_t * angular_velocity
+            
+            if plane_choice == 'xz':
+                # Spiral in xz plane
+                x = center_x + current_radius * np.cos(theta)
+                y = np.full(seq_len, center_y)
+                z = center_z - descent_height * norm_t
+                vx = -current_radius * angular_velocity * 2 * np.pi * turns * np.sin(theta)
+                vy = np.zeros(seq_len)
+                vz = np.full(seq_len, -descent_height)
+            else:
+                # Spiral in yz plane
+                x = np.full(seq_len, center_x)
+                y = center_y + current_radius * np.cos(theta)
+                z = center_z - descent_height * norm_t
+                vx = np.zeros(seq_len)
+                vy = -current_radius * angular_velocity * 2 * np.pi * turns * np.sin(theta)
+                vz = np.full(seq_len, -descent_height)
+
+        else:
+            # Simple straight line (fallback)
+            x = center_x + norm_t * 10
+            y = np.full(seq_len, center_y)
+            z = np.full(seq_len, center_z)
+            vx = np.full(seq_len, 10.0)
+            vy = np.zeros(seq_len)
+            vz = np.zeros(seq_len)
+
+        # Smooth and re-calculate velocity if not done above
+        if style not in ['clover', 'spiral_inward', 'spiral_outward', 'spiral_vertical_up', 'spiral_vertical_down']:
+            x_smooth = smooth_trajectory(x)
+            y_smooth = smooth_trajectory(y)
+            z_smooth = smooth_trajectory(z)
+            dt = 1.0 / seq_len
+            vx = np.gradient(x_smooth, dt)
+            vy = np.gradient(y_smooth, dt)
+            vz = np.gradient(z_smooth, dt)
+            x, y, z = x_smooth, y_smooth, z_smooth
+        
+        # Compute speed and direction
+        speed = np.sqrt(vx**2 + vy**2 + vz**2)
+        direction = np.stack([vx, vy, vz], axis=-1)
+        norms = np.linalg.norm(direction, axis=-1, keepdims=True)
+        direction = np.divide(direction, norms, where=norms>0, out=np.zeros_like(direction))
+        
+        # Attitude: direction + fixed components (e.g., for roll/pitch/yaw approximation)
+        attitude = np.concatenate([direction, np.full((seq_len, 3), 0.1)], axis=-1)
+        
+        # Full state: [speed, x, y, z, attitude(6)]
+        state = np.column_stack([speed, x, y, z, attitude])
+        trajectories.append(state)
+        
+    return torch.tensor(np.stack(trajectories), dtype=torch.float32)
+
 # B-spline trajectory representation (Section III-E)
 class BSplineTrajectory:
     """
@@ -129,15 +395,18 @@ def demo_bspline_trajectory():
     
     # Test case 1: Simple 2D trajectory
     print("Test 1: 2D Trajectory with 5 control points")
-    control_points_2d = torch.tensor([
-        [0.0, 0.0],
-        [1.0, 2.0], 
-        [3.0, 1.0],
-        [4.0, 3.0],
-        [5.0, 0.0]
-    ], dtype=torch.float32)
-    
-    bspline_2d = BSplineTrajectory(control_points_2d, degree=3, seq_len=100)
+    # control_points_2d = torch.tensor([
+    #     [0.0, 0.0],
+    #     [1.0, 2.0], 
+    #     [3.0, 1.0],
+    #     [4.0, 3.0],
+    #     [5.0, 0.0]
+    # ], dtype=torch.float32)
+    seq_len = 10
+    trajectories = generate_aerobatic_trajectories(1, seq_len)
+    control_points_2d = trajectories[0]
+
+    bspline_2d = BSplineTrajectory(control_points_2d, degree=3, seq_len=seq_len*12)
     trajectory_2d = bspline_2d.evaluate()
     
     print(f"Control points shape: {control_points_2d.shape}")
@@ -195,7 +464,7 @@ def visualize_results(control_points, trajectory, trajectories_by_degree, veloci
     fig, axes = plt.subplots(2, 3, figsize=(15, 10))
     
     # Plot 1: Original trajectory with control points
-    axes[0, 0].plot(trajectory[:, 0].numpy(), trajectory[:, 1].numpy(), 'b-', linewidth=2, label='B-spline trajectory')
+    axes[0, 0].plot(trajectory[:, 0].numpy(), trajectory[:, 1].numpy(), 'b.-', linewidth=2, label='B-spline trajectory')
     axes[0, 0].plot(control_points[:, 0].numpy(), control_points[:, 1].numpy(), 'ro--', 
                    linewidth=1, markersize=8, label='Control points')
     axes[0, 0].set_xlabel('X')

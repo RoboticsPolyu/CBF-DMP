@@ -10,6 +10,9 @@ from tqdm import tqdm
 import os
 from mpl_toolkits.mplot3d import Axes3D
 import matplotlib.animation as animation
+from AeroDM_SafeTrj_v2_Test import (
+    generate_aerobatic_trajectories,
+    generate_random_obstacles)
 
 # ======================
 #  SYNTHETIC DATA
@@ -251,7 +254,7 @@ class LidarDataEncoder:
         return self.history[-1]
 
 
-def example():
+def test_lidar_map():
     encoder = LidarDataEncoder(n_bins=36, d_max=10.0, h=1.0, history_frames=36)
     
     # Quadrotor (fixed at origin, z = 1 m)
@@ -340,5 +343,300 @@ def example():
     print("✓ Each GIF frame shows the accumulated history up to that point")
     print(f"✓ Fixed GIF saved: {gif_path}")
 
+
+def test_point_generation():
+    trajectries = generate_aerobatic_trajectories(1, 60, 10, 5)
+    obstacles = generate_random_obstacles(trajectory=trajectries, num_obstacles_range=(1,3), radius_range=(1,2))
+    
+def convert_obstacles_pointcloud(obstacles, x_range=(-20, 20), y_range=(-20, 20), z_range=(-20, 20), 
+                               x_dim=64, y_dim=64, z_dim=64, points_per_obstacle=100):
+    """
+    将障碍物列表转换为固定维度的3D点云体素网格
+    
+    Args:
+        obstacles: 障碍物字典列表，每个障碍物包含 'center' 和 'radius'
+        x_range, y_range, z_range: 空间范围 (min, max)
+        x_dim, y_dim, z_dim: 体素网格的维度
+        points_per_obstacle: 每个障碍物采样的点数
+    
+    Returns:
+        point_cloud_3d: 3D体素网格，形状为 (x_dim, y_dim, z_dim)，值为占用概率
+        point_coords: 采样的3D点坐标，形状为 (N, 3)
+        voxel_grid: 二值体素网格，形状为 (x_dim, y_dim, z_dim)
+    """
+    
+    def sample_sphere_surface(center, radius, num_points):
+        """在球体表面均匀采样点"""
+        # 生成单位球面上的随机点
+        theta = 2 * np.pi * np.random.rand(num_points)
+        phi = np.arccos(2 * np.random.rand(num_points) - 1)
+        
+        # 转换为笛卡尔坐标
+        x = radius * np.sin(phi) * np.cos(theta)
+        y = radius * np.sin(phi) * np.sin(theta)
+        z = radius * np.cos(phi)
+        
+        # 平移到障碍物中心
+        points = np.column_stack([x, y, z]) + center
+        return points
+    
+    def sample_sphere_volume(center, radius, num_points):
+        """在球体体积内均匀采样点"""
+        # 首先生成单位球体内的随机点
+        u = np.random.rand(num_points)
+        v = np.random.rand(num_points)
+        w = np.random.rand(num_points)
+        
+        # 转换为球坐标
+        theta = 2 * np.pi * u
+        phi = np.arccos(2 * v - 1)
+        r = radius * np.cbrt(w)  # 立方根确保体积均匀
+        
+        # 转换为笛卡尔坐标
+        x = r * np.sin(phi) * np.cos(theta)
+        y = r * np.sin(phi) * np.sin(theta)
+        z = r * np.cos(phi)
+        
+        # 平移到障碍物中心
+        points = np.column_stack([x, y, z]) + center
+        return points
+    
+    # 初始化点云列表
+    all_points = []
+    
+    # 对每个障碍物进行采样
+    for obstacle in obstacles:
+        center = obstacle['center']
+        radius = obstacle['radius']
+        
+        # 将tensor转换为numpy数组（如果需要）
+        if hasattr(center, 'cpu'):
+            center = center.cpu().numpy()
+        
+        # 采样点（表面或体积）
+        points = sample_sphere_surface(center, radius, points_per_obstacle)
+        # 或者使用体积采样：points = sample_sphere_volume(center, radius, points_per_obstacle)
+        
+        all_points.append(points)
+    
+    # 合并所有点
+    if all_points:
+        point_coords = np.vstack(all_points)
+    else:
+        point_coords = np.empty((0, 3))
+    
+    # 创建体素网格
+    voxel_grid = np.zeros((x_dim, y_dim, z_dim), dtype=np.float32)
+    point_cloud_3d = np.zeros((x_dim, y_dim, z_dim), dtype=np.float32)
+    
+    if len(point_coords) > 0:
+        # 将点坐标映射到体素索引
+        x_min, x_max = x_range
+        y_min, y_max = y_range
+        z_min, z_max = z_range
+        
+        # 过滤在范围内的点
+        valid_mask = (
+            (point_coords[:, 0] >= x_min) & (point_coords[:, 0] <= x_max) &
+            (point_coords[:, 1] >= y_min) & (point_coords[:, 1] <= y_max) &
+            (point_coords[:, 2] >= z_min) & (point_coords[:, 2] <= z_max)
+        )
+        valid_points = point_coords[valid_mask]
+        
+        if len(valid_points) > 0:
+            # 计算体素索引
+            x_indices = ((valid_points[:, 0] - x_min) / (x_max - x_min) * (x_dim - 1)).astype(int)
+            y_indices = ((valid_points[:, 1] - y_min) / (y_max - y_min) * (y_dim - 1)).astype(int)
+            z_indices = ((valid_points[:, 2] - z_min) / (z_max - z_min) * (z_dim - 1)).astype(int)
+            
+            # 确保索引在有效范围内
+            x_indices = np.clip(x_indices, 0, x_dim - 1)
+            y_indices = np.clip(y_indices, 0, y_dim - 1)
+            z_indices = np.clip(z_indices, 0, z_dim - 1)
+            
+            # 填充体素网格
+            for x, y, z in zip(x_indices, y_indices, z_indices):
+                voxel_grid[x, y, z] = 1.0
+                point_cloud_3d[x, y, z] += 1.0  # 累积占用次数
+            
+            # 归一化为概率 [0, 1]
+            if point_cloud_3d.max() > 0:
+                point_cloud_3d = point_cloud_3d / point_cloud_3d.max()
+    
+    return point_cloud_3d, point_coords, voxel_grid
+
+def visualize_point_cloud_3d(point_cloud_3d, point_coords=None, obstacles=None, 
+                           trajectory=None, show_flag=True, title="3D Obstacle Point Cloud"):
+    """
+    可视化3D点云体素网格
+    
+    Args:
+        point_cloud_3d: 3D体素网格，形状为 (x_dim, y_dim, z_dim)
+        point_coords: 原始点坐标，形状为 (N, 3)
+        obstacles: 原始障碍物列表
+        trajectory: 轨迹数据
+        show_flag: 是否显示图像
+        title: 图像标题
+    """
+    fig = plt.figure(figsize=(15, 5))
+    
+    # 1. 3D体素可视化
+    ax1 = fig.add_subplot(131, projection='3d')
+    
+    # 提取非零体素的位置
+    x_idx, y_idx, z_idx = np.where(point_cloud_3d > 0)
+    
+    if len(x_idx) > 0:
+        # 将体素索引转换回实际坐标（近似）
+        x_range = (-20, 20)  # 与convert函数中的范围一致
+        y_range = (-20, 20)
+        z_range = (-20, 20)
+        
+        x_coords = np.interp(x_idx, [0, point_cloud_3d.shape[0]-1], x_range)
+        y_coords = np.interp(y_idx, [0, point_cloud_3d.shape[1]-1], y_range)
+        z_coords = np.interp(z_idx, [0, point_cloud_3d.shape[2]-1], z_range)
+        
+        # 根据占用概率设置颜色和透明度
+        values = point_cloud_3d[x_idx, y_idx, z_idx]
+        scatter = ax1.scatter(x_coords, y_coords, z_coords, 
+                             c=values, cmap='viridis', alpha=0.6, 
+                             s=20, marker='o')
+        plt.colorbar(scatter, ax=ax1, label='Occupancy Probability')
+    
+    # 绘制轨迹（如果提供）
+    if trajectory is not None:
+        traj_points = trajectory.detach().cpu().numpy() if hasattr(trajectory, 'detach') else trajectory
+        if traj_points.ndim == 3:  # 如果是批量数据，取第一个
+            traj_points = traj_points[0]
+        if traj_points.shape[1] >= 4:  # 提取位置 (x,y,z)
+            positions = traj_points[:, 1:4]
+            ax1.plot(positions[:, 0], positions[:, 1], positions[:, 2], 
+                    'r-', linewidth=3, label='Trajectory', alpha=0.8)
+    
+    ax1.set_xlabel('X')
+    ax1.set_ylabel('Y')
+    ax1.set_zlabel('Z')
+    ax1.set_title('3D Voxel Grid')
+    ax1.legend()
+    
+    # 2. 原始点云可视化
+    ax2 = fig.add_subplot(132, projection='3d')
+    
+    if point_coords is not None and len(point_coords) > 0:
+        ax2.scatter(point_coords[:, 0], point_coords[:, 1], point_coords[:, 2],
+                   c='blue', alpha=0.5, s=10, label='Sampled Points')
+    
+    # 绘制原始障碍物球体
+    if obstacles is not None:
+        colors = plt.cm.Set3(np.linspace(0, 1, len(obstacles)))
+        for i, obstacle in enumerate(obstacles):
+            center = obstacle['center']
+            radius = obstacle['radius']
+            
+            if hasattr(center, 'cpu'):
+                center = center.cpu().numpy()
+            
+            # 绘制球体表面
+            u = np.linspace(0, 2 * np.pi, 10)
+            v = np.linspace(0, np.pi, 10)
+            x = center[0] + radius * np.outer(np.cos(u), np.sin(v))
+            y = center[1] + radius * np.outer(np.sin(u), np.sin(v))
+            z = center[2] + radius * np.outer(np.ones(np.size(u)), np.cos(v))
+            
+            ax2.plot_surface(x, y, z, alpha=0.3, color=colors[i])
+            
+            if i == 0:
+                from matplotlib.patches import Patch
+                # 为图例创建代理
+                proxy = Patch(color=colors[i], alpha=0.5, label='Obstacles')
+                ax2.legend(handles=[proxy])
+    
+    ax2.set_xlabel('X')
+    ax2.set_ylabel('Y')
+    ax2.set_zlabel('Z')
+    ax2.set_title('Original Obstacles & Points')
+    
+    # 3. 2D投影（XY平面）
+    ax3 = fig.add_subplot(133)
+    
+    if point_coords is not None and len(point_coords) > 0:
+        ax3.scatter(point_coords[:, 0], point_coords[:, 1],
+                   c='blue', alpha=0.5, s=10, label='Points')
+    
+    # 绘制障碍物圆圈
+    if obstacles is not None:
+        for i, obstacle in enumerate(obstacles):
+            center = obstacle['center']
+            radius = obstacle['radius']
+            
+            if hasattr(center, 'cpu'):
+                center = center.cpu().numpy()
+            
+            circle = plt.Circle((center[0], center[1]), radius, 
+                              color=plt.cm.Set3(i/len(obstacles)), 
+                              alpha=0.5, label=f'Obstacle {i+1}' if i < 3 else "")
+            ax3.add_patch(circle)
+    
+    ax3.set_xlabel('X')
+    ax3.set_ylabel('Y')
+    ax3.set_title('XY Projection')
+    ax3.legend()
+    ax3.grid(True, alpha=0.3)
+    ax3.axis('equal')
+    
+    plt.suptitle(title, fontsize=16)
+    plt.tight_layout()
+    
+    if show_flag:
+        plt.show()
+    else:
+        filename = "Figs/obstacle_point_cloud_3d.svg"
+        plt.savefig(filename, format='svg', bbox_inches='tight', dpi=300)
+        plt.close()
+
+def test_point_generation():
+    """测试点云生成功能"""
+    # 生成测试数据
+    trajectories = generate_aerobatic_trajectories(1, 60, 10, 5)
+    obstacles = generate_random_obstacles(
+        trajectory=trajectories[0], 
+        num_obstacles_range=(2, 4), 
+        radius_range=(0.2, 1.0),
+        check_collision=True
+    )
+    
+    print(f"Generated {len(obstacles)} obstacles")
+    for i, obs in enumerate(obstacles):
+        print(f"Obstacle {i}: center={obs['center']}, radius={obs['radius']:.2f}")
+    
+    # 转换为点云
+    point_cloud_3d, point_coords, voxel_grid = convert_obstacles_pointcloud(
+        obstacles, 
+        x_range=(-20, 20), 
+        y_range=(-20, 20), 
+        z_range=(-20, 20),
+        x_dim=128,  # 降低分辨率以提高性能
+        y_dim=128, 
+        z_dim=128,
+        points_per_obstacle=200
+    )
+    
+    print(f"Point cloud shape: {point_cloud_3d.shape}")
+    print(f"Number of sampled points: {len(point_coords)}")
+    print(f"Occupied voxels: {np.sum(voxel_grid > 0)}")
+    
+    # 可视化
+    visualize_point_cloud_3d(
+        point_cloud_3d, 
+        point_coords, 
+        obstacles, 
+        trajectory=trajectories[0],
+        show_flag=True,
+        title="Obstacle Point Cloud Visualization"
+    )
+    
+    return point_cloud_3d, point_coords, voxel_grid, obstacles
+
 if __name__ == "__main__":
-    example()
+    # test_lidar_map()
+    point_cloud, points, voxels, obstacles = test_point_generation()

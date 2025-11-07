@@ -24,6 +24,7 @@ import matplotlib.pyplot as plt
 import sys
 import time
 from scipy.interpolate import BSpline
+from plot_mpd_comparison import plot_mpd_comparison
 
 # Configuration parameters based on the MPD paper
 class Config:
@@ -547,26 +548,26 @@ class ObstacleAwareDiffusionProcess:
             ε_pred = (x_t - sqrt_alpha_bar_t * pred_x0) / sqrt_one_minus_alpha_bar_t
             
             # Compute score s_theta ≈ -ε_pred / sqrt(1 - α_bar_t)
-            sigma_t = sqrt_one_minus_alpha_bar_t
-            s_theta = - ε_pred / sigma_t
+            # s_theta = - ε_pred / sigma_t
             
             # Apply CBF guidance if enabled
-            ε_guided = ε_pred.clone()
+            # ε_guided = ε_pred.clone()
             barrier_info = None
             if enable_guidance and guidance_gamma is not None and mean is not None and std is not None:
                 # Compute γ_t (scheduled: strongest at t=0 for final safety enforcement)
-                gamma_t = guidance_gamma * (1.0 - t_exp.squeeze(1).float() / self.num_timesteps)
+                gamma_t = guidance_gamma * (1.0 - t_exp.squeeze(1).float() / self.diffusion_steps)
                 
                 # Compute barrier gradient ∇V with multiple obstacles
                 V, grad_V = compute_barrier_and_grad(x_t, self.config, mean, std, obstacles_data)
                 barrier_info = {'V': V, 'grad_V': grad_V, 'gamma_t': gamma_t}
 
                 # Guided score: s_guided = s_theta - γ_t ∇V
-                s_guided = s_theta - gamma_t.view(batch_size, 1, 1) * grad_V
-                
-                # Guided noise
-                ε_guided = - s_guided * sigma_t
-            
+                sigma_t = sqrt_one_minus_alpha_bar_t
+                ε_guided = ε_pred - gamma_t.view(batch_size, 1, 1) * grad_V * sigma_t
+
+            else:
+                ε_guided = ε_pred
+
             # Compute mean μ using guided noise (standard DDPM formula)
             coeff = (1 - alpha_t) / sqrt_one_minus_alpha_bar_t
             mu = (1 / torch.sqrt(alpha_t)) * (x_t - coeff * ε_guided)
@@ -1836,7 +1837,7 @@ def test_model_performance(model, trajectories_norm, mean, std, num_test_samples
                 action, 
                 history, 
                 batch_size=1, 
-                enable_guidance=True, 
+                enable_guidance=False, 
                 guidance_gamma=config.guidance_gamma, 
                 plot_all_steps=False # Plotting is too slow, rely on final plot
             )
@@ -2132,12 +2133,18 @@ class MPDPlanning:
         device = next(self.diffusion_model.parameters()).device
         
         # Initialize with noise - use B-spline control points
-        x_t = torch.randn(batch_size, self.config.b_spline_control_points, 
-                         self.config.state_dim).to(device)
+        if self.config.use_b_spline:
+            x_t = torch.randn(batch_size, self.config.b_spline_control_points, 
+                              self.config.state_dim).to(device)
+            print(f"\n{'='*50}")
+            print("MPD PLANNING: Sampling from Posterior with Cost Guidance")
+            print(f"B-spline control points: {self.config.b_spline_control_points}")
+        else:
+            x_t = torch.randn(batch_size, self.config.seq_len, 
+                              self.config.state_dim).to(device)
+            print("MPD PLANNING: Sampling from Posterior with Cost Guidance")
+            print(f"seq points: {self.config.seq_len}")
         
-        print(f"\n{'='*50}")
-        print("MPD PLANNING: Sampling from Posterior with Cost Guidance")
-        print(f"B-spline control points: {self.config.b_spline_control_points}")
         print(f"Cost guidance steps: {self.config.cost_guidance_steps}")
         print(f"{'='*50}")
         
@@ -2154,9 +2161,11 @@ class MPDPlanning:
             )
         
         # Convert B-spline control points to dense trajectory
-        dense_trajectory = self._b_spline_to_dense(x_t)
-            
-        return dense_trajectory
+        if self.config.use_b_spline:
+            dense_trajectory = self._b_spline_to_dense(x_t)
+            return dense_trajectory
+        else:
+            return x_t
 
     def _mpd_denoising_step(self, x_t, t, target, action, history, apply_guidance, obstacles_data):
         """
@@ -2189,16 +2198,22 @@ class MPDPlanning:
             # 3. Apply cost guidance if enabled (equation 13-14)
             if apply_guidance and self.mean is not None and self.std is not None:
                 # Convert to dense trajectory for cost computation
-                dense_trajectory = self._b_spline_to_dense(pred_x0)
-                
+                if self.config.use_b_spline:
+                    dense_trajectory = self._b_spline_to_dense(pred_x0)
+                else:
+                    dense_trajectory = pred_x0
+
                 # Compute costs and gradients
                 total_cost, cost_gradients = self.compute_motion_planning_costs(
                     dense_trajectory, target, obstacles_data
                 )
                 
                 # Map gradients back to B-spline space (simplified)
-                cost_gradients_bspline = cost_gradients[:, :self.config.b_spline_control_points, :]
-                
+                if self.config.use_b_spline:
+                    cost_gradients_bspline = cost_gradients[:, :self.config.b_spline_control_points, :]
+                else:
+                    cost_gradients_bspline = cost_gradients[:, :self.config.seq_len, :]
+
                 # Cost-guided noise adjustment (equation 14)
                 sigma_t = sqrt_one_minus_alpha_bar_t
                 guidance_strength = self.config.lambda_prior * (1.0 - t_exp.float() / self.config.diffusion_steps)
@@ -2379,132 +2394,6 @@ def test_mpd_planning(model, trajectories_norm, mean, std, num_test_samples=3, s
                 step_idx=i+1
             )
 
-def plot_mpd_comparison(original, standard_sample, mpd_sample, history, target, obstacles, show_flag, step_idx):
-    """Plot comparison between standard sampling and MPD planning"""
-    fig = plt.figure(figsize=(20, 12))
-    fig.suptitle(f'MPD Planning vs Standard Sampling (Test {step_idx})', fontsize=16, fontweight='bold')
-    
-    # Extract positions
-    original_pos = original[0, :, 1:4].detach().cpu().numpy()
-    standard_pos = standard_sample[0, :, 1:4].detach().cpu().numpy()
-    mpd_pos = mpd_sample[0, :, 1:4].detach().cpu().numpy()
-    
-    # 1. 3D trajectory comparison
-    ax1 = fig.add_subplot(231, projection='3d')
-    ax1.plot(original_pos[:, 0], original_pos[:, 1], original_pos[:, 2], 
-             'b-', label='Original', linewidth=3, alpha=0.7)
-    ax1.plot(standard_pos[:, 0], standard_pos[:, 1], standard_pos[:, 2], 
-             'r--', label='Standard Sampling', linewidth=2, alpha=0.8)
-    ax1.plot(mpd_pos[:, 0], mpd_pos[:, 1], mpd_pos[:, 2], 
-             'g-.', label='MPD Planning', linewidth=2, alpha=0.8)
-    
-    # Plot obstacles
-    for obstacle in obstacles:
-        center = obstacle['center'].cpu().numpy()
-        radius = obstacle['radius']
-        
-        u = np.linspace(0, 2 * np.pi, 10)
-        v = np.linspace(0, np.pi, 10)
-        x_sphere = center[0] + radius * np.outer(np.cos(u), np.sin(v))
-        y_sphere = center[1] + radius * np.outer(np.sin(u), np.sin(v))
-        z_sphere = center[2] + radius * np.outer(np.ones(np.size(u)), np.cos(v))
-        
-        ax1.plot_surface(x_sphere, y_sphere, z_sphere, alpha=0.3, color='red')
-    
-    ax1.set_xlabel('X')
-    ax1.set_ylabel('Y')
-    ax1.set_zlabel('Z')
-    ax1.legend()
-    ax1.set_title('3D Trajectory Comparison')
-    ax1.grid(True)
-    
-    # 2. Cost analysis
-    ax2 = fig.add_subplot(232)
-    # Simplified cost comparison (in practice, compute actual costs)
-    costs = ['Standard', 'MPD Planning']
-    collision_avoidance = [0.8, 0.2]  # Example values
-    goal_achievement = [0.7, 0.9]     # Example values
-    
-    x = np.arange(len(costs))
-    width = 0.35
-    
-    ax2.bar(x - width/2, collision_avoidance, width, label='Collision Avoidance', alpha=0.7)
-    ax2.bar(x + width/2, goal_achievement, width, label='Goal Achievement', alpha=0.7)
-    
-    ax2.set_xlabel('Method')
-    ax2.set_ylabel('Performance (higher is better)')
-    ax2.set_title('Cost Performance Comparison')
-    ax2.set_xticks(x)
-    ax2.set_xticklabels(costs)
-    ax2.legend()
-    ax2.grid(True, alpha=0.3)
-    
-    # 3. Position error over time
-    ax3 = fig.add_subplot(233)
-    time_steps = np.arange(len(original_pos))
-    standard_error = np.linalg.norm(standard_pos - original_pos, axis=1)
-    mpd_error = np.linalg.norm(mpd_pos - original_pos, axis=1)
-    
-    ax3.plot(time_steps, standard_error, 'r--', label='Standard Error', linewidth=2)
-    ax3.plot(time_steps, mpd_error, 'g-.', label='MPD Error', linewidth=2)
-    ax3.set_xlabel('Time Step')
-    ax3.set_ylabel('L2 Position Error')
-    ax3.set_title('Trajectory Error Comparison')
-    ax3.legend()
-    ax3.grid(True)
-    
-    # 4. Final position accuracy
-    ax4 = fig.add_subplot(234)
-    final_errors = [
-        np.linalg.norm(standard_pos[-1] - original_pos[-1]),
-        np.linalg.norm(mpd_pos[-1] - original_pos[-1])
-    ]
-    
-    ax4.bar(costs, final_errors, color=['red', 'green'], alpha=0.7)
-    ax4.set_ylabel('Final Position Error')
-    ax4.set_title('Goal Achievement Accuracy')
-    ax4.grid(True, alpha=0.3)
-    
-    # 5. Obstacle clearance
-    ax5 = fig.add_subplot(235)
-    # Simplified clearance metrics
-    min_distances_standard = [0.5]  # Example
-    min_distances_mpd = [1.8]       # Example
-    
-    ax5.bar(['Standard'], min_distances_standard, color='red', alpha=0.7, label='Min Distance')
-    ax5.bar(['MPD'], min_distances_mpd, color='green', alpha=0.7)
-    ax5.axhline(y=1.0, color='orange', linestyle='--', label='Safety Threshold')
-    ax5.set_ylabel('Minimum Obstacle Distance')
-    ax5.set_title('Collision Avoidance Performance')
-    ax5.legend()
-    ax5.grid(True, alpha=0.3)
-    
-    # 6. Summary statistics
-    ax6 = fig.add_subplot(236)
-    ax6.axis('off')
-    
-    summary_text = (
-        f"MPD Planning Summary:\n\n"
-        f"• B-spline Control Points: {config.b_spline_control_points}\n"
-        f"• Cost Guidance Steps: {config.cost_guidance_steps}\n"
-        f"• Obstacles Avoided: {len(obstacles)}/{len(obstacles)}\n"
-        f"• Goal Error Reduction: {((final_errors[0]-final_errors[1])/final_errors[0]*100):.1f}%\n"
-        f"• Safety Improvement: {((min_distances_mpd[0]-min_distances_standard[0])/min_distances_standard[0]*100):.1f}%"
-    )
-    
-    ax6.text(0.1, 0.9, summary_text, transform=ax6.transAxes, fontsize=12,
-             verticalalignment='top', bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.5))
-    
-    plt.tight_layout()
-    
-    if show_flag:
-        plt.show()
-    else:
-        filename = f"Figs/mpd_planning_test_{step_idx:03d}.svg"
-        plt.savefig(filename, format='svg', bbox_inches='tight')
-        plt.close()
-
-
 # Modified main execution for MPD
 if __name__ == "__main__":
     print("Training AeroDM with MPD Planning Framework...")
@@ -2534,9 +2423,9 @@ if __name__ == "__main__":
     print(f"Using AeroDMLoss (obstacle term: {use_obstacle_loss})")
     
     # Training parameters
-    num_epochs = 100
+    num_epochs = 50
     batch_size = 32
-    num_trajectories = 3000
+    num_trajectories = 40000
     
     print("Generating training data with obstacle-aware transformer...")
     trajectories = generate_aerobatic_trajectories(
@@ -2622,7 +2511,7 @@ if __name__ == "__main__":
                     obstacles = generate_random_obstacles(
                         traj_denorm[0], 
                         num_obstacles_range=(1, 3), 
-                        radius_range=(0.1, 2.5), 
+                        radius_range=(0.1, 0.3), 
                         check_collision=True, 
                         device=device
                     )
@@ -2688,9 +2577,9 @@ if __name__ == "__main__":
     # ------------------
     # Evaluation and Testing
     # ------------------
-    # Optional: Display a few generated trajectories before normalization/splitting
-    # plot_trajectories_demo(trajectories[:18], rows=3, cols=6)
-    
+    # Load test data and run MPD planning tests
+    test_mpd_planning(model, test_norm, mean, std, num_test_samples=100, show_flag=config.show_flag)
+
      # Save model checkpoint
     checkpoint = {
         'model_state_dict': model.state_dict(),
@@ -2712,5 +2601,4 @@ if __name__ == "__main__":
     print("MPD PLANNING EVALUATION")
     print("="*60)
     
-    # Load test data and run MPD planning tests
-    test_mpd_planning(model, test_norm, mean, std, num_test_samples=100, show_flag=config.show_flag)
+    

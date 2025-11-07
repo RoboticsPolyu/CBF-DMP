@@ -513,35 +513,32 @@ class ObstacleAwareDiffusionProcess:
             # Compute predicted noise from pred_x0
             sqrt_alpha_bar_t = torch.sqrt(alpha_bar_t)
             sqrt_one_minus_alpha_bar_t = torch.sqrt(one_minus_alpha_bar_t)
-            ε_pred = (x_t - sqrt_alpha_bar_t * pred_x0) / sqrt_one_minus_alpha_bar_t
+            # Predict noise ε_pred = (x_t - sqrt(α_bar_t) * pred_x0) / sqrt(1 - α_bar_t)
+            mu_pred = (x_t - sqrt_alpha_bar_t * pred_x0) / sqrt_one_minus_alpha_bar_t
             
-            # Compute score s_theta ≈ -ε_pred / sqrt(1 - α_bar_t)
-            sigma_t = sqrt_one_minus_alpha_bar_t
-            s_theta = - ε_pred / sigma_t
-            
-            # Apply CBF guidance if enabled
-            ε_guided = ε_pred.clone()
             barrier_info = None
             if enable_guidance and guidance_gamma is not None and mean is not None and std is not None:
                 # Compute γ_t (scheduled: strongest at t=0 for final safety enforcement)
-                gamma_t = guidance_gamma * (1.0 - t_exp.squeeze(1).float() / self.num_timesteps)
+                gamma_t = guidance_gamma * (1.0 - t_exp.squeeze(1).float() / self.diffusion_steps)
                 
                 # Compute barrier gradient ∇V with multiple obstacles
                 V, grad_V = compute_barrier_and_grad(pred_x0, self.config, mean, std, obstacles_data)
                 barrier_info = {'V': V, 'grad_V': grad_V, 'gamma_t': gamma_t}
                 # print(barrier_info)
                 # Guided score: s_guided = s_theta - γ_t ∇V
-                s_guided = s_theta - gamma_t.view(batch_size, 1, 1) * grad_V
+                sigma_t = sqrt_one_minus_alpha_bar_t
+                ε_guided = mu_pred - gamma_t.view(batch_size, 1, 1) * grad_V * sigma_t
                 
-                s_norm = torch.norm(s_theta, dim=(1,2), keepdim=True)
+                s_norm = torch.norm(mu_pred, dim=(1,2), keepdim=True)
                 grad_norm = torch.norm(gamma_t.view(batch_size, 1, 1) * grad_V, dim=(1,2), keepdim=True)
                 print("s_norm: ", s_norm, "grad_norm: ", grad_norm, "[s_norm / grad_norm]: ", s_norm / (grad_norm + 1e-8), "gamma_t: ", gamma_t)
 
-                # Guided noise
-                ε_guided = - s_guided * sigma_t
+            else:
+                ε_guided = mu_pred
             
             # Compute mean μ using guided noise (standard DDPM formula)
             coeff = (1 - alpha_t) / sqrt_one_minus_alpha_bar_t
+            # x_{t-1} mean = 1/sqrt(α_t) * (x_t - (1 - α_t) / sqrt(1 - α_bar_t) * ε_guided)
             mu = (1 / torch.sqrt(alpha_t)) * (x_t - coeff * ε_guided)
             
             # For t=0, return pred_x0 (or guided equivalent)
@@ -556,13 +553,14 @@ class ObstacleAwareDiffusionProcess:
             
             # Variance (DDPM posterior variance)
             alpha_bar_prev = alpha_bars[t_exp.squeeze(1) - 1].view(batch_size, 1, 1) if t.min() > 0 else torch.ones_like(alpha_bar_t)
+            # var = β_t * (1 - ᾱ_{t-1}) / (1 - ᾱ_t)
             var = beta_t * (1 - alpha_bar_prev) / one_minus_alpha_bar_t
             sigma = torch.sqrt(var)
             
             # Sample noise
             z = torch.randn_like(x_t)
             
-            # x_{t-1}
+            # x_{t-1} = μ + σ * z
             x_prev = mu + sigma * z
             
             if plot_step:
@@ -1511,8 +1509,8 @@ def generate_random_obstacles(trajectory, num_obstacles_range=(1, 5), radius_ran
     bounds_range = max_bounds - min_bounds
     
     # Expand the placement area by 50% of the trajectory range to allow space around it
-    expanded_min = min_bounds - 0.0 * bounds_range
-    expanded_max = max_bounds + 0.0 * bounds_range
+    expanded_min = min_bounds - 0.3 * bounds_range
+    expanded_max = max_bounds + 0.3 * bounds_range
     
     # print(f"Generating {num_obstacles} random non-colliding obstacles around trajectory")
     for i in range(num_obstacles):
