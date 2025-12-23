@@ -12,41 +12,47 @@ import matplotlib.pyplot as plt
 import sys
 import time
 
+
+from Deformation import generate_aerobatic_trajectories
+from Deformation import generate_aerobatic_trajectories_deformation
+from circular_trajectories import generate_circular_end_trajectories
+from distribute_trajectories import generate_distributed_trajectories
+
 # Configuration parameters based on the paper
 class Config:
     # Model dimensions
-    latent_dim = 256
+    latent_dim = 128 # 256
+    obs_latent_dim = 64
     num_layers = 4
     num_heads = 4
     dropout = 0.1
     
     # Diffusion parameters
-    diffusion_steps = 30
+    diffusion_steps = 100
     beta_start = 0.0001
     beta_end = 0.02
     
     # Sequence parameters
-    seq_len = 60  # N_a = 60 time steps
-    state_dim = 10  # x_i ∈ R^10: s(1) + p(3) + r(6)
-    history_len = 5  # 5-frame historical observations
+    seq_len = 60  # N_a = 60 time steps; 6s-long future trajectory sequence
+    state_dim = 11  # x_i ∈ R^10: s(1) + p(3) + r(6) + style(1)
+    history_len = 1  # 5-frame historical observations
     
     # Condition dimensions
     target_dim = 3  # p_t ∈ R^3
-    action_dim = 5   # 5 maneuver styles
+    action_dim = 14   # 14 maneuver styles
 
     # Obstacle parameters
     max_obstacles = 10  # Maximum number of obstacles to process
     obstacle_feat_dim = 4  # [x, y, z, radius]
-    enable_obstacle_encoding = True  # Toggle obstacle encoding in the model
+    enable_obstacle_encoding = False  # Toggle obstacle encoding in the model
     use_obstacle_loss = False  # Toggle obstacle loss term in training
 
     # CBF Guidance parameters (from CoDiG paper)
     enable_cbf_guidance = False  # Disabled by default; toggle for inference
-    guidance_gamma = 1000.0  # Base gamma for barrier guidance
-    obstacle_radius = 5.0  # Safe distance radius
+    guidance_gamma = 10000.0  # Base gamma for barrier guidance
     
     # Plotting control
-    show_flag = False  # Set to False to save plots as SVG instead of displaying
+    show_flag = True  # Set to False to save plots as SVG instead of displaying
     
     @staticmethod
     def get_obstacle_center(device='cpu'):
@@ -79,151 +85,102 @@ class ObstacleEncoder(nn.Module):
         
         # MLP for encoding individual obstacles
         self.obstacle_mlp = nn.Sequential(
-            nn.Linear(config.obstacle_feat_dim, config.latent_dim // 2),
+            nn.Linear(config.obstacle_feat_dim, config.obs_latent_dim * 2),
             nn.ReLU(),
-            nn.Linear(config.latent_dim // 2, config.latent_dim),
+            nn.Linear(config.obs_latent_dim * 2, config.obs_latent_dim),
             nn.ReLU(),
-            nn.Linear(config.latent_dim, config.latent_dim)
+            nn.Linear(config.obs_latent_dim, config.obs_latent_dim)
         )
-        
-        # Global obstacle context encoder
-        self.global_obstacle_encoder = nn.Sequential(
-            nn.Linear(config.latent_dim, config.latent_dim),
-            nn.ReLU(),
-            nn.Linear(config.latent_dim, config.latent_dim)
-        )
-        
-        # Learnable obstacle query for aggregation
-        self.obstacle_query = nn.Parameter(torch.randn(1, config.latent_dim))
-        
+
     def forward(self, obstacles_data):
         """
-        Encode obstacle information into a latent representation.
-        Handles both single list of obstacles and batch-wise list of lists.
+        Process multiple obstacles and generate a global obstacle embedding.
+        
+        Args:
+            obstacles_data: List of lists, where each inner list contains obstacle dicts for a batch sample
+        
+        Returns:
+            global_features: Global obstacle embedding tensor of shape [batch_size, obs_latent_dim]
         """
-        if obstacles_data is None:
-            # No obstacles, return zero embedding
-            batch_size = 1
-            return torch.zeros(batch_size, self.config.latent_dim, device=next(self.parameters()).device)
+        if obstacles_data is None or len(obstacles_data) == 0:
+            # Return zero embedding if no obstacles
+            batch_size = 1 if obstacles_data is None else len(obstacles_data)
+            return torch.zeros(batch_size, self.config.obs_latent_dim, device=next(self.parameters()).device)
         
-        if isinstance(obstacles_data, list) and len(obstacles_data) == 0:
-            # No obstacles, return zero embedding
-            batch_size = 1
-            return torch.zeros(batch_size, self.config.latent_dim, device=next(self.parameters()).device)
-
         device = next(self.parameters()).device
+        # print(" -------- device:", device)
+        batch_size = len(obstacles_data)
         
-        # Check if obstacles_data is batch-wise (list of lists)
-        if (isinstance(obstacles_data, list) and 
-            len(obstacles_data) > 0 and 
-            isinstance(obstacles_data[0], list)):
-            # Batch-wise obstacles: list of lists
-            batch_size = len(obstacles_data)
-            all_obstacle_tensors = []
-            
-            for batch_idx, batch_obstacles in enumerate(obstacles_data):
-                batch_obstacle_tensors = []
-                
-                # Process actual obstacles in this batch
-                for obstacle in batch_obstacles:
+        # Preprocessing: Prepare a fixed number of obstacles for each sample
+        batch_obstacle_tensors = []
+        valid_counts = []  # Record the number of effective obstacles for each sample
+        
+        for sample_obstacles in obstacles_data:
+            if not sample_obstacles:
+                # Empty sample, create zero tensor
+                obstacle_tensor = torch.zeros(self.config.max_obstacles, self.config.obstacle_feat_dim, device=device)
+                valid_counts.append(0)
+            else:
+                # Extracting obstacle features
+                obstacle_tensors = []
+                for obstacle in sample_obstacles:
                     center = obstacle['center'].to(device)
                     radius = obstacle['radius']
-                    if isinstance(radius, torch.Tensor):
-                        radius_tensor = radius.to(device)
-                    else:
-                        radius_tensor = torch.tensor([radius], device=device, dtype=torch.float32)
-                    obstacle_feat = torch.cat([center, radius_tensor])
-                    batch_obstacle_tensors.append(obstacle_feat)
+                    obstacle_feat = torch.cat([
+                        center,
+                        torch.tensor([radius], device=device, dtype=center.dtype)
+                    ])
+                    obstacle_tensors.append(obstacle_feat)
                 
-                # Handle padding for this batch
-                num_obstacles = len(batch_obstacle_tensors)
-                if num_obstacles == 0:
-                    # No obstacles - create all padding
-                    batch_obstacle_tensors = [torch.zeros(self.config.obstacle_feat_dim, device=device) 
-                                            for _ in range(self.config.max_obstacles)]
-                elif num_obstacles < self.config.max_obstacles:
-                    # Add padding obstacles
-                    num_padding = self.config.max_obstacles - num_obstacles
-                    for _ in range(num_padding):
-                        batch_obstacle_tensors.append(torch.zeros(self.config.obstacle_feat_dim, device=device))
-                elif num_obstacles > self.config.max_obstacles:
-                    # Truncate to max_obstacles
-                    batch_obstacle_tensors = batch_obstacle_tensors[:self.config.max_obstacles]
-                
-                # Stack this batch's obstacles
-                batch_tensor = torch.stack(batch_obstacle_tensors)  # (max_obstacles, feat_dim)
-                all_obstacle_tensors.append(batch_tensor)
-            
-            # Stack all batches
-            obstacle_tensor = torch.stack(all_obstacle_tensors)  # (batch_size, max_obstacles, feat_dim)
-            
-        elif isinstance(obstacles_data, list):
-            # Single list of obstacles (broadcast to batch_size=1)
-            batch_size = 1
-            obstacle_tensors = []
-            
-            # Process actual obstacles
-            for obstacle in obstacles_data:
-                center = obstacle['center'].to(device)
-                radius = obstacle['radius']
-                if isinstance(radius, torch.Tensor):
-                    radius_tensor = radius.to(device)
+               # Stack and handle quantity limits
+                if obstacle_tensors:
+                    obstacle_tensor = torch.stack(obstacle_tensors)
+                    valid_count = len(obstacle_tensors)
+                    
+                    if valid_count < self.config.max_obstacles:
+                        padding = torch.zeros(self.config.max_obstacles - valid_count, 
+                                            self.config.obstacle_feat_dim, device=device)
+                        obstacle_tensor = torch.cat([obstacle_tensor, padding], dim=0)
+                    elif valid_count > self.config.max_obstacles:
+                        obstacle_tensor = obstacle_tensor[:self.config.max_obstacles]
+                        valid_count = self.config.max_obstacles
+                    
+                    valid_counts.append(valid_count)
                 else:
-                    radius_tensor = torch.tensor([radius], device=device, dtype=torch.float32)
-                obstacle_feat = torch.cat([center, radius_tensor])
-                obstacle_tensors.append(obstacle_feat)
+                    obstacle_tensor = torch.zeros(self.config.max_obstacles, self.config.obstacle_feat_dim, device=device)
+                    valid_counts.append(0)
             
-            # Handle padding
-            num_obstacles = len(obstacle_tensors)
-            if num_obstacles == 0:
-                # No obstacles - create all padding
-                obstacle_tensors = [torch.zeros(self.config.obstacle_feat_dim, device=device) 
-                                  for _ in range(self.config.max_obstacles)]
-            elif num_obstacles < self.config.max_obstacles:
-                # Add padding obstacles
-                num_padding = self.config.max_obstacles - num_obstacles
-                for _ in range(num_padding):
-                    obstacle_tensors.append(torch.zeros(self.config.obstacle_feat_dim, device=device))
-            elif num_obstacles > self.config.max_obstacles:
-                # Truncate to max_obstacles
-                obstacle_tensors = obstacle_tensors[:self.config.max_obstacles]
-            
-            # Stack and add batch dimension
-            obstacle_tensor = torch.stack(obstacle_tensors).unsqueeze(0)  # (1, max_obstacles, feat_dim)
-            
-        else:
-            # Assume obstacles_data is already a tensor
-            obstacle_tensor = obstacles_data.to(device)
-            if obstacle_tensor.dim() == 2:
-                obstacle_tensor = obstacle_tensor.unsqueeze(0)
-            batch_size = obstacle_tensor.size(0)
-            
-            # Ensure proper shape: (batch_size, max_obstacles, feat_dim)
-            if obstacle_tensor.size(1) < self.config.max_obstacles:
-                padding = torch.zeros(batch_size, self.config.max_obstacles - obstacle_tensor.size(1), 
-                                    self.config.obstacle_feat_dim, device=device)
-                obstacle_tensor = torch.cat([obstacle_tensor, padding], dim=1)
-            elif obstacle_tensor.size(1) > self.config.max_obstacles:
-                obstacle_tensor = obstacle_tensor[:, :self.config.max_obstacles, :]
+            batch_obstacle_tensors.append(obstacle_tensor)
         
-        # Debug print to verify tensor shape
-        # print(f"Obstacle tensor shape: {obstacle_tensor.shape}")  # Should be (batch_size, max_obstacles, 4)
+        # Batch process all samples
+        batch_obstacle_tensor = torch.stack(batch_obstacle_tensors)  # [batch_size, max_obstacles, obstacle_feat_dim]
         
-        # Encode each obstacle individually
-        encoded_obstacles = self.obstacle_mlp(obstacle_tensor)  # (batch_size, max_obstacles, latent_dim)
+        # Reshaping for batch processing
+        batch_size, max_obs, feat_dim = batch_obstacle_tensor.shape
+        flattened_obstacles = batch_obstacle_tensor.view(-1, feat_dim)  # [batch_size * max_obstacles, feat_dim]
         
-        # Global aggregation using attention mechanism
-        obstacle_query = self.obstacle_query.expand(batch_size, -1, -1)  # (batch_size, 1, latent_dim)
+        # Batch encode all obstacles
+        encoded_obstacles = self.obstacle_mlp(flattened_obstacles)  # [batch_size * max_obstacles, obs_latent_dim]
         
-        # Simple attention-based aggregation
-        attention_weights = F.softmax(torch.bmm(obstacle_query, encoded_obstacles.transpose(1, 2)), dim=-1)
-        aggregated_obstacle = torch.bmm(attention_weights, encoded_obstacles)  # (batch_size, 1, latent_dim)
+        # Restore to original structure
+        encoded_obstacles = encoded_obstacles.view(batch_size, max_obs, -1)  # [batch_size, max_obstacles, obs_latent_dim]
         
-        # Final encoding
-        obstacle_emb = self.global_obstacle_encoder(aggregated_obstacle.squeeze(1))  # (batch_size, latent_dim)
+        # Create an effective mask (to exclude filled obstacles)
+        valid_mask = torch.zeros(batch_size, max_obs, device=device)
+        for i, count in enumerate(valid_counts):
+            if count > 0:
+                valid_mask[i, :count] = 1.0
         
-        return obstacle_emb
-    
+        # Perform average pooling on valid obstacles
+        masked_embeddings = encoded_obstacles * valid_mask.unsqueeze(-1)  # Apply mask
+        sum_embeddings = masked_embeddings.sum(dim=1)  # Sum [batch_size, obs_latent_dim]
+        valid_counts_tensor = torch.tensor(valid_counts, device=device).float().clamp(min=1.0)  # Avoid division by zero
+        
+        # Calculate the average
+        global_features = sum_embeddings / valid_counts_tensor.unsqueeze(-1)  # [batch_size, obs_latent_dim]
+        
+        return global_features
+
 # Condition Embedding with Obstacle Information
 class ConditionEmbedding(nn.Module):
     def __init__(self, config):
@@ -269,6 +226,7 @@ class ConditionEmbedding(nn.Module):
         
         # Obstacle embedding
         if obstacles_data is not None and self.config.enable_obstacle_encoding:
+            # print("obstacles are encoded.")
             obstacle_emb = self.obstacle_encoder(obstacles_data)
         else:
             obstacle_emb = torch.zeros_like(t_emb)
@@ -368,95 +326,155 @@ class ObstacleAwareDiffusionTransformer(nn.Module):
         mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
         return mask
 
-# CBF Barrier Function with Multiple Obstacles
-def compute_barrier_and_grad(x, config, mean, std, obstacles_data=None):
+# # CBF Barrier Function with Multiple Obstacles
+# def compute_barrier_and_grad(x, config, mean, std, obstacles_data=None):
+#     """
+#     Compute barrier V and its gradient ∇V for the trajectory x.
+#     Extended to handle multiple spherical obstacles.
+#     V = sum_τ sum_obs max(0, r_obs - ||pos_τ - center_obs||)^2
+#     ∇V affects only position components (indices 1:4).
+#     """
+#     # Denormalize positions for barrier computation
+#     # Uses std and mean to denormalize only position components (1:4)
+#     pos_denorm = x[:, :, 1:4] * std[0, 0, 1:4] + mean[0, 0, 1:4]
+#     batch_size, seq_len, _ = pos_denorm.shape
+    
+#     # Initialize barrier value and gradient
+#     V_total = torch.zeros(batch_size, device=x.device)
+#     # Gradient will be computed on the denormalized positions
+#     grad_pos_denorm = torch.zeros_like(pos_denorm, requires_grad=True)
+#     # Ensure pos_denorm requires grad for backprop
+#     pos_denorm = pos_denorm.clone().detach().requires_grad_(True)
+    
+#     # Process each obstacle
+#     if obstacles_data is not None:
+#         for batch_idx in range(batch_size):
+#             # Get obstacles for this sample
+#             batch_obs = obstacles_data[batch_idx] if batch_idx < len(obstacles_data) else []
+            
+#             for obstacle in batch_obs:
+#                 center = obstacle['center'].to(x.device)  # Shape: (3,)
+#                 radius = obstacle['radius']  # Scalar float
+                
+#                 # Euclidean distances from trajectory points to center
+#                 # Shape: (seq_len, 3) -> (seq_len,)
+#                 distances = torch.norm(pos_denorm[batch_idx] - center.unsqueeze(0), dim=1)
+                
+#                 # Closeness function: r - distance (positive means inside/near obstacle)
+#                 h = radius - distances
+                
+#                 # Barrier violation term: max(0, h)^2
+#                 violation = torch.clamp(h, min=0.0)
+#                 V_obstacle = torch.sum(violation ** 2)
+#                 V_total[batch_idx] += V_obstacle
+                
+#                 # Compute gradient for this obstacle
+#                 # The gradient of max(0, h)^2 with respect to pos_denorm is:
+#                 # 2 * max(0, h) * grad(h)
+#                 # grad(h) = grad(r - distances) = -grad(distances)
+#                 # grad(distances) = (pos_denorm - center) / distances (if distances > 0)
+                
+#                 # Compute mask for violated points (where h > 0, i.e., distance < radius)
+#                 violation_mask = (h > 0).float().unsqueeze(1) # (seq_len, 1)
+                
+#                 # Compute direction vector from center to point (pos_denorm - center)
+#                 direction_vec = pos_denorm[batch_idx] - center.unsqueeze(0) # (seq_len, 3)
+                
+#                 # Compute gradient of distance w.r.t pos_denorm
+#                 # Add small epsilon to distances to avoid div by zero
+#                 epsilon = 1e-6
+#                 grad_dist = direction_vec / (distances.unsqueeze(1) + epsilon) # (seq_len, 3)
+                
+#                 # Grad(V_obs) w.r.t. pos_denorm: 2 * violation * (-grad_dist)
+#                 grad_V_obs = -2 * violation.unsqueeze(1) * grad_dist
+                
+#                 # Apply violation mask (grad is 0 if not violated)
+#                 grad_V_obs = grad_V_obs * violation_mask
+                
+#                 # Accumulate gradients (note: pos_denorm is still a leaf node)
+#                 # We update the manually tracked gradient
+#                 grad_pos_denorm[batch_idx] += grad_V_obs
+    
+#     # Map the gradient back to the normalized space (x)
+#     # grad_x = grad_pos_denorm * (d(pos_denorm)/d(x))
+#     # pos_denorm = x[:, :, 1:4] * std + mean
+#     # d(pos_denorm)/d(x) = std
+#     grad_x = torch.zeros_like(x, device=x.device)
+#     grad_x[:, :, 1:4] = grad_pos_denorm / std[0, 0, 1:4].to(x.device)
+    
+#     # V_total is sum of barrier violations over all obstacles and timesteps in the batch
+#     V_avg = V_total.mean() 
+    
+#     # Print grad_V information
+#     print(f"grad_V shape: {grad_x.shape}")
+#     print(f"grad_V norm: {torch.norm(grad_x):.6f}")
+#     print(f"grad_V min/max: {grad_x.min():.6f} / {grad_x.max():.6f}")
+#     print(f"Total barrier value V: {V_total.mean().item():.6f}")
+
+#     return V_avg, grad_x
+
+def compute_barrier_and_grad(x, config, mean, std, obstacles_data=None, safety_margin = 0.20):
     """
     Compute barrier V and its gradient ∇V for the trajectory x.
-    Extended to handle multiple spherical obstacles.
-    V = sum_τ sum_obs max(0, r_obs - ||pos_τ - center_obs||)^2
-    ∇V affects only position components (indices 1:4).
+    Fixed version with proper gradient computation.
     """
     # Denormalize positions for barrier computation
-    # Uses std and mean to denormalize only position components (1:4)
     pos_denorm = x[:, :, 1:4] * std[0, 0, 1:4] + mean[0, 0, 1:4]
     batch_size, seq_len, _ = pos_denorm.shape
     
-    # Initialize barrier value and gradient
+    # 关键修复：创建一个不需要梯度的张量来累积梯度
+    grad_pos_denorm = torch.zeros_like(pos_denorm)
+    
+    # 确保pos_denorm可以计算梯度（如果需要自动微分的话）
+    # 但这里我们手动计算梯度，所以不需要
+    pos_denorm = pos_denorm.clone().detach()
+    
+    # Initialize barrier value
     V_total = torch.zeros(batch_size, device=x.device)
-    # Gradient will be computed on the denormalized positions
-    grad_pos_denorm = torch.zeros_like(pos_denorm, requires_grad=True)
-    # Ensure pos_denorm requires grad for backprop
-    pos_denorm = pos_denorm.clone().detach().requires_grad_(True)
     
     # Process each obstacle
     if obstacles_data is not None:
-        # Handle obstacles_data: list-of-lists (per-batch) or single list (broadcast)
-        if not isinstance(obstacles_data, list):
-            obstacles_data = [obstacles_data] * batch_size  # Broadcast to batch
-
         for batch_idx in range(batch_size):
             # Get obstacles for this sample
             batch_obs = obstacles_data[batch_idx] if batch_idx < len(obstacles_data) else []
             
             for obstacle in batch_obs:
-                center = obstacle['center'].to(x.device)  # Shape: (3,)
-                radius = obstacle['radius']  # Scalar float
+                center = obstacle['center'].to(x.device)
+                radius = obstacle['radius'] + safety_margin  # Add safety margin
                 
-                # Euclidean distances from trajectory points to center
-                # Shape: (seq_len, 3) -> (seq_len,)
+                # Euclidean distances
                 distances = torch.norm(pos_denorm[batch_idx] - center.unsqueeze(0), dim=1)
                 
-                # Closeness function: r - distance (positive means inside/near obstacle)
-                h = radius - distances
+                # Closeness function: r - distance
+                h = radius * radius - distances * distances
                 
                 # Barrier violation term: max(0, h)^2
                 violation = torch.clamp(h, min=0.0)
-                V_obstacle = torch.sum(violation ** 2)
+                V_obstacle = torch.sum(violation) # sum( min(0, r^2 - d^2  ) r^2 - d^2 = r^2 - ||p - c||^2
                 V_total[batch_idx] += V_obstacle
                 
                 # Compute gradient for this obstacle
-                # The gradient of max(0, h)^2 with respect to pos_denorm is:
-                # 2 * max(0, h) * grad(h)
-                # grad(h) = grad(r - distances) = -grad(distances)
-                # grad(distances) = (pos_denorm - center) / distances (if distances > 0)
+                violation_mask = (h > 0).float().unsqueeze(1)
+                direction_vec = pos_denorm[batch_idx] - center.unsqueeze(0)
                 
-                # Compute mask for violated points (where h > 0, i.e., distance < radius)
-                violation_mask = (h > 0).float().unsqueeze(1) # (seq_len, 1)
-                
-                # Compute direction vector from center to point (pos_denorm - center)
-                direction_vec = pos_denorm[batch_idx] - center.unsqueeze(0) # (seq_len, 3)
-                
-                # Compute gradient of distance w.r.t pos_denorm
-                # Add small epsilon to distances to avoid div by zero
                 epsilon = 1e-6
-                grad_dist = direction_vec / (distances.unsqueeze(1) + epsilon) # (seq_len, 3)
+                grad_dist = direction_vec / (distances.unsqueeze(1) + epsilon) # (p - center) / distance
                 
-                # Grad(V_obs) w.r.t. pos_denorm: 2 * violation * (-grad_dist)
-                grad_V_obs = -2 * violation.unsqueeze(1) * grad_dist
+                # Grad(V_obs) = -2 * violation * grad_dist
+                grad_V_obs = -2 * direction_vec * violation_mask # 2 *
+                # grad_V_obs = grad_V_obs * violation_mask
                 
-                # Apply violation mask (grad is 0 if not violated)
-                grad_V_obs = grad_V_obs * violation_mask
-                
-                # Accumulate gradients (note: pos_denorm is still a leaf node)
-                # We update the manually tracked gradient
-                grad_pos_denorm[batch_idx] += grad_V_obs
+                # 安全地累积梯度
+                grad_pos_denorm[batch_idx] = grad_pos_denorm[batch_idx] + grad_V_obs
     
-    # Map the gradient back to the normalized space (x)
-    # grad_x = grad_pos_denorm * (d(pos_denorm)/d(x))
-    # pos_denorm = x[:, :, 1:4] * std + mean
-    # d(pos_denorm)/d(x) = std
+    # Map gradient back to normalized space
     grad_x = torch.zeros_like(x, device=x.device)
-    grad_x[:, :, 1:4] = grad_pos_denorm / std[0, 0, 1:4].to(x.device)
+    std_scaled = std[0, 0, 1:4].to(x.device)
+    grad_x[:, :, 1:4] = grad_pos_denorm / std_scaled
     
-    # V_total is sum of barrier violations over all obstacles and timesteps in the batch
-    V_avg = V_total.mean() 
+    # V_total is sum of barrier violations
+    V_avg = V_total.mean()
     
-    # Print grad_V information
-    print(f"grad_V shape: {grad_x.shape}")
-    print(f"grad_V norm: {torch.norm(grad_x):.6f}")
-    print(f"grad_V min/max: {grad_x.min():.6f} / {grad_x.max():.6f}")
-    print(f"Total barrier value V: {V_total.mean().item():.6f}")
-
     return V_avg, grad_x
 
 # Diffusion Process with Obstacle-Aware Sampling
@@ -514,12 +532,12 @@ class ObstacleAwareDiffusionProcess:
             sqrt_alpha_bar_t = torch.sqrt(alpha_bar_t)
             sqrt_one_minus_alpha_bar_t = torch.sqrt(one_minus_alpha_bar_t)
             # Predict noise ε_pred = (x_t - sqrt(α_bar_t) * pred_x0) / sqrt(1 - α_bar_t)
-            mu_pred = (x_t - sqrt_alpha_bar_t * pred_x0) / sqrt_one_minus_alpha_bar_t
+            ε_pred = (x_t - sqrt_alpha_bar_t * pred_x0) / sqrt_one_minus_alpha_bar_t
             
             barrier_info = None
             if enable_guidance and guidance_gamma is not None and mean is not None and std is not None:
                 # Compute γ_t (scheduled: strongest at t=0 for final safety enforcement)
-                gamma_t = guidance_gamma * (1.0 - t_exp.squeeze(1).float() / self.diffusion_steps)
+                gamma_t = guidance_gamma * (1.0 - t_exp.squeeze(1).float() / self.config.diffusion_steps)
                 
                 # Compute barrier gradient ∇V with multiple obstacles
                 V, grad_V = compute_barrier_and_grad(pred_x0, self.config, mean, std, obstacles_data)
@@ -527,14 +545,18 @@ class ObstacleAwareDiffusionProcess:
                 # print(barrier_info)
                 # Guided score: s_guided = s_theta - γ_t ∇V
                 sigma_t = sqrt_one_minus_alpha_bar_t
-                ε_guided = mu_pred - gamma_t.view(batch_size, 1, 1) * grad_V * sigma_t
-                
-                s_norm = torch.norm(mu_pred, dim=(1,2), keepdim=True)
+                # ε_guided = mu_pred - gamma_t.view(batch_size, 1, 1) * grad_V
+                # norm(grad_V) << norm(mu_pred), sigma_t: 1->0, gamma_t: 0->guidance_gamma
+                ε_guided = ε_pred + gamma_t.view(batch_size, 1, 1) * grad_V * sqrt_one_minus_alpha_bar_t
+                # ε_pred = score_function * - sqrt_one_minus_alpha_bar_t
+                # norm(score_function) = norm(ε_pred) / sigma_t; norm(ε_pred)^2 ~ χ2(D) 
+
+                s_norm = torch.norm(ε_pred, dim=(1,2), keepdim=True)
                 grad_norm = torch.norm(gamma_t.view(batch_size, 1, 1) * grad_V, dim=(1,2), keepdim=True)
-                print("s_norm: ", s_norm, "grad_norm: ", grad_norm, "[s_norm / grad_norm]: ", s_norm / (grad_norm + 1e-8), "gamma_t: ", gamma_t)
+                print("s_norm: ", s_norm, "grad_norm: ", grad_norm,  "gamma_t: ", gamma_t, "sigma_t: ", sigma_t)
 
             else:
-                ε_guided = mu_pred
+                ε_guided = ε_pred
             
             # Compute mean μ using guided noise (standard DDPM formula)
             coeff = (1 - alpha_t) / sqrt_one_minus_alpha_bar_t
@@ -599,19 +621,19 @@ class ObstacleAwareDiffusionProcess:
         ax1.plot(x_prev_pos[:, 0], x_prev_pos[:, 1], x_prev_pos[:, 2], 'b-', label='x_prev (denoised)', linewidth=2, alpha=0.7)
         
         # Plot obstacles if available (assumes centers are already denormalized)
-        if obstacles_data:
-            for obstacle in obstacles_data:
-                center = obstacle['center'].cpu().numpy() if hasattr(obstacle['center'], 'cpu') else obstacle['center']
-                radius = obstacle['radius']
+        # if obstacles_data:
+        #     for obstacle in obstacles_data:
+        #         center = obstacle['center'].cpu().numpy() if hasattr(obstacle['center'], 'cpu') else obstacle['center']
+        #         radius = obstacle['radius']
                 
-                # Create sphere surface for 3D visualization
-                u = np.linspace(0, 2 * np.pi, 10)
-                v = np.linspace(0, np.pi, 10)
-                x_sphere = center[0] + radius * np.outer(np.cos(u), np.sin(v))
-                y_sphere = center[1] + radius * np.outer(np.sin(u), np.sin(v))
-                z_sphere = center[2] + radius * np.outer(np.ones(np.size(u)), np.cos(v))
+        #         # Create sphere surface for 3D visualization
+        #         u = np.linspace(0, 2 * np.pi, 10)
+        #         v = np.linspace(0, np.pi, 10)
+        #         x_sphere = center[0] + radius * np.outer(np.cos(u), np.sin(v))
+        #         y_sphere = center[1] + radius * np.outer(np.sin(u), np.sin(v))
+        #         z_sphere = center[2] + radius * np.outer(np.ones(np.size(u)), np.cos(v))
                 
-                ax1.plot_surface(x_sphere, y_sphere, z_sphere, alpha=0.3, color='red')
+        #         ax1.plot_surface(x_sphere, y_sphere, z_sphere, alpha=0.3, color='red')
         
         # Set fixed equal-range limits for X/Y/Z to prevent distortion (spheres look spherical)
         ax1.set_xlim(fixed_min[0], fixed_max[0])
@@ -754,9 +776,6 @@ class AeroDM(nn.Module):
         """Set obstacles data: must be list of list of dicts"""
         if obstacles_data is None:
             self.obstacles_data = None
-        elif isinstance(obstacles_data, list) and len(obstacles_data) > 0 and isinstance(obstacles_data[0], dict):
-            # Single trajectory → wrap
-            self.obstacles_data = [obstacles_data]
         else:
             self.obstacles_data = obstacles_data
         print(f"Set obstacles_data: {len(self.obstacles_data) if self.obstacles_data else 0} batches")
@@ -807,7 +826,7 @@ class AeroDM(nn.Module):
             plot_step = plot_all_steps or (t_step % max(1, self.config.diffusion_steps // 5) == 0) or t_step == 0
             
             # debug: 
-            plot_step = False
+            # plot_step = False
             x_t = self.diffusion_process.p_sample(
                 self.diffusion_model, x_t, t_batch, target, action, history, enable_guidance,
                 gamma, self.mean, self.std, plot_step=plot_step, step_idx=step_counter,
@@ -830,7 +849,7 @@ class AeroDMLoss(nn.Module):
     Supports switching obstacle term via flag; always returns 4 values for consistency.
     Fixes: Proper safety margin for obstacles, Z-weighting, normalization by avg obstacles.
     """
-    def __init__(self, config, enable_obstacle_term=False, safe_extra_factor=0.2, z_weight=1.5, obstacle_weight=10.0, continuity_weight=15.0):
+    def __init__(self, config, enable_obstacle_term=False, safe_extra_factor=0.2, xyz_weight=1.5, obstacle_weight=10.0, continuity_weight=15.0):
         super().__init__()
         self.config = config
         # Flag to enable/disable obstacle distance penalty in total loss
@@ -838,7 +857,7 @@ class AeroDMLoss(nn.Module):
         # Safety buffer beyond obstacle surface (as fraction of radius, e.g., 0.2 = 20%)
         self.safe_extra_factor = safe_extra_factor
         # Extra weight for Z-axis losses (height is critical in aviation trajectories)
-        self.z_weight = z_weight
+        self.xyz_weight = xyz_weight
         # Scaling factor for the entire obstacle loss term
         self.obstacle_weight = obstacle_weight
         # Weight for continuity loss
@@ -869,10 +888,6 @@ class AeroDMLoss(nn.Module):
         pos_std = std[0, 0, 1:4]
         pos_mean = mean[0, 0, 1:4]
         pred_pos_denorm = pred_trajectory[:, :, 1:4] * pos_std + pos_mean
-        
-        # Handle obstacles_data: list-of-lists (per-batch) or single list (broadcast)
-        if not isinstance(obstacles_data, list):
-            obstacles_data = [obstacles_data] * batch_size  # Broadcast to batch
         
         # Loop over batch samples
         for batch_idx in range(batch_size):
@@ -926,23 +941,23 @@ class AeroDMLoss(nn.Module):
         gt_pos = gt_trajectory[:, :, 1:4]
         pred_speed = pred_trajectory[:, :, 0:1]  # (B, T, 1) - speed
         gt_speed = gt_trajectory[:, :, 0:1]
-        pred_attitude = pred_trajectory[:, :, 4:]  # (B, T, 6) - attitude (roll/pitch/yaw approx)
-        gt_attitude = gt_trajectory[:, :, 4:]
+        pred_attitude = pred_trajectory[:, :, 4:10]  # (B, T, 6) - attitude (roll/pitch/yaw approx)
+        gt_attitude = gt_trajectory[:, :, 4:10]
         
         # Position losses: Per-dimension MSE
-        x_loss = self.mse_loss(pred_pos[:, :, 0], gt_pos[:, :, 0])
-        y_loss = self.mse_loss(pred_pos[:, :, 1], gt_pos[:, :, 1])
+        x_loss = self.xyz_weight * self.mse_loss(pred_pos[:, :, 0], gt_pos[:, :, 0])
+        y_loss = self.xyz_weight * self.mse_loss(pred_pos[:, :, 1], gt_pos[:, :, 1])
         # Z loss with extra weight for height accuracy
-        z_loss = self.z_weight * self.mse_loss(pred_pos[:, :, 2], gt_pos[:, :, 2])
+        z_loss = self.xyz_weight * self.mse_loss(pred_pos[:, :, 2], gt_pos[:, :, 2])
         
         # Last time-step losses (higher weight for endpoint accuracy)
-        last_x_loss = self.mse_loss(pred_pos[:, -1, 0], gt_pos[:, -1, 0])
-        last_y_loss = self.mse_loss(pred_pos[:, -1, 1], gt_pos[:, -1, 1])
-        last_z_loss = self.z_weight * self.mse_loss(pred_pos[:, -1, 2], gt_pos[:, -1, 2])
+        last_x_loss = self.xyz_weight * self.mse_loss(pred_pos[:, -1, 0], gt_pos[:, -1, 0])
+        last_y_loss = self.xyz_weight * self.mse_loss(pred_pos[:, -1, 1], gt_pos[:, -1, 1])
+        last_z_loss = self.xyz_weight * self.mse_loss(pred_pos[:, -1, 2], gt_pos[:, -1, 2])
         
+        last_xyz_loss = last_x_loss + last_y_loss + last_z_loss
         # Combine: Base + 10x last point
-        position_loss = (x_loss + y_loss + z_loss + 
-                         10.0 * (last_x_loss + last_y_loss + last_z_loss))
+        position_loss = x_loss + y_loss + z_loss
         
         # Velocity loss: From position differences (assumes uniform dt=1)
         if seq_len > 1:
@@ -950,9 +965,9 @@ class AeroDMLoss(nn.Module):
             pred_vel = pred_pos[:, 1:, :] - pred_pos[:, :-1, :]
             gt_vel = gt_pos[:, 1:, :] - gt_pos[:, :-1, :]
             # Per-dimension MSE on velocities
-            vel_x_loss = self.mse_loss(pred_vel[:, :, 0], gt_vel[:, :, 0])
-            vel_y_loss = self.mse_loss(pred_vel[:, :, 1], gt_vel[:, :, 1])
-            vel_z_loss = self.z_weight * self.mse_loss(pred_vel[:, :, 2], gt_vel[:, :, 2])
+            vel_x_loss = self.xyz_weight * self.mse_loss(pred_vel[:, :, 0], gt_vel[:, :, 0])
+            vel_y_loss = self.xyz_weight * self.mse_loss(pred_vel[:, :, 1], gt_vel[:, :, 1])
+            vel_z_loss = self.xyz_weight * self.mse_loss(pred_vel[:, :, 2], gt_vel[:, :, 2])
             vel_loss = vel_x_loss + vel_y_loss + vel_z_loss
         else:
             # No velocity if single timestep
@@ -976,15 +991,16 @@ class AeroDMLoss(nn.Module):
             first_pred_pos = pred_trajectory[:, 0, 1:4]
             continuity_loss = self.mse_loss(first_pred_pos, last_history_pos)
             
+            continuity_loss += self.mse_loss(pred_pos[:, :-1, 0:1], pred_pos[:, 1:, 0:1])
+
             # Optional: Add velocity continuity (delta from last history to first pred)
-            if history.size(1) > 1:
-                last_history_vel = history[:, -1, 1:4] - history[:, -2, 1:4]
-                first_pred_vel = pred_trajectory[:, 0, 1:4] - last_history_pos # Approx
-                continuity_loss += self.mse_loss(first_pred_vel, last_history_vel)
+            # if history.size(1) > 1:
+            #     last_history_vel = history[:, -1, 1:4] - history[:, -2, 1:4]
+            #     first_pred_vel = pred_trajectory[:, 0, 1:4] - last_history_pos # Approx
+            #     continuity_loss += self.mse_loss(first_pred_vel, last_history_vel)
         
         # Total weighted loss
-        total_loss = (2.0 * position_loss + 1.5 * vel_loss + other_loss + 
-                      self.obstacle_weight * obstacle_loss + self.continuity_weight * continuity_loss)
+        total_loss = 1 * last_xyz_loss + 0.01 * position_loss + 0 * vel_loss + other_loss + self.obstacle_weight * obstacle_loss + self.continuity_weight * continuity_loss
         
         return total_loss, position_loss, vel_loss, obstacle_loss, continuity_loss
 
@@ -1044,271 +1060,6 @@ def generate_history_segments(trajectories, history_len, device=None):
             history_segment = torch.cat([history_segment, padding], dim=0)
         histories.append(history_segment)
     return torch.stack(histories)
-
-def generate_aerobatic_trajectories(num_trajectories, seq_len, height=10.0, radius=5.0):
-    """Generates synthetic aerobatic trajectories (Power Loop, Barrel Roll, Split S, Immelmann, Wall Ride, Figure Eight, Star, Half Moon, Sphinx, Clover)."""
-    trajectories = []
-    maneuver_styles = ['power_loop', 'barrel_roll', 'split_s', 'immelmann', 'wall_ride', 'eight_figure', 'star', 'half_moon', 'sphinx', 'clover', 'spiral_inward', 'spiral_outward', 'spiral_vertical_up', 'spiral_vertical_down' ]
-    
-    def smooth_trajectory(positions, smoothing_factor=0.1):
-        # """Apply smoothing to trajectory positions using a simple moving average"""
-        # smoothed = np.zeros_like(positions)
-        # for i in range(len(positions)):
-        #     start_idx = max(0, i - 1)
-        #     end_idx = min(len(positions), i + 2)
-        #     smoothed[i] = np.mean(positions[start_idx:end_idx], axis=0)
-        # return smoothing_factor * smoothed + (1 - smoothing_factor) * positions
-        return positions # Keeping the original simple implementation
-        
-    for i in range(num_trajectories):
-        # Randomly select a maneuver style
-        style = np.random.choice(maneuver_styles)
-        
-        # Random centers and scales
-        center_x = np.random.uniform(-20, 20)
-        center_y = np.random.uniform(-20, 20)
-        center_z = height + np.random.uniform(-10, 10)
-        current_radius = radius * np.random.uniform(0.8, 1.2)
-        angular_velocity = np.random.uniform(0.5, 2.0)
-        
-        # Normalize time steps to [0, 1] - exactly one period
-        norm_t = np.linspace(0, 1, seq_len)
-        
-        # Compute positions and velocities based on style
-        if style == 'power_loop':
-            # Full vertical loop in xz plane, starting at bottom with forward velocity
-            theta = np.pi * norm_t * angular_velocity
-            x = center_x - current_radius * (1 - np.cos(theta))
-            y = np.full(seq_len, center_y)
-            z = center_z + current_radius * np.sin(theta)
-            vx = -current_radius * angular_velocity * np.pi * np.sin(theta)
-            vy = np.zeros(seq_len)
-            vz = current_radius * angular_velocity * np.pi * np.cos(theta)
-
-        elif style == 'barrel_roll':
-            # Helical motion
-            pitch = np.random.uniform(5.0, 10.0)
-            theta = 2 * np.pi * norm_t * angular_velocity
-            x = center_x + current_radius * np.cos(theta)
-            y = center_y + current_radius * np.sin(theta)
-            z = center_z + pitch * norm_t
-            vx = -current_radius * angular_velocity * 2 * np.pi * np.sin(theta)
-            vy = current_radius * angular_velocity * 2 * np.pi * np.cos(theta)
-            vz = np.full(seq_len, pitch)
-
-        elif style == 'split_s':
-            # Half loop down, then inverted flight and recovery
-            theta = np.pi * norm_t
-            x = center_x + current_radius * np.sin(theta)
-            y = np.full(seq_len, center_y)
-            z = center_z - current_radius * (1 - np.cos(theta))
-            vx = current_radius * np.pi * np.cos(theta)
-            vy = np.zeros(seq_len)
-            vz = -current_radius * np.pi * np.sin(theta)
-
-        elif style == 'immelmann':
-            # Half loop up, then half roll to recover
-            theta = np.pi * norm_t
-            x = center_x + current_radius * np.sin(theta)
-            y = np.full(seq_len, center_y)
-            z = center_z + current_radius * (1 - np.cos(theta))
-            vx = current_radius * np.pi * np.cos(theta)
-            vy = np.zeros(seq_len)
-            vz = current_radius * np.pi * np.sin(theta)
-
-        elif style == 'wall_ride':
-            # Vertical helix climb (spiral up)
-            turns = np.random.uniform(0.5, 1.5) # Number of turns
-            climb_height = np.random.uniform(20.0, 40.0)
-            theta = 2 * np.pi * turns * norm_t * angular_velocity
-            x = center_x + current_radius * np.cos(theta)
-            y = center_y + current_radius * np.sin(theta)
-            z = center_z + climb_height * norm_t
-            vx = -current_radius * angular_velocity * 2 * np.pi * turns * np.sin(theta)
-            vy = current_radius * angular_velocity * 2 * np.pi * turns * np.cos(theta)
-            vz = np.full(seq_len, climb_height)
-        
-        elif style == 'eight_figure':
-            # Figure eight in the xy plane
-            theta = 2 * np.pi * norm_t
-            x = center_x + current_radius * np.sin(theta)
-            y = center_y + 0.5 * current_radius * np.sin(2 * theta)
-            z = np.full(seq_len, center_z)
-            vx = current_radius * 2 * np.pi * np.cos(theta)
-            vy = 0.5 * current_radius * 4 * np.pi * np.cos(2 * theta)
-            vz = np.zeros(seq_len)
-
-        elif style == 'star':
-            # 3D Star/Lissajous-like curve
-            alpha = 2.0
-            beta = 3.0
-            x = center_x + current_radius * np.sin(2 * np.pi * alpha * norm_t)
-            y = center_y + current_radius * np.cos(2 * np.pi * beta * norm_t)
-            z = center_z + current_radius * 0.5 * np.sin(2 * np.pi * (alpha + beta) * norm_t)
-            vx = current_radius * 2 * np.pi * alpha * np.cos(2 * np.pi * alpha * norm_t)
-            vy = -current_radius * 2 * np.pi * beta * np.sin(2 * np.pi * beta * norm_t)
-            vz = current_radius * 0.5 * 2 * np.pi * (alpha + beta) * np.cos(2 * np.pi * (alpha + beta) * norm_t)
-
-        elif style == 'half_moon':
-            # Semicircle arc, primarily in xy plane, with some small z variation
-            theta = np.pi * norm_t
-            x = center_x + current_radius * np.cos(theta)
-            y = center_y + current_radius * np.sin(theta)
-            z = center_z + 0.1 * current_radius * np.sin(theta)
-            vx = -current_radius * np.pi * np.sin(theta)
-            vy = current_radius * np.pi * np.cos(theta)
-            vz = 0.1 * current_radius * np.pi * np.cos(theta)
-
-        elif style == 'sphinx':
-            # Similar to wall ride, but with pitch variation for 'nose-up' maneuver
-            turns = np.random.uniform(0.5, 1.5)
-            climb_height = np.random.uniform(10.0, 30.0)
-            theta = 2 * np.pi * turns * norm_t * angular_velocity
-            x = center_x + current_radius * np.cos(theta)
-            y = center_y + current_radius * np.sin(theta)
-            z = center_z + climb_height * norm_t + 5 * np.sin(np.pi * norm_t) # Pitch variation
-            vx = -current_radius * angular_velocity * 2 * np.pi * turns * np.sin(theta)
-            vy = current_radius * angular_velocity * 2 * np.pi * turns * np.cos(theta)
-            vz = np.full(seq_len, climb_height) + 5 * np.pi * np.cos(np.pi * norm_t)
-
-        elif style == 'clover':
-            # Four leaf clover shape (like two overlapping figure eights)
-            alpha = 2.0
-            x = center_x + current_radius * np.cos(2 * np.pi * norm_t) * np.cos(2 * np.pi * alpha * norm_t)
-            y = center_y + current_radius * np.cos(2 * np.pi * norm_t) * np.sin(2 * np.pi * alpha * norm_t)
-            z = np.full(seq_len, center_z)
-            # Use gradient for velocity approximation (too complex to derive analytically)
-            x_smooth = smooth_trajectory(x)
-            y_smooth = smooth_trajectory(y)
-            z_smooth = smooth_trajectory(z)
-            dt = 1.0 / seq_len
-            vx = np.gradient(x_smooth, dt)
-            vy = np.gradient(y_smooth, dt)
-            vz = np.gradient(z_smooth, dt)
-            x, y, z = x_smooth, y_smooth, z_smooth
-
-        elif style == 'spiral_inward':
-            # Horizontal spiral moving inward (contracting spiral)
-            turns = np.random.uniform(1.0, 3.0)  # Number of turns
-            start_radius = current_radius * np.random.uniform(1.5, 2.5)
-            end_radius = current_radius * 0.2
-            theta = 2 * np.pi * turns * norm_t * angular_velocity
-            
-            # Radius decreases over time
-            radius_t = start_radius + (end_radius - start_radius) * norm_t
-            
-            x = center_x + radius_t * np.cos(theta)
-            y = center_y + radius_t * np.sin(theta)
-            z = np.full(seq_len, center_z)
-            
-            # Analytical velocities
-            dr_dt = (end_radius - start_radius)  # Constant rate of radius change
-            vx = dr_dt * np.cos(theta) - radius_t * angular_velocity * 2 * np.pi * turns * np.sin(theta)
-            vy = dr_dt * np.sin(theta) + radius_t * angular_velocity * 2 * np.pi * turns * np.cos(theta)
-            vz = np.zeros(seq_len)
-
-        elif style == 'spiral_outward':
-            # Horizontal spiral moving outward (expanding spiral)
-            turns = np.random.uniform(1.0, 3.0)  # Number of turns
-            start_radius = current_radius * 0.2
-            end_radius = current_radius * np.random.uniform(1.5, 2.5)
-            theta = 2 * np.pi * turns * norm_t * angular_velocity
-            
-            # Radius increases over time
-            radius_t = start_radius + (end_radius - start_radius) * norm_t
-            
-            x = center_x + radius_t * np.cos(theta)
-            y = center_y + radius_t * np.sin(theta)
-            z = np.full(seq_len, center_z)
-            
-            # Analytical velocities
-            dr_dt = (end_radius - start_radius)  # Constant rate of radius change
-            vx = dr_dt * np.cos(theta) - radius_t * angular_velocity * 2 * np.pi * turns * np.sin(theta)
-            vy = dr_dt * np.sin(theta) + radius_t * angular_velocity * 2 * np.pi * turns * np.cos(theta)
-            vz = np.zeros(seq_len)
-
-        elif style == 'spiral_vertical_up':
-            # Vertical spiral moving upward (in xz or yz plane)
-            plane_choice = np.random.choice(['xz', 'yz'])
-            turns = np.random.uniform(1.0, 3.0)  # Number of turns
-            climb_height = np.random.uniform(15.0, 35.0)
-            theta = 2 * np.pi * turns * norm_t * angular_velocity
-            
-            if plane_choice == 'xz':
-                # Spiral in xz plane
-                x = center_x + current_radius * np.cos(theta)
-                y = np.full(seq_len, center_y)
-                z = center_z + climb_height * norm_t
-                vx = -current_radius * angular_velocity * 2 * np.pi * turns * np.sin(theta)
-                vy = np.zeros(seq_len)
-                vz = np.full(seq_len, climb_height)
-            else:
-                # Spiral in yz plane
-                x = np.full(seq_len, center_x)
-                y = center_y + current_radius * np.cos(theta)
-                z = center_z + climb_height * norm_t
-                vx = np.zeros(seq_len)
-                vy = -current_radius * angular_velocity * 2 * np.pi * turns * np.sin(theta)
-                vz = np.full(seq_len, climb_height)
-
-        elif style == 'spiral_vertical_down':
-            # Vertical spiral moving downward (in xz or yz plane)
-            plane_choice = np.random.choice(['xz', 'yz'])
-            turns = np.random.uniform(1.0, 3.0)  # Number of turns
-            descent_height = np.random.uniform(15.0, 35.0)
-            theta = 2 * np.pi * turns * norm_t * angular_velocity
-            
-            if plane_choice == 'xz':
-                # Spiral in xz plane
-                x = center_x + current_radius * np.cos(theta)
-                y = np.full(seq_len, center_y)
-                z = center_z - descent_height * norm_t
-                vx = -current_radius * angular_velocity * 2 * np.pi * turns * np.sin(theta)
-                vy = np.zeros(seq_len)
-                vz = np.full(seq_len, -descent_height)
-            else:
-                # Spiral in yz plane
-                x = np.full(seq_len, center_x)
-                y = center_y + current_radius * np.cos(theta)
-                z = center_z - descent_height * norm_t
-                vx = np.zeros(seq_len)
-                vy = -current_radius * angular_velocity * 2 * np.pi * turns * np.sin(theta)
-                vz = np.full(seq_len, -descent_height)
-
-        else:
-            # Simple straight line (fallback)
-            x = center_x + norm_t * 10
-            y = np.full(seq_len, center_y)
-            z = np.full(seq_len, center_z)
-            vx = np.full(seq_len, 10.0)
-            vy = np.zeros(seq_len)
-            vz = np.zeros(seq_len)
-
-        # Smooth and re-calculate velocity if not done above
-        if style not in ['clover', 'spiral_inward', 'spiral_outward', 'spiral_vertical_up', 'spiral_vertical_down']:
-            x_smooth = smooth_trajectory(x)
-            y_smooth = smooth_trajectory(y)
-            z_smooth = smooth_trajectory(z)
-            dt = 1.0 / seq_len
-            vx = np.gradient(x_smooth, dt)
-            vy = np.gradient(y_smooth, dt)
-            vz = np.gradient(z_smooth, dt)
-            x, y, z = x_smooth, y_smooth, z_smooth
-        
-        # Compute speed and direction
-        speed = np.sqrt(vx**2 + vy**2 + vz**2)
-        direction = np.stack([vx, vy, vz], axis=-1)
-        norms = np.linalg.norm(direction, axis=-1, keepdims=True)
-        direction = np.divide(direction, norms, where=norms>0, out=np.zeros_like(direction))
-        
-        # Attitude: direction + fixed components (e.g., for roll/pitch/yaw approximation)
-        attitude = np.concatenate([direction, np.full((seq_len, 3), 0.1)], axis=-1)
-        
-        # Full state: [speed, x, y, z, attitude(6)]
-        state = np.column_stack([speed, x, y, z, attitude])
-        trajectories.append(state)
-        
-    return torch.tensor(np.stack(trajectories), dtype=torch.float32)
 
 def generate_colliding_obstacles(trajectory, num_obstacles_range=(1, 5), radius_range=(0.5, 2.0), 
                                min_collision_points=1, max_attempts=100, device='cpu'):
@@ -1541,7 +1292,8 @@ def generate_random_obstacles(trajectory, num_obstacles_range=(1, 5), radius_ran
                 print(f"Warning: Could not place obstacle {i} without collision after {max_attempts} attempts. Skipping.")
                 continue
         else:
-            center = np.random.uniform(expanded_min, expanded_max)
+            # center = np.random.uniform(expanded_min, expanded_max)
+            center = traj_pos[np.random.randint(10, len(traj_pos))] + [0.3, 0.3, 0.3]
             # Sample a random radius within the given range
             radius = np.random.uniform(radius_range[0], radius_range[1])
 
@@ -1864,18 +1616,20 @@ def test_model_performance(model, trajectories_norm, mean, std, num_test_samples
             # Prepare test sample
             full_traj = trajectories_norm[i:i+1]
             target_norm = generate_target_waypoints(full_traj)
-            action = generate_action_styles(1, config.action_dim, device=device)
+
             history = generate_history_segments(full_traj, config.history_len, device=device)
             x_0 = full_traj[:, config.history_len:, :]
-            
+            style_indices = x_0[:, 0, -1].long()  # Use style index from first timestep
+            action = F.one_hot(style_indices, num_classes=config.action_dim).float()
+
             # Denormalize for obstacle generation and plotting
             x_0_denorm = denormalize_trajectories(x_0, mean, std)
             target_denorm = target_norm * std[0, 0, 1:4] + mean[0, 0, 1:4]
             
             # Generate random obstacles
             obstacles = generate_random_obstacles(x_0_denorm[0], 
-                                                  num_obstacles_range=(1, 3), 
-                                                  radius_range=(0.2, 0.3), 
+                                                  num_obstacles_range=(1, 1), 
+                                                  radius_range=(1.2, 2.3), 
                                                   check_collision=False, 
                                                   device=device)
             
@@ -1943,42 +1697,131 @@ def format_progress(epoch, num_epochs, start_time, avg_total, avg_position, avg_
     return f"\rEpoch {(epoch+1):4d}/{num_epochs} [{bar}] {progress*100:5.1f}% | Time: {time.time()-start_time:6.2f}s | {loss_info}"
 
 def generate_trj_demos():
-# Generate example enhanced circular trajectories for demonstration
+    # Generate example enhanced circular trajectories for demonstration
     print("Generating example enhanced circular trajectories...")
     demo_trajectories = generate_aerobatic_trajectories(num_trajectories=18, seq_len=60)
     
+    # Extract style indices from the trajectories (last dimension)
+    # Style index is stored as the last element in the state vector
+    style_indices = demo_trajectories[:, 0, -1].long().numpy()
+    
+    # Define style names mapping (same as in generate_aerobatic_trajectories)
+    style_names = {
+        0: 'power_loop',
+        1: 'barrel_roll',
+        2: 'split_s',
+        3: 'immelmann',
+        4: 'wall_ride',
+        5: 'eight_figure',
+        6: 'star',
+        7: 'half_moon',
+        8: 'sphinx',
+        9: 'clover',
+        10: 'spiral_inward',
+        11: 'spiral_outward',
+        12: 'spiral_vertical_up',
+        13: 'spiral_vertical_down'
+    }
+    
+    # Get style names for each trajectory
+    trajectory_styles = [style_names.get(idx, 'unknown') for idx in style_indices]
+    
     # Visualize some training data with z-axis focus
     fig = plt.figure(figsize=(15, 10))
+    fig.suptitle('Enhanced Circular Trajectories with Style Information', fontsize=16, fontweight='bold')
+    
     for i in range(6):
+        # First row: Trajectories 1-6
         ax = fig.add_subplot(3, 6, i+1, projection='3d')
         trajectory = demo_trajectories[i, :, 1:4].numpy()
-        ax.plot(trajectory[:, 0], trajectory[:, 1], trajectory[:, 2], 'b-', linewidth=2)
-        ax.set_title(f'Enhanced Circular Trajectory {i+1}')
-        ax.set_xlabel('X')
-        ax.set_ylabel('Y')
-        ax.set_zlabel('Z')
-        ax.grid(True)
+        style = trajectory_styles[i]
         
-        ax = fig.add_subplot(3, 6, i+6+1, projection='3d')
+        # Color coding based on style
+        if 'loop' in style:
+            color = 'blue'
+        elif 'roll' in style:
+            color = 'red'
+        elif 'spiral' in style:
+            color = 'green'
+        elif 'figure' in style:
+            color = 'purple'
+        else:
+            color = 'orange'
+        
+        ax.plot(trajectory[:, 0], trajectory[:, 1], trajectory[:, 2], 
+                color=color, linewidth=2, alpha=0.8)
+        ax.set_title(f'Traj {i+1}: {style}', fontsize=9, pad=5)
+        ax.set_xlabel('X')
+        ax.set_ylabel('Y')
+        ax.set_zlabel('Z')
+        ax.grid(True, alpha=0.3)
+        
+        # Second row: Trajectories 7-12
+        ax = fig.add_subplot(3, 6, i+7, projection='3d')
         trajectory = demo_trajectories[i+6, :, 1:4].numpy()
-        ax.plot(trajectory[:, 0], trajectory[:, 1], trajectory[:, 2], 'b-', linewidth=2)
-        ax.set_title(f'Enhanced Circular Trajectory {i+7}')
+        style = trajectory_styles[i+6]
+        
+        if 'loop' in style:
+            color = 'blue'
+        elif 'roll' in style:
+            color = 'red'
+        elif 'spiral' in style:
+            color = 'green'
+        elif 'figure' in style:
+            color = 'purple'
+        else:
+            color = 'orange'
+        
+        ax.plot(trajectory[:, 0], trajectory[:, 1], trajectory[:, 2], 
+                color=color, linewidth=2, alpha=0.8)
+        ax.set_title(f'Traj {i+7}: {style}', fontsize=9, pad=5)
         ax.set_xlabel('X')
         ax.set_ylabel('Y')
         ax.set_zlabel('Z')
-        ax.grid(True)
-
-        ax = fig.add_subplot(3, 6, i+12+1, projection='3d')
+        ax.grid(True, alpha=0.3)
+        
+        # Third row: Trajectories 13-18
+        ax = fig.add_subplot(3, 6, i+13, projection='3d')
         trajectory = demo_trajectories[i+12, :, 1:4].numpy()
-        ax.plot(trajectory[:, 0], trajectory[:, 1], trajectory[:, 2], 'b-', linewidth=2)
-        ax.set_title(f'Enhanced Circular Trajectory {i+13}')
+        style = trajectory_styles[i+12]
+        
+        if 'loop' in style:
+            color = 'blue'
+        elif 'roll' in style:
+            color = 'red'
+        elif 'spiral' in style:
+            color = 'green'
+        elif 'figure' in style:
+            color = 'purple'
+        else:
+            color = 'orange'
+        
+        ax.plot(trajectory[:, 0], trajectory[:, 1], trajectory[:, 2], 
+                color=color, linewidth=2, alpha=0.8)
+        ax.set_title(f'Traj {i+13}: {style}', fontsize=9, pad=5)
         ax.set_xlabel('X')
         ax.set_ylabel('Y')
         ax.set_zlabel('Z')
-        ax.grid(True)
+        ax.grid(True, alpha=0.3)
     
-    plt.tight_layout()
+    # Add legend for style-color mapping
+    plt.figtext(0.5, 0.01, 
+                'Color Legend: Blue=Loops, Red=Rolls, Green=Spirals, Purple=Figures, Orange=Others',
+                ha='center', fontsize=10, bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+    
+    plt.tight_layout(rect=[0, 0.05, 1, 0.95])  # Adjust layout to accommodate title and legend
     plt.show()
+    
+    # Print style distribution
+    print("\n=== Style Distribution in Generated Trajectories ===")
+    style_counts = {}
+    for style in trajectory_styles:
+        style_counts[style] = style_counts.get(style, 0) + 1
+    
+    for style, count in style_counts.items():
+        print(f"{style}: {count} trajectories")
+    
+    print(f"Total: {len(trajectory_styles)} trajectories")
 
 # the main execution
 if __name__ == "__main__":
@@ -2000,27 +1843,42 @@ if __name__ == "__main__":
         config, 
         enable_obstacle_term = config.use_obstacle_loss, # not use obstacle term in loss for this experiment
         safe_extra_factor=0.2, # Safety buffer as fraction of radius (e.g., 20%)
-        z_weight=1.5, # Extra weight for Z-axis (height) in aviation
+        xyz_weight=1, # Extra weight for Z-axis (height) in aviation
         obstacle_weight=10.0, # Weight for obstacle term
-        continuity_weight=20.0 # Weight for continuity term
+        continuity_weight=10.0 # Weight for continuity term
     )
     print(f"Using AeroDMLoss (obstacle term: {config.use_obstacle_loss})")
     
     # Training parameters
     num_epochs = 100
     batch_size = 32
-    num_trajectories = 35000
+    num_trajectories = 3000
     
     print("Generating training data with obstacle-aware transformer...")
-    trajectories = generate_aerobatic_trajectories(
+    # trajectories = generate_aerobatic_trajectories(
+    #     num_trajectories=num_trajectories, 
+    #     seq_len=config.seq_len + config.history_len
+    # )
+    
+    # trajectories = generate_aerobatic_trajectories_deformation(    
+    #     num_trajectories=num_trajectories, 
+    #     seq_len=config.seq_len + config.history_len
+    # )
+
+    trajectories = generate_circular_end_trajectories(    
         num_trajectories=num_trajectories, 
         seq_len=config.seq_len + config.history_len
     )
-    
+
+    # trajectories = generate_distributed_trajectories(    
+    #     num_trajectories=num_trajectories, 
+    #     seq_len=config.seq_len + config.history_len
+    # )
+
     # Split trajectories into train and test sets (80/20 split)
     torch.manual_seed(42) # For reproducibility
     indices = torch.randperm(num_trajectories)
-    train_size = int(0.8 * num_trajectories)
+    train_size = int(0.9 * num_trajectories)
     train_indices = indices[:train_size]
     test_indices = indices[train_size:]
     
@@ -2072,11 +1930,15 @@ if __name__ == "__main__":
             
             # Split into history and sequence-to-predict
             history = full_traj[:, :config.history_len, :]
+            # print(history)
             x_0 = full_traj[:, config.history_len:, :] # (B, T_pred, D)
             
             # Generate condition inputs
             target = generate_target_waypoints(x_0)
-            action = generate_action_styles(actual_batch_size, config.action_dim, device=device)
+            # print(target)
+
+            style_indices = x_0[:, 0, -1].long()  # Use style index from first timestep
+            action = F.one_hot(style_indices, num_classes=config.action_dim).float()
             
             # Sample time step t
             t = torch.randint(0, config.diffusion_steps, (actual_batch_size,), device=device).long()
@@ -2088,18 +1950,18 @@ if __name__ == "__main__":
             # Generate obstacles for this batch (only needed if obstacle loss is enabled)
             obstacles_for_batch = None
             # In the training loop, modify the obstacles generation:
-            if config.use_obstacle_loss:
+            if config.use_obstacle_loss or config.enable_obstacle_encoding:
                 obstacles_for_batch = []
                 for b in range(actual_batch_size):
                     traj_denorm = denormalize_trajectories(full_traj[b:b+1, config.history_len:, :], mean, std)
                     obstacles = generate_random_obstacles(
                         traj_denorm[0], 
-                        num_obstacles_range=(1, 3), 
-                        radius_range=(0.2, 0.3), 
-                        check_collision=True, 
+                        num_obstacles_range=(1, 1), 
+                        radius_range=(4.5, 5.5), 
+                        check_collision=False, 
                         device=device
                     )
-                    obstacles_for_batch.append(obstacles)  # This creates a list of lists
+                    obstacles_for_batch.append(obstacles) 
 
             # Model prediction (reverse process: predict x_0 from x_t)
             pred_x0 = model(x_t, t, target, action, history, obstacles_data=obstacles_for_batch)

@@ -9,7 +9,7 @@ from mpl_toolkits.mplot3d import Axes3D
 from typing import List, Dict
 
 # Import your model and utility functions
-from AeroDM_SafeTrj_v2 import (
+from AeroDM_SafeTrj_v2_Test import (
     Config, AeroDM,
     generate_aerobatic_trajectories,
     normalize_trajectories, denormalize_trajectories,
@@ -198,16 +198,31 @@ def visualize_samples(model, mean, std, num_samples=3):
             title=f"Visualization Sample {i+1} (Guided: Green avoids Red Obstacles)"
         )
 
+def detailed_parameters(model):
+    total_params = 0
+    for name, parameter in model.named_parameters():
+        if not parameter.requires_grad:
+            continue
+        params = parameter.numel()
+        print(f"{name:30} | Shape: {str(list(parameter.shape)):20} | Params: {params:,}")
+        total_params += params
+    print(f"{'='*60}")
+    print(f"{'Total parameters:':30} | {total_params:,}")
+    return total_params
+
+
 if __name__ == "__main__":
     # Set device
     device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
 
     # Path to your trained model checkpoint
-    checkpoint_path = "model/enhanced_obstacle_aware_aerodm.pth"
+    checkpoint_path = "model/aerodm_v2_test.pth"
 
     # Load model
     print("Loading trained Enhanced Obstacle-Aware AeroDM model...")
     model = load_model(checkpoint_path, device)
+
+    detailed_parameters(model)
 
     # Load mean and std from checkpoint or recompute from training data
     checkpoint = torch.load(checkpoint_path, map_location=device)

@@ -1,4 +1,4 @@
-# DACS: Diffusion-based Aerobatics with CBF-Guided Sampling for Urban Air Vehicles
+# Diffusion-based Trajectory Generation with CBF-Guided Sampling for Urban Air Vehicles
 
 A PyTorch implementation of an enhanced diffusion-based trajectory generation model for urban air vehicles, featuring obstacle-aware transformers and Control Barrier Function (CBF) guidance for guaranteed safety in complex environments.
 
@@ -25,22 +25,23 @@ This project implements DACS (Diffusion-based Aerobatics with CBF-Guided Samplin
 ### Core Components
 
 1. **ObstacleAwareDiffusionTransformer**: Enhanced transformer with obstacle encoding
+
    - Positional encoding for temporal information
    - Multi-head self-attention with causal masking
    - MLP-based obstacle encoder with attention aggregation
    - Enhanced condition embedding with obstacle fusion
-
 2. **ObstacleAwareDiffusionProcess**: CBF-guided DDPM with safety constraints
+
    - 30 diffusion steps with linear noise schedule
    - CBF-guided reverse sampling with barrier functions
    - Multiple obstacle support with spherical representations
-
 3. **Obstacle Encoder MLP**: Neural network for obstacle representation
+
    - Individual obstacle encoding with MLP
    - Global attention-based aggregation
    - Dynamic obstacle processing capabilities
-
 4. **EnhancedAeroDM**: Complete model wrapper with safety features
+
    - Obstacle data management
    - CBF guidance configuration
    - Comprehensive sampling interface
