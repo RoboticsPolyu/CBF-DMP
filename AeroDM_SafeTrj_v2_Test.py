@@ -18,15 +18,16 @@ from Deformation import generate_aerobatic_trajectories_deformation
 from circular_trajectories import generate_circular_end_trajectories
 from distribute_trajectories import generate_distributed_trajectories
 
+
 # Configuration parameters based on the paper
 class Config:
     # Model dimensions
-    latent_dim = 128 # 256
-    obs_latent_dim = 64
+    latent_dim = 128
+    obs_latent_dim = 128
     num_layers = 4
     num_heads = 4
     dropout = 0.1
-    
+
     # Diffusion parameters
     diffusion_steps = 100
     beta_start = 0.0001
@@ -34,9 +35,9 @@ class Config:
     
     # Sequence parameters
     seq_len = 60  # N_a = 60 time steps; 6s-long future trajectory sequence
-    state_dim = 11  # x_i ∈ R^10: s(1) + p(3) + r(6) + style(1)
-    history_len = 1  # 5-frame historical observations
-    
+    state_dim = 7  # x_i ∈ R^7: s(1) + p(3) + r(3) + style(1)
+    history_len = 20  # 20-frame historical observations
+
     # Condition dimensions
     target_dim = 3  # p_t ∈ R^3
     action_dim = 14   # 14 maneuver styles
@@ -45,12 +46,21 @@ class Config:
     max_obstacles = 10  # Maximum number of obstacles to process
     obstacle_feat_dim = 4  # [x, y, z, radius]
     enable_obstacle_encoding = False  # Toggle obstacle encoding in the model
-    use_obstacle_loss = False  # Toggle obstacle loss term in training
+    use_obstacle_loss = enable_obstacle_encoding & True  # Toggle obstacle loss term in training
 
     # CBF Guidance parameters (from CoDiG paper)
-    enable_cbf_guidance = False  # Disabled by default; toggle for inference
-    guidance_gamma = 10000.0  # Base gamma for barrier guidance
+    # enable_cbf_guidance = True  # Disabled by default; toggle for inference
+    guidance_gamma = 2000.0  # Base gamma for barrier guidance
     
+    safe_extra_factor=0.2 # Safety buffer as fraction of radius (e.g., 20%)
+    last_xyz_weight=5.0 # Extra weight for final timestep's position error
+    xyz_weight=1.0 # Extra weight for Z-axis (height) in aviation
+    diff_vel_weight=0.0 # Weight for velocity term
+    other_weight=1.0 # Weight for other losses
+    obstacle_weight=10.0 # Weight for obstacle term
+    continuity_weight=5.0 # Weight for continuity term
+    acc_weight=1.0 # Weight for acceleration term
+
     # Plotting control
     show_flag = True  # Set to False to save plots as SVG instead of displaying
     
@@ -181,6 +191,123 @@ class ObstacleEncoder(nn.Module):
         
         return global_features
 
+# Attention-based Obstacle Encoder for small obstacle sets
+class AttentionObstacleEncoder(nn.Module):
+    """
+    Attention-based obstacle encoder for small obstacle sets (<10 obstacles).
+    Uses self-attention to model interactions between obstacles and handles
+    variable numbers of obstacles naturally without padding.
+    """
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        
+        # Project obstacle features to latent space
+        # Input: [x, y, z, radius] -> Output: [obs_latent_dim]
+        self.obstacle_proj = nn.Sequential(
+            nn.Linear(config.obstacle_feat_dim, config.obs_latent_dim),
+            nn.ReLU(),
+            nn.Linear(config.obs_latent_dim, config.obs_latent_dim)
+        )
+        
+        # Multi-head attention for obstacle-obstacle interactions
+        # Allows obstacles to "see" each other and understand spatial relationships
+        self.attention = nn.MultiheadAttention(
+            config.obs_latent_dim,
+            num_heads=4,
+            batch_first=True,
+            dropout=config.dropout
+        )
+        
+        # Learnable positional encoding for obstacles (optional but helpful)
+        # Since obstacles are unordered, this helps the model distinguish them
+        max_obs = config.max_obstacles
+        self.pos_encoding = nn.Parameter(torch.randn(1, max_obs, config.obs_latent_dim) * 0.1)
+        
+        # Global feature extraction after attention
+        self.global_proj = nn.Sequential(
+            nn.Linear(config.obs_latent_dim * 2, config.obs_latent_dim),  # *2 for concat of mean+max
+            nn.ReLU(),
+            nn.Linear(config.obs_latent_dim, config.obs_latent_dim),
+            nn.LayerNorm(config.obs_latent_dim)  # Add layer norm for stability
+        )
+        
+    def forward(self, obstacles_data):
+        """
+        Forward pass for obstacle encoding.
+        
+        Args:
+            obstacles_data: List of lists, each inner list contains obstacle dicts
+                           Each dict: {'center': tensor([x,y,z]), 'radius': float}
+        
+        Returns:
+            global_features: Tensor of shape [batch_size, obs_latent_dim]
+                            Global obstacle embedding for each sample
+        """
+        batch_size = len(obstacles_data)
+        device = next(self.parameters()).device
+        
+        batch_embeddings = []
+        
+        for batch_idx, sample_obs in enumerate(obstacles_data):
+            num_obstacles = len(sample_obs)
+            
+            # Case 1: No obstacles in this sample
+            if num_obstacles == 0:
+                batch_embeddings.append(
+                    torch.zeros(self.config.obs_latent_dim, device=device)
+                )
+                continue
+            
+            # Extract obstacle features: [center_x, center_y, center_z, radius]
+            obstacle_features = []
+            for obstacle in sample_obs:
+                center = obstacle['center'].to(device)
+                radius = obstacle['radius']
+                # Ensure radius is a tensor with correct dtype
+                radius_tensor = torch.tensor([radius], device=device, dtype=center.dtype)
+                feat = torch.cat([center, radius_tensor])
+                obstacle_features.append(feat)
+            
+            # Stack obstacles for this sample: [num_obs, obstacle_feat_dim]
+            obs_tensor = torch.stack(obstacle_features)
+            
+            # Project to latent space: [num_obs, obs_latent_dim]
+            obs_emb = self.obstacle_proj(obs_tensor)
+            
+            # Add positional encoding (use first num_obs positions)
+            # This helps the model maintain consistency despite unordered input
+            pos_enc = self.pos_encoding[:, :num_obstacles, :].to(device)
+            obs_emb = obs_emb.unsqueeze(0) + pos_enc  # [1, num_obs, obs_latent_dim]
+            
+            # Apply self-attention to model obstacle interactions
+            # Each obstacle attends to all others to understand spatial relationships
+            attn_output, attn_weights = self.attention(
+                query=obs_emb,
+                key=obs_emb,
+                value=obs_emb
+            )  # attn_output: [1, num_obs, obs_latent_dim]
+            
+            # Remove batch dimension
+            obs_emb = attn_output.squeeze(0)  # [num_obs, obs_latent_dim]
+            
+            # Global pooling: combine mean and max pooling
+            # Mean pooling captures the "average" obstacle context
+            mean_pool = obs_emb.mean(dim=0)  # [obs_latent_dim]
+            # Max pooling captures the "most critical" obstacle
+            max_pool = obs_emb.max(dim=0)[0]  # [obs_latent_dim]
+            
+            # Concatenate both pooling results
+            global_feat = torch.cat([mean_pool, max_pool])  # [obs_latent_dim * 2]
+            
+            # Final projection to get global obstacle embedding
+            global_feat = self.global_proj(global_feat)  # [obs_latent_dim]
+            
+            batch_embeddings.append(global_feat)
+        
+        # Stack all batch embeddings: [batch_size, obs_latent_dim]
+        return torch.stack(batch_embeddings)
+    
 # Condition Embedding with Obstacle Information
 class ConditionEmbedding(nn.Module):
     def __init__(self, config):
@@ -209,8 +336,9 @@ class ConditionEmbedding(nn.Module):
         )
         
         # Obstacle embedding
-        self.obstacle_encoder = ObstacleEncoder(config)
-        
+        # self.obstacle_encoder = ObstacleEncoder(config)
+        self.obstacle_encoder = AttentionObstacleEncoder(config)
+
         # Feature fusion layer
         self.fusion_layer = nn.Sequential(
             nn.Linear(config.latent_dim * 4, config.latent_dim * 2),
@@ -422,11 +550,9 @@ def compute_barrier_and_grad(x, config, mean, std, obstacles_data=None, safety_m
     pos_denorm = x[:, :, 1:4] * std[0, 0, 1:4] + mean[0, 0, 1:4]
     batch_size, seq_len, _ = pos_denorm.shape
     
-    # 关键修复：创建一个不需要梯度的张量来累积梯度
+    # Initialize gradient tensor for denormalized positions
     grad_pos_denorm = torch.zeros_like(pos_denorm)
     
-    # 确保pos_denorm可以计算梯度（如果需要自动微分的话）
-    # 但这里我们手动计算梯度，所以不需要
     pos_denorm = pos_denorm.clone().detach()
     
     # Initialize barrier value
@@ -447,6 +573,10 @@ def compute_barrier_and_grad(x, config, mean, std, obstacles_data=None, safety_m
                 
                 # Closeness function: r - distance
                 h = radius * radius - distances * distances
+                # h = (p-o)^T*(p-o) - r^2
+                # P_free(x) = Φ(z) = Φ( h(x) / σ_h(x) )
+                # log(P_free) = log(Φ(z)) ; ∇log(P_free) = ( φ(z) / Φ(z) ) * ∇h / σ_h   
+                # φ(z) = exp(-0.5*z^2) / sqrt(2π)
                 
                 # Barrier violation term: max(0, h)^2
                 violation = torch.clamp(h, min=0.0)
@@ -457,14 +587,10 @@ def compute_barrier_and_grad(x, config, mean, std, obstacles_data=None, safety_m
                 violation_mask = (h > 0).float().unsqueeze(1)
                 direction_vec = pos_denorm[batch_idx] - center.unsqueeze(0)
                 
-                epsilon = 1e-6
-                grad_dist = direction_vec / (distances.unsqueeze(1) + epsilon) # (p - center) / distance
-                
-                # Grad(V_obs) = -2 * violation * grad_dist
-                grad_V_obs = -2 * direction_vec * violation_mask # 2 *
-                # grad_V_obs = grad_V_obs * violation_mask
-                
-                # 安全地累积梯度
+                epsilon = 1e-6  
+                grad_dist = direction_vec / (distances.unsqueeze(1) + epsilon)
+                grad_V_obs = -2 * violation.unsqueeze(1) * grad_dist
+
                 grad_pos_denorm[batch_idx] = grad_pos_denorm[batch_idx] + grad_V_obs
     
     # Map gradient back to normalized space
@@ -612,8 +738,8 @@ class ObstacleAwareDiffusionProcess:
             x_prev_pos = x_prev[0, :, 1:4].cpu().numpy()
         
         # Fixed bounds based on trajectory generation ranges (centers -20~20, radius~10, climb~40; safe cover -50 to 50)
-        fixed_min = np.array([-20.0, -20.0, -20.0])
-        fixed_max = np.array([20.0, 20.0, 20.0])
+        # fixed_min = np.array([-20.0, -20.0, -20.0])
+        # fixed_max = np.array([20.0, 20.0, 20.0])
 
         # 1. 3D trajectory evolution with obstacles
         ax1 = fig.add_subplot(241, projection='3d')
@@ -636,9 +762,9 @@ class ObstacleAwareDiffusionProcess:
         #         ax1.plot_surface(x_sphere, y_sphere, z_sphere, alpha=0.3, color='red')
         
         # Set fixed equal-range limits for X/Y/Z to prevent distortion (spheres look spherical)
-        ax1.set_xlim(fixed_min[0], fixed_max[0])
-        ax1.set_ylim(fixed_min[1], fixed_max[1])
-        ax1.set_zlim(fixed_min[2], fixed_max[2])
+        # ax1.set_xlim(fixed_min[0], fixed_max[0])
+        # ax1.set_ylim(fixed_min[1], fixed_max[1])
+        # ax1.set_zlim(fixed_min[2], fixed_max[2])
 
         ax1.set_xlabel('X')
         ax1.set_ylabel('Y')
@@ -823,10 +949,10 @@ class AeroDM(nn.Module):
             gamma = guidance_gamma if enable_guidance else None
             
             # Plot every step if requested, or key steps for overview
-            plot_step = plot_all_steps or (t_step % max(1, self.config.diffusion_steps // 5) == 0) or t_step == 0
+            # plot_step = plot_all_steps or (t_step % max(1, self.config.diffusion_steps // 5) == 0) or t_step == 0
             
             # debug: 
-            # plot_step = False
+            plot_step = False
             x_t = self.diffusion_process.p_sample(
                 self.diffusion_model, x_t, t_batch, target, action, history, enable_guidance,
                 gamma, self.mean, self.std, plot_step=plot_step, step_idx=step_counter,
@@ -841,7 +967,7 @@ class AeroDM(nn.Module):
         
         return x_t
 
-# Pos Error, Velocity Error, Obstacle Distance Loss
+# Unified Loss Function for AeroDM with Obstacle Awareness
 class AeroDMLoss(nn.Module):
     """
     Unified loss function for AeroDM training.
@@ -849,19 +975,27 @@ class AeroDMLoss(nn.Module):
     Supports switching obstacle term via flag; always returns 4 values for consistency.
     Fixes: Proper safety margin for obstacles, Z-weighting, normalization by avg obstacles.
     """
-    def __init__(self, config, enable_obstacle_term=False, safe_extra_factor=0.2, xyz_weight=1.5, obstacle_weight=10.0, continuity_weight=15.0):
+    def __init__(self, config, enable_obstacle_term=False, safe_extra_factor=0.2, last_xyz_weight=1.5, xyz_weight=1.5, diff_vel_weight=1.0, other_weight=1.0, obstacle_weight=10.0, continuity_weight=15.0, acc_weight=1.0):
         super().__init__()
         self.config = config
         # Flag to enable/disable obstacle distance penalty in total loss
         self.enable_obstacle_term = enable_obstacle_term
         # Safety buffer beyond obstacle surface (as fraction of radius, e.g., 0.2 = 20%)
         self.safe_extra_factor = safe_extra_factor
+        # Extra weight for the last point's position loss (critical for trajectory endpoint accuracy)
+        self.last_xyz_weight = last_xyz_weight
         # Extra weight for Z-axis losses (height is critical in aviation trajectories)
         self.xyz_weight = xyz_weight
+        # Weight for velocity loss
+        self.diff_vel_weight = diff_vel_weight
+        # Weight for other losses
+        self.other_weight = other_weight
         # Scaling factor for the entire obstacle loss term
         self.obstacle_weight = obstacle_weight
         # Weight for continuity loss
         self.continuity_weight = continuity_weight
+        # Weight for acceleration loss
+        self.acc_weight = acc_weight
         # Base MSE loss for all components
         self.mse_loss = nn.MSELoss()
     
@@ -973,6 +1107,14 @@ class AeroDMLoss(nn.Module):
             # No velocity if single timestep
             vel_loss = torch.tensor(0.0, device=device)
         
+        if seq_len >= 3:
+            # vel = (B, T-1, 3)
+            vel = pred_pos[:, 1:, :] - pred_pos[:, :-1, :]
+            # acc = (B, T-2, 3) - acceleration
+            acc = vel[:, 1:, :] - vel[:, :-1, :]
+            # Smoothness loss = mean squared acceleration
+            acc_smoothness = acc.pow(2).mean()
+
         # Other losses: Explicit speed and attitude (no overlap with position)
         speed_loss = self.mse_loss(pred_speed, gt_speed)
         attitude_loss = self.mse_loss(pred_attitude, gt_attitude)
@@ -991,8 +1133,6 @@ class AeroDMLoss(nn.Module):
             first_pred_pos = pred_trajectory[:, 0, 1:4]
             continuity_loss = self.mse_loss(first_pred_pos, last_history_pos)
             
-            continuity_loss += self.mse_loss(pred_pos[:, :-1, 0:1], pred_pos[:, 1:, 0:1])
-
             # Optional: Add velocity continuity (delta from last history to first pred)
             # if history.size(1) > 1:
             #     last_history_vel = history[:, -1, 1:4] - history[:, -2, 1:4]
@@ -1000,7 +1140,7 @@ class AeroDMLoss(nn.Module):
             #     continuity_loss += self.mse_loss(first_pred_vel, last_history_vel)
         
         # Total weighted loss
-        total_loss = 1 * last_xyz_loss + 0.01 * position_loss + 0 * vel_loss + other_loss + self.obstacle_weight * obstacle_loss + self.continuity_weight * continuity_loss
+        total_loss = self.xyz_weight * last_xyz_loss + self.xyz_weight * position_loss + self.diff_vel_weight * vel_loss + self.other_weight * other_loss + self.obstacle_weight * obstacle_loss + self.continuity_weight * continuity_loss + self.acc_weight * acc_smoothness
         
         return total_loss, position_loss, vel_loss, obstacle_loss, continuity_loss
 
@@ -1010,6 +1150,24 @@ def normalize_trajectories(trajectories):
     std = trajectories.std(dim=(0, 1), keepdim=True)
     std = torch.where(std < 1e-8, torch.ones_like(std), std) # avoid division by zero
     return (trajectories - mean) / std, mean, std
+
+# def normalize_trajectories(trajectories):
+#     """
+#     Normalize each dimension to zero mean and unit variance.
+#     Excludes the last dimension (style) from normalization.
+#     """
+#     # Separate state variables (first state_dim-1 dimensions) from style (last dimension)
+#     state_trajectories = trajectories[:, :, :-1]  # All dimensions except style
+#     style_trajectories = trajectories[:, :, -1:]  # Only style dimension
+    
+#     # Normalize only the state variables
+#     mean = state_trajectories.mean(dim=(0, 1), keepdim=True)
+#     std = state_trajectories.std(dim=(0, 1), keepdim=True)
+#     std = torch.where(std < 1e-8, torch.ones_like(std), std)
+    
+#     state_normalized = (state_trajectories - mean) / std
+    
+#     return state_normalized, mean, std
 
 def denormalize_trajectories(trajectories_norm, mean, std):
     return trajectories_norm * std + mean
@@ -1438,23 +1596,39 @@ def plot_test_results(original, sampled_unguided_denorm, sampled_guided_denorm, 
 # Helper functions for modular plotting
 def plot_3d_trajectory(ax, original_pos, reconstructed_pos, sampled_pos, history_pos, target_pos, obstacles, styles, bounds):
     """Plot 3D trajectory with obstacles"""
-    # Plot trajectories
+    # # Plot trajectories
+    # if history_pos is not None:
+    #     ax.plot(history_pos[:, 0], history_pos[:, 1], history_pos[:, 2], 
+    #             label='History', **styles['history'])
+    
+    # ax.plot(original_pos[:, 0], original_pos[:, 1], original_pos[:, 2], 
+    #         label='Original Trajectory', **styles['original'])
+    # ax.plot(reconstructed_pos[:, 0], reconstructed_pos[:, 1], reconstructed_pos[:, 2], 
+    #         label='Reconstructed Trajectory', **styles['reconstructed'])
+    # ax.plot(sampled_pos[:, 0], sampled_pos[:, 1], sampled_pos[:, 2], 
+    #         label='Sampled Guided Trajectory', **styles['sampled'])
+    
+    # # Plot target
+    # if target_pos is not None:
+    #     ax.scatter(target_pos[0], target_pos[1], target_pos[2], 
+    #               label='Target Waypoint', **styles['target'])
+    
+        # Plot trajectories
     if history_pos is not None:
         ax.plot(history_pos[:, 0], history_pos[:, 1], history_pos[:, 2], 
-                label='History', **styles['history'])
-    
+                label='His', **styles['history'])
     ax.plot(original_pos[:, 0], original_pos[:, 1], original_pos[:, 2], 
-            label='Original Trajectory', **styles['original'])
+            label='Trj', **styles['original'])
     ax.plot(reconstructed_pos[:, 0], reconstructed_pos[:, 1], reconstructed_pos[:, 2], 
-            label='Reconstructed Trajectory', **styles['reconstructed'])
+            label='Pred', **styles['reconstructed'])
     ax.plot(sampled_pos[:, 0], sampled_pos[:, 1], sampled_pos[:, 2], 
-            label='Sampled Guided Trajectory', **styles['sampled'])
+            label='CBF', **styles['sampled'])
     
     # Plot target
     if target_pos is not None:
         ax.scatter(target_pos[0], target_pos[1], target_pos[2], 
-                  label='Target Waypoint', **styles['target'])
-    
+                  label='Tar', **styles['target'])
+        
     # Plot obstacles
     obstacle_proxies = plot_3d_obstacles(ax, obstacles)
     
@@ -1607,6 +1781,9 @@ def test_model_performance(model, trajectories_norm, mean, std, num_test_samples
     config = model.config
     device = next(model.parameters()).device
     
+    mean_state = mean[..., :-1]  # Shape: (1, 1, 10)
+    std_state = std[..., :-1]    # Shape: (1, 1, 10)
+
     # Set normalization parameters
     model.set_normalization_params(mean, std)
     
@@ -1615,21 +1792,33 @@ def test_model_performance(model, trajectories_norm, mean, std, num_test_samples
         for i in range(min(num_test_samples, trajectories_norm.shape[0])):
             # Prepare test sample
             full_traj = trajectories_norm[i:i+1]
-            target_norm = generate_target_waypoints(full_traj)
+            
 
-            history = generate_history_segments(full_traj, config.history_len, device=device)
-            x_0 = full_traj[:, config.history_len:, :]
-            style_indices = x_0[:, 0, -1].long()  # Use style index from first timestep
-            action = F.one_hot(style_indices, num_classes=config.action_dim).float()
+            # history = generate_history_segments(full_traj, config.history_len, device=device)
+            # x_0 = full_traj[:, config.history_len:, :]
+            # style_indices = x_0[:, 0, -1].long()  # Use style index from first timestep
+            # action = F.one_hot(style_indices, num_classes=config.action_dim).float()
+
+            style_info = full_traj[:, :, -1:]  # Shape: (B, T_full, 1)
+            state_without_style = full_traj[:, :, :-1]  # Shape: (B, T_full, state_dim-1)
+
+            # Split into history and sequence-to-predict
+            history = state_without_style[:, :config.history_len, :]
+            x_0 = state_without_style[:, config.history_len:config.history_len+config.seq_len, :]
+            target_norm = generate_target_waypoints(x_0)
 
             # Denormalize for obstacle generation and plotting
-            x_0_denorm = denormalize_trajectories(x_0, mean, std)
-            target_denorm = target_norm * std[0, 0, 1:4] + mean[0, 0, 1:4]
+            x_0_denorm = denormalize_trajectories(x_0, mean_state, std_state)
+            target_denorm = target_norm * std_state[0, 0, 1:4] + mean_state[0, 0, 1:4]
             
+            style_index = style_info[:, 0, 0]  # Shape: (B,) - take first timestep, first feature
+            style_indices = style_index.long()
+            action = F.one_hot(style_indices, num_classes=config.action_dim).float()  # Shape: (B, action_dim)
+
             # Generate random obstacles
             obstacles = generate_random_obstacles(x_0_denorm[0], 
-                                                  num_obstacles_range=(1, 1), 
-                                                  radius_range=(1.2, 2.3), 
+                                                  num_obstacles_range=(3, 5), 
+                                                  radius_range=(0.5, 1.0), 
                                                   check_collision=False, 
                                                   device=device)
             
@@ -1652,7 +1841,7 @@ def test_model_performance(model, trajectories_norm, mean, std, num_test_samples
                 enable_guidance=False, 
                 plot_all_steps=False
             )
-            sampled_unguided_denorm = denormalize_trajectories(sampled_unguided_norm, mean, std)
+            sampled_unguided_denorm = denormalize_trajectories(sampled_unguided_norm, mean_state, std_state)
 
             # 2. Sample CBF-Guided Trajectory
             # Use a smaller number of steps for guided sampling visualization
@@ -1667,14 +1856,14 @@ def test_model_performance(model, trajectories_norm, mean, std, num_test_samples
                 guidance_gamma=config.guidance_gamma, 
                 plot_all_steps=False # Plotting is too slow, rely on final plot
             )
-            sampled_guided_denorm = denormalize_trajectories(sampled_guided_norm, mean, std)
+            sampled_guided_denorm = denormalize_trajectories(sampled_guided_norm, mean_state, std_state)
             
             # 3. Final Plotting (denormalized)
             plot_test_results(
                 x_0_denorm, 
                 sampled_unguided_denorm, 
                 sampled_guided_denorm, 
-                denormalize_trajectories(history, mean, std) if history is not None else None,
+                denormalize_trajectories(history, mean_state, std_state) if history is not None else None,
                 target_denorm,
                 obstacles,
                 show_flag,
@@ -1842,11 +2031,16 @@ if __name__ == "__main__":
     criterion = AeroDMLoss(
         config, 
         enable_obstacle_term = config.use_obstacle_loss, # not use obstacle term in loss for this experiment
-        safe_extra_factor=0.2, # Safety buffer as fraction of radius (e.g., 20%)
-        xyz_weight=1, # Extra weight for Z-axis (height) in aviation
-        obstacle_weight=10.0, # Weight for obstacle term
-        continuity_weight=10.0 # Weight for continuity term
+        safe_extra_factor=config.safe_extra_factor, # Safety buffer as fraction of radius (e.g., 20%)
+        last_xyz_weight=config.last_xyz_weight, # Extra weight for final timestep's position error
+        xyz_weight=config.xyz_weight, # Extra weight for Z-axis (height) in aviation
+        diff_vel_weight=config.diff_vel_weight, # Weight for velocity term
+        other_weight=config.other_weight, # Weight for other losses
+        obstacle_weight=config.obstacle_weight, # Weight for obstacle term
+        continuity_weight=config.continuity_weight, # Weight for continuity term
+        acc_weight=config.acc_weight # Weight for acceleration term
     )
+
     print(f"Using AeroDMLoss (obstacle term: {config.use_obstacle_loss})")
     
     # Training parameters
@@ -1855,20 +2049,20 @@ if __name__ == "__main__":
     num_trajectories = 3000
     
     print("Generating training data with obstacle-aware transformer...")
-    # trajectories = generate_aerobatic_trajectories(
-    #     num_trajectories=num_trajectories, 
-    #     seq_len=config.seq_len + config.history_len
-    # )
+    trajectories = generate_aerobatic_trajectories(
+        num_trajectories=num_trajectories, 
+        seq_len=config.seq_len + config.history_len
+    )
     
     # trajectories = generate_aerobatic_trajectories_deformation(    
     #     num_trajectories=num_trajectories, 
     #     seq_len=config.seq_len + config.history_len
     # )
 
-    trajectories = generate_circular_end_trajectories(    
-        num_trajectories=num_trajectories, 
-        seq_len=config.seq_len + config.history_len
-    )
+    # trajectories = generate_circular_end_trajectories(    
+    #     num_trajectories=num_trajectories, 
+    #     seq_len=config.seq_len + config.history_len
+    # )
 
     # trajectories = generate_distributed_trajectories(    
     #     num_trajectories=num_trajectories, 
@@ -1928,17 +2122,22 @@ if __name__ == "__main__":
             batch_indices = indices[i:i+actual_batch_size]
             full_traj = train_norm[batch_indices] # (B, T_full, D)
             
+            # Extract style index (last dimension)
+            style_info = full_traj[:, :, -1:]  # Shape: (B, T_full, 1)
+            state_without_style = full_traj[:, :, :-1]  # Shape: (B, T_full, state_dim-1)
+
             # Split into history and sequence-to-predict
-            history = full_traj[:, :config.history_len, :]
-            # print(history)
-            x_0 = full_traj[:, config.history_len:, :] # (B, T_pred, D)
-            
+            history = state_without_style[:, :config.history_len, :]
+            x_0 = state_without_style[:, config.history_len:config.history_len+config.seq_len, :]
+
             # Generate condition inputs
             target = generate_target_waypoints(x_0)
-            # print(target)
 
-            style_indices = x_0[:, 0, -1].long()  # Use style index from first timestep
-            action = F.one_hot(style_indices, num_classes=config.action_dim).float()
+            # FIXED: Use the style index from the FIRST timestep of the FULL trajectory
+            # Since style is constant, any timestep works, but use the first for clarity
+            style_index = style_info[:, 0, 0]  # Shape: (B,) - take first timestep, first feature
+            style_indices = style_index.long()
+            action = F.one_hot(style_indices, num_classes=config.action_dim).float()  # Shape: (B, action_dim)
             
             # Sample time step t
             t = torch.randint(0, config.diffusion_steps, (actual_batch_size,), device=device).long()
@@ -1956,8 +2155,8 @@ if __name__ == "__main__":
                     traj_denorm = denormalize_trajectories(full_traj[b:b+1, config.history_len:, :], mean, std)
                     obstacles = generate_random_obstacles(
                         traj_denorm[0], 
-                        num_obstacles_range=(1, 1), 
-                        radius_range=(4.5, 5.5), 
+                        num_obstacles_range=(3, 5), 
+                        radius_range=(0.5, 1.0), 
                         check_collision=False, 
                         device=device
                     )

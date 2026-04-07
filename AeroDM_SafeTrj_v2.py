@@ -36,7 +36,7 @@ class Config:
     # Obstacle parameters
     max_obstacles = 10  # Maximum number of obstacles to process
     obstacle_feat_dim = 4  # [x, y, z, radius]
-    enable_obstacle_encoding = True  # Toggle obstacle encoding in the model
+    enable_obstacle_encoding = False  # Toggle obstacle encoding in the model
 
     # CBF Guidance parameters (from CoDiG paper)
     enable_cbf_guidance = True  # Disabled by default; toggle for inference

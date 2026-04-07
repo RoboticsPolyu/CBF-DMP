@@ -114,7 +114,7 @@ def compare_guidance_effects_corrected():
     divide_series = gamma_ts / (sigma_ts + 1e-8) * grad_V_norm
     
     # Create comprehensive visualization
-    fig = plt.figure(figsize=(5, 3.1))
+    fig = plt.figure(figsize=(4.8, 3.1))
     
     # 1. Main comparison: Guidance strength over REVERSE diffusion steps
     diffusion_steps = torch.arange(T)  # 0 to T-1 (forward diffusion indices)
@@ -122,11 +122,11 @@ def compare_guidance_effects_corrected():
     
     # Plot in reverse diffusion order (from noisy to clean)
     plt.plot(reverse_steps.numpy(), multiply_series.flip(0).numpy(), 
-             'b-', linewidth=2, label=r'$\gamma (t) × σ_t × \nabla V$')
+             'b-', linewidth=2, label=r'$\gamma (t) \cdot \sigma_t $')
     plt.plot(reverse_steps.numpy(), sigma_ts.numpy(), 
              'r-', linewidth=2, label=r'$\sigma_t$')
     plt.plot(reverse_steps.numpy(), gamma_ts.flip(0).numpy(),
-             'g--', linewidth=1.5, label=r'$γ(t)$')
+             'g--', linewidth=1.5, label=r'$\gamma(t)$')
     
 
     # Mark constraint activation region
