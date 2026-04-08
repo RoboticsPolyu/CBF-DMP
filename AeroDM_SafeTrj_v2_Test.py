@@ -46,7 +46,7 @@ class Config:
     max_obstacles = 10  # Maximum number of obstacles to process
     obstacle_feat_dim = 4  # [x, y, z, radius]
     enable_obstacle_encoding = False  # Toggle obstacle encoding in the model
-    use_obstacle_loss = enable_obstacle_encoding & True  # Toggle obstacle loss term in training
+    use_obstacle_loss = enable_obstacle_encoding  # Toggle obstacle loss term in training
 
     # CBF Guidance parameters (from CoDiG paper)
     # enable_cbf_guidance = True  # Disabled by default; toggle for inference
@@ -60,6 +60,9 @@ class Config:
     obstacle_weight=10.0 # Weight for obstacle term
     continuity_weight=5.0 # Weight for continuity term
     acc_weight=1.0 # Weight for acceleration term
+
+    drop_style_prob = 0.1  # Probability of dropping style information during training for robustness
+    guidance_scale = 2.0  # Classifier-free guidance scale for sampling (tune for best results)
 
     # Plotting control
     show_flag = True  # Set to False to save plots as SVG instead of displaying
@@ -398,6 +401,12 @@ class ObstacleAwareDiffusionTransformer(nn.Module):
     def forward(self, x, t, target, action, history=None, obstacles_data=None):
         batch_size, seq_len, _ = x.shape
         
+        # During training, randomly drop style information to improve robustness
+        if self.training:
+            drop_mask = torch.rand(x.size(0), device=x.device) < self.config.drop_style_prob
+            action = action.clone()
+            action[drop_mask] = 0  
+
         # Project input to latent space (no PE yet)
         x_proj = self.input_proj(x)
         
@@ -454,93 +463,7 @@ class ObstacleAwareDiffusionTransformer(nn.Module):
         mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
         return mask
 
-# # CBF Barrier Function with Multiple Obstacles
-# def compute_barrier_and_grad(x, config, mean, std, obstacles_data=None):
-#     """
-#     Compute barrier V and its gradient ∇V for the trajectory x.
-#     Extended to handle multiple spherical obstacles.
-#     V = sum_τ sum_obs max(0, r_obs - ||pos_τ - center_obs||)^2
-#     ∇V affects only position components (indices 1:4).
-#     """
-#     # Denormalize positions for barrier computation
-#     # Uses std and mean to denormalize only position components (1:4)
-#     pos_denorm = x[:, :, 1:4] * std[0, 0, 1:4] + mean[0, 0, 1:4]
-#     batch_size, seq_len, _ = pos_denorm.shape
-    
-#     # Initialize barrier value and gradient
-#     V_total = torch.zeros(batch_size, device=x.device)
-#     # Gradient will be computed on the denormalized positions
-#     grad_pos_denorm = torch.zeros_like(pos_denorm, requires_grad=True)
-#     # Ensure pos_denorm requires grad for backprop
-#     pos_denorm = pos_denorm.clone().detach().requires_grad_(True)
-    
-#     # Process each obstacle
-#     if obstacles_data is not None:
-#         for batch_idx in range(batch_size):
-#             # Get obstacles for this sample
-#             batch_obs = obstacles_data[batch_idx] if batch_idx < len(obstacles_data) else []
-            
-#             for obstacle in batch_obs:
-#                 center = obstacle['center'].to(x.device)  # Shape: (3,)
-#                 radius = obstacle['radius']  # Scalar float
-                
-#                 # Euclidean distances from trajectory points to center
-#                 # Shape: (seq_len, 3) -> (seq_len,)
-#                 distances = torch.norm(pos_denorm[batch_idx] - center.unsqueeze(0), dim=1)
-                
-#                 # Closeness function: r - distance (positive means inside/near obstacle)
-#                 h = radius - distances
-                
-#                 # Barrier violation term: max(0, h)^2
-#                 violation = torch.clamp(h, min=0.0)
-#                 V_obstacle = torch.sum(violation ** 2)
-#                 V_total[batch_idx] += V_obstacle
-                
-#                 # Compute gradient for this obstacle
-#                 # The gradient of max(0, h)^2 with respect to pos_denorm is:
-#                 # 2 * max(0, h) * grad(h)
-#                 # grad(h) = grad(r - distances) = -grad(distances)
-#                 # grad(distances) = (pos_denorm - center) / distances (if distances > 0)
-                
-#                 # Compute mask for violated points (where h > 0, i.e., distance < radius)
-#                 violation_mask = (h > 0).float().unsqueeze(1) # (seq_len, 1)
-                
-#                 # Compute direction vector from center to point (pos_denorm - center)
-#                 direction_vec = pos_denorm[batch_idx] - center.unsqueeze(0) # (seq_len, 3)
-                
-#                 # Compute gradient of distance w.r.t pos_denorm
-#                 # Add small epsilon to distances to avoid div by zero
-#                 epsilon = 1e-6
-#                 grad_dist = direction_vec / (distances.unsqueeze(1) + epsilon) # (seq_len, 3)
-                
-#                 # Grad(V_obs) w.r.t. pos_denorm: 2 * violation * (-grad_dist)
-#                 grad_V_obs = -2 * violation.unsqueeze(1) * grad_dist
-                
-#                 # Apply violation mask (grad is 0 if not violated)
-#                 grad_V_obs = grad_V_obs * violation_mask
-                
-#                 # Accumulate gradients (note: pos_denorm is still a leaf node)
-#                 # We update the manually tracked gradient
-#                 grad_pos_denorm[batch_idx] += grad_V_obs
-    
-#     # Map the gradient back to the normalized space (x)
-#     # grad_x = grad_pos_denorm * (d(pos_denorm)/d(x))
-#     # pos_denorm = x[:, :, 1:4] * std + mean
-#     # d(pos_denorm)/d(x) = std
-#     grad_x = torch.zeros_like(x, device=x.device)
-#     grad_x[:, :, 1:4] = grad_pos_denorm / std[0, 0, 1:4].to(x.device)
-    
-#     # V_total is sum of barrier violations over all obstacles and timesteps in the batch
-#     V_avg = V_total.mean() 
-    
-#     # Print grad_V information
-#     print(f"grad_V shape: {grad_x.shape}")
-#     print(f"grad_V norm: {torch.norm(grad_x):.6f}")
-#     print(f"grad_V min/max: {grad_x.min():.6f} / {grad_x.max():.6f}")
-#     print(f"Total barrier value V: {V_total.mean().item():.6f}")
-
-#     return V_avg, grad_x
-
+# Barrier Function Computation for Multiple Obstacles
 def compute_barrier_and_grad(x, config, mean, std, obstacles_data=None, safety_margin = 0.20):
     """
     Compute barrier V and its gradient ∇V for the trajectory x.
@@ -641,6 +564,21 @@ class ObstacleAwareDiffusionProcess:
             # Model prediction with obstacle information
             pred_x0 = model(x_t, t, target, action, history, obstacles_data)
             
+            print(f"Action: {action[0, :5].cpu().numpy()}...")  # Print first 5 elements
+
+            # Conditional prediction (with action) for guidance
+            pred_x0_cond = model(x_t, t, target, action, history, obstacles_data)
+            
+            #  non-conditional prediction (zero out action) for guidance
+            zero_action = torch.zeros_like(action)
+            pred_x0_uncond = model(x_t, t, target, zero_action, history, obstacles_data)
+            
+            # Classifier-free guidance: pred_x0 = pred_x0_uncond + guidance_scale * (pred_x0_cond - pred_x0_uncond)
+            if enable_guidance and self.config.guidance_scale != 1.0:
+                pred_x0 = pred_x0_uncond + self.config.guidance_scale * (pred_x0_cond - pred_x0_uncond)
+            else:
+                pred_x0 = pred_x0_cond
+
             # Expand t for broadcasting
             t_exp = t.view(batch_size, 1, 1) if t.dim() == 1 else t.view(-1, 1, 1)
             
@@ -1144,31 +1082,43 @@ class AeroDMLoss(nn.Module):
         
         return total_loss, position_loss, vel_loss, obstacle_loss, continuity_loss
 
+# def normalize_trajectories(trajectories):
+#     """Normalize each dimension to zero mean and unit variance"""
+#     mean = trajectories.mean(dim=(0, 1), keepdim=True)
+#     std = trajectories.std(dim=(0, 1), keepdim=True)
+    
+#     std = torch.where(std < 1e-8, torch.ones_like(std), std) # avoid division by zero
+#     return (trajectories - mean) / std, mean, std
+
 def normalize_trajectories(trajectories):
-    """Normalize each dimension to zero mean and unit variance"""
+    """
+    Normalize all dimensions to zero mean and unit variance, 
+    but then restore the original style dimension values.
+    
+    Args:
+        trajectories: Shape (batch, seq_len, state_dim) where state_dim includes style
+    
+    Returns:
+        normalized_trajectories: State dimensions normalized, style restored to original
+        mean: Mean for ALL dimensions (including style)
+        std: Std for ALL dimensions (including style)
+    """
+    # Save original style values (last dimension)
+    original_style = trajectories[:, :, -1:]  # Shape: (batch, seq_len, 1)
+    
+    # Normalize everything (including style)
     mean = trajectories.mean(dim=(0, 1), keepdim=True)
     std = trajectories.std(dim=(0, 1), keepdim=True)
-    std = torch.where(std < 1e-8, torch.ones_like(std), std) # avoid division by zero
-    return (trajectories - mean) / std, mean, std
+    std = torch.where(std < 1e-8, torch.ones_like(std), std)
+    
+    normalized = (trajectories - mean) / std
+    
+    # Restore original style values (overwrite the normalized style dimension)
+    normalized[:, :, -1:] = original_style
+    
+    return normalized, mean, std
 
-# def normalize_trajectories(trajectories):
-#     """
-#     Normalize each dimension to zero mean and unit variance.
-#     Excludes the last dimension (style) from normalization.
-#     """
-#     # Separate state variables (first state_dim-1 dimensions) from style (last dimension)
-#     state_trajectories = trajectories[:, :, :-1]  # All dimensions except style
-#     style_trajectories = trajectories[:, :, -1:]  # Only style dimension
-    
-#     # Normalize only the state variables
-#     mean = state_trajectories.mean(dim=(0, 1), keepdim=True)
-#     std = state_trajectories.std(dim=(0, 1), keepdim=True)
-#     std = torch.where(std < 1e-8, torch.ones_like(std), std)
-    
-#     state_normalized = (state_trajectories - mean) / std
-    
-#     return state_normalized, mean, std
-
+# Note: Denormalization should be applied only to the state variables (x,y,z) and not to the style dimension.
 def denormalize_trajectories(trajectories_norm, mean, std):
     return trajectories_norm * std + mean
 
@@ -2012,6 +1962,453 @@ def generate_trj_demos():
     
     print(f"Total: {len(trajectory_styles)} trajectories")
 
+# Test the effect of different actions (maneuver styles) on trajectory generation
+def test_action_effect(model, trajectories_norm, mean, std, num_test_samples=5, show_flag=True):
+    """Test the effect of different actions (maneuver styles) on trajectory generation"""
+    print("\nTesting action (maneuver style) effects on trajectory generation...")
+    config = model.config
+    device = next(model.parameters()).device
+    
+    mean_state = mean[..., :-1]
+    std_state = std[..., :-1]
+
+    # Set normalization parameters
+    model.set_normalization_params(mean, std)
+    
+    # Define style names for display
+    style_names = {
+        0: 'power_loop',
+        1: 'barrel_roll',
+        2: 'split_s',
+        3: 'immelmann',
+        4: 'wall_ride',
+        5: 'eight_figure',
+        6: 'star',
+        7: 'half_moon',
+        8: 'sphinx',
+        9: 'clover',
+        10: 'spiral_inward',
+        11: 'spiral_outward',
+        12: 'spiral_vertical_up',
+        13: 'spiral_vertical_down'
+    }
+    
+    # Select a subset of styles to test
+    test_styles = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]  # All styles
+    
+    model.eval()
+    with torch.no_grad():
+        # Use a fixed test sample from the dataset
+        for i in range(min(num_test_samples, trajectories_norm.shape[0])):
+            full_traj = trajectories_norm[i:i+1]
+            
+            # Extract history from the test sample
+            state_without_style = full_traj[:, :, :-1]
+            history = state_without_style[:, :config.history_len, :]
+            
+            # Get the target from the ground truth trajectory
+            x_0 = state_without_style[:, config.history_len:config.history_len+config.seq_len, :]
+            target_norm = generate_target_waypoints(x_0)
+            target_denorm = target_norm * std_state[0, 0, 1:4] + mean_state[0, 0, 1:4]
+            
+            # Generate fixed obstacles for consistent comparison
+            x_0_denorm = denormalize_trajectories(x_0, mean_state, std_state)
+            obstacles = generate_random_obstacles(
+                x_0_denorm[0], 
+                num_obstacles_range=(3, 5), 
+                radius_range=(0.5, 1.0), 
+                check_collision=False, 
+                device=device
+            )
+            model.set_obstacles_data([obstacles])
+            
+            print(f"\n{'='*80}")
+            print(f"TEST SAMPLE {i+1} - Comparing All Maneuver Styles")
+            print(f"Target Waypoint: {target_denorm[0].cpu().numpy()}")
+            print(f"Number of obstacles: {len(obstacles)}")
+            print(f"{'='*80}")
+            
+            # Store results for all styles
+            all_trajectories = {}
+            all_trajectories_norm = {}
+            
+            # Generate trajectories for each test style
+            for style_idx in test_styles:
+                # Create one-hot action for this style
+                action = F.one_hot(torch.tensor([style_idx]), num_classes=config.action_dim).float().to(device)
+                style_name = style_names.get(style_idx, f'style_{style_idx}')
+                
+                # Sample with CBF guidance
+                sampled_norm = model.sample(
+                    target_norm, 
+                    action, 
+                    history, 
+                    batch_size=1, 
+                    enable_guidance=True, 
+                    guidance_gamma=config.guidance_gamma, 
+                    plot_all_steps=False
+                )
+                
+                sampled_denorm = denormalize_trajectories(sampled_norm, mean_state, std_state)
+                all_trajectories[style_name] = sampled_denorm[0].cpu().numpy()
+                all_trajectories_norm[style_name] = sampled_norm[0].cpu().numpy()
+            
+            # Plot comparison of all styles
+            plot_action_comparison(
+                all_trajectories, 
+                target_denorm[0].cpu().numpy(),
+                obstacles,
+                history[0].cpu().numpy() if history is not None else None,
+                mean_state, std_state,
+                show_flag,
+                sample_idx=i+1
+            )
+            
+            # Plot style statistics
+            plot_style_statistics(all_trajectories, show_flag, sample_idx=i+1)
+
+def plot_action_comparison(all_trajectories, target, obstacles, history, mean_state, std_state, show_flag, sample_idx=1):
+    """Plot comparison of trajectories generated with different actions/styles"""
+    
+    num_styles = len(all_trajectories)
+    cols = min(4, num_styles)
+    rows = (num_styles + cols - 1) // cols
+    
+    fig = plt.figure(figsize=(5 * cols, 5 * rows))
+    fig.suptitle(f'Effect of Different Maneuver Styles on Trajectory Generation (Sample {sample_idx})', 
+                 fontsize=16, fontweight='bold')
+    
+    # Color map for different styles
+    colors = plt.cm.tab20(np.linspace(0, 1, num_styles))
+    
+    # Fixed bounds for consistent scaling
+    bounds = {
+        'xlim': (-20, 20),
+        'ylim': (-20, 20),
+        'zlim': (-10, 30)
+    }
+    
+    for idx, (style_name, trajectory) in enumerate(all_trajectories.items()):
+        row = idx // cols
+        col = idx % cols
+        ax = fig.add_subplot(rows, cols, idx + 1, projection='3d')
+        
+        # Plot trajectory
+        ax.plot(trajectory[:, 1], trajectory[:, 2], trajectory[:, 3], 
+                color=colors[idx], linewidth=2, alpha=0.8, label=style_name)
+        
+        # Mark start and end points
+        ax.scatter(trajectory[0, 1], trajectory[0, 2], trajectory[0, 3], 
+                  color=colors[idx], s=50, marker='o', edgecolors='black', label='Start')
+        ax.scatter(trajectory[-1, 1], trajectory[-1, 2], trajectory[-1, 3], 
+                  color=colors[idx], s=50, marker='s', edgecolors='black', label='End')
+        
+        # Plot obstacles
+        if obstacles:
+            for obstacle in obstacles:
+                center = obstacle['center'].cpu().numpy() if hasattr(obstacle['center'], 'cpu') else obstacle['center']
+                radius = obstacle['radius']
+                
+                # Create sphere
+                u = np.linspace(0, 2 * np.pi, 10)
+                v = np.linspace(0, np.pi, 10)
+                x_sphere = center[0] + radius * np.outer(np.cos(u), np.sin(v))
+                y_sphere = center[1] + radius * np.outer(np.sin(u), np.sin(v))
+                z_sphere = center[2] + radius * np.outer(np.ones(np.size(u)), np.cos(v))
+                ax.plot_surface(x_sphere, y_sphere, z_sphere, alpha=0.2, color='red')
+        
+        # Plot target
+        ax.scatter(target[0], target[1], target[2], color='gold', s=100, 
+                  marker='*', edgecolors='black', linewidth=2, label='Target')
+        
+        ax.set_xlim(bounds['xlim'])
+        ax.set_ylim(bounds['ylim'])
+        ax.set_zlim(bounds['zlim'])
+        ax.set_xlabel('X')
+        ax.set_ylabel('Y')
+        ax.set_zlabel('Z')
+        ax.set_title(f'{style_name}', fontsize=10, fontweight='bold')
+        ax.grid(True, alpha=0.3)
+        
+        # Only show legend for first subplot to avoid clutter
+        if idx == 0:
+            ax.legend(loc='upper right', fontsize=8)
+    
+    plt.tight_layout()
+    
+    if show_flag:
+        plt.show()
+    else:
+        filename = f"Figs/action_comparison_sample_{sample_idx:03d}.svg"
+        plt.savefig(filename, format='svg', bbox_inches='tight')
+        plt.close()
+
+def plot_style_statistics(all_trajectories, show_flag, sample_idx=1):
+    """Plot statistical comparison of different styles"""
+    
+    num_styles = len(all_trajectories)
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    fig.suptitle(f'Style Statistics Comparison (Sample {sample_idx})', fontsize=14, fontweight='bold')
+    
+    style_names = list(all_trajectories.keys())
+    colors = plt.cm.tab20(np.linspace(0, 1, num_styles))
+    
+    # 1. Trajectory length (total distance traveled)
+    ax1 = axes[0, 0]
+    lengths = []
+    for style_name, traj in all_trajectories.items():
+        positions = traj[:, 1:4]  # x, y, z
+        diffs = np.diff(positions, axis=0)
+        total_length = np.sum(np.linalg.norm(diffs, axis=1))
+        lengths.append(total_length)
+    
+    bars = ax1.bar(style_names, lengths, color=colors)
+    ax1.set_ylabel('Total Path Length')
+    ax1.set_title('Trajectory Length by Style')
+    ax1.tick_params(axis='x', rotation=45, labelsize=8)
+    for bar, length in zip(bars, lengths):
+        ax1.text(bar.get_x() + bar.get_width()/2, bar.get_height(), f'{length:.1f}', 
+                ha='center', va='bottom', fontsize=8)
+    
+    # 2. Maximum altitude (Z)
+    ax2 = axes[0, 1]
+    max_altitudes = []
+    for style_name, traj in all_trajectories.items():
+        max_z = np.max(traj[:, 3])  # Z is index 3 (after speed at index 0, x,y,z at 1,2,3)
+        max_altitudes.append(max_z)
+    
+    bars = ax2.bar(style_names, max_altitudes, color=colors)
+    ax2.set_ylabel('Maximum Altitude (Z)')
+    ax2.set_title('Maximum Altitude by Style')
+    ax2.tick_params(axis='x', rotation=45, labelsize=8)
+    for bar, alt in zip(bars, max_altitudes):
+        ax2.text(bar.get_x() + bar.get_width()/2, bar.get_height(), f'{alt:.1f}', 
+                ha='center', va='bottom', fontsize=8)
+    
+    # 3. Speed profile (mean speed)
+    ax3 = axes[1, 0]
+    mean_speeds = []
+    for style_name, traj in all_trajectories.items():
+        speeds = traj[:, 0]  # Speed is at index 0
+        mean_speed = np.mean(speeds)
+        mean_speeds.append(mean_speed)
+    
+    bars = ax3.bar(style_names, mean_speeds, color=colors)
+    ax3.set_ylabel('Mean Speed')
+    ax3.set_title('Mean Speed by Style')
+    ax3.tick_params(axis='x', rotation=45, labelsize=8)
+    for bar, speed in zip(bars, mean_speeds):
+        ax3.text(bar.get_x() + bar.get_width()/2, bar.get_height(), f'{speed:.1f}', 
+                ha='center', va='bottom', fontsize=8)
+    
+    # 4. Curvature (how winding the path is)
+    ax4 = axes[1, 1]
+    curvatures = []
+    for style_name, traj in all_trajectories.items():
+        positions = traj[:, 1:4]
+        if len(positions) >= 3:
+            # Approximate curvature using three points
+            curv = []
+            for i in range(1, len(positions) - 1):
+                v1 = positions[i] - positions[i-1]
+                v2 = positions[i+1] - positions[i]
+                if np.linalg.norm(v1) > 0 and np.linalg.norm(v2) > 0:
+                    angle = np.arccos(np.clip(np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2)), -1, 1))
+                    curv.append(angle)
+            if curv:
+                curvatures.append(np.mean(curv))
+            else:
+                curvatures.append(0)
+        else:
+            curvatures.append(0)
+    
+    bars = ax4.bar(style_names, curvatures, color=colors)
+    ax4.set_ylabel('Mean Turning Angle (rad)')
+    ax4.set_title('Path Curvature by Style')
+    ax4.tick_params(axis='x', rotation=45, labelsize=8)
+    
+    plt.tight_layout()
+    
+    if show_flag:
+        plt.show()
+    else:
+        filename = f"Figs/style_statistics_sample_{sample_idx:03d}.svg"
+        plt.savefig(filename, format='svg', bbox_inches='tight')
+        plt.close()
+
+def test_single_action_effect(model, trajectories_norm, mean, std, style_idx=0, num_test_samples=3, show_flag=True):
+    """Test and visualize a single action style with detailed plots"""
+    print(f"\nTesting detailed effect of style {style_idx}...")
+    config = model.config
+    device = next(model.parameters()).device
+    
+    mean_state = mean[..., :-1]
+    std_state = std[..., :-1]
+    
+    style_names = {
+        0: 'power_loop', 1: 'barrel_roll', 2: 'split_s', 3: 'immelmann',
+        4: 'wall_ride', 5: 'eight_figure', 6: 'star', 7: 'half_moon',
+        8: 'sphinx', 9: 'clover', 10: 'spiral_inward', 11: 'spiral_outward',
+        12: 'spiral_vertical_up', 13: 'spiral_vertical_down'
+    }
+    style_name = style_names.get(style_idx, f'style_{style_idx}')
+    
+    model.set_normalization_params(mean, std)
+    model.eval()
+    
+    with torch.no_grad():
+        for i in range(min(num_test_samples, trajectories_norm.shape[0])):
+            full_traj = trajectories_norm[i:i+1]
+            
+            state_without_style = full_traj[:, :, :-1]
+            history = state_without_style[:, :config.history_len, :]
+            
+            x_0 = state_without_style[:, config.history_len:config.history_len+config.seq_len, :]
+            target_norm = generate_target_waypoints(x_0)
+            target_denorm = target_norm * std_state[0, 0, 1:4] + mean_state[0, 0, 1:4]
+            
+            # Create action for the specified style
+            action = F.one_hot(torch.tensor([style_idx]), num_classes=config.action_dim).float().to(device)
+            
+            # Generate obstacles
+            x_0_denorm = denormalize_trajectories(x_0, mean_state, std_state)
+            obstacles = generate_random_obstacles(
+                x_0_denorm[0], 
+                num_obstacles_range=(3, 5), 
+                radius_range=(0.5, 1.0), 
+                check_collision=False, 
+                device=device
+            )
+            model.set_obstacles_data([obstacles])
+            
+            print(f"\n{'='*60}")
+            print(f"Testing Style: {style_name} (idx={style_idx}) - Sample {i+1}")
+            print(f"Target: {target_denorm[0].cpu().numpy()}")
+            print(f"{'='*60}")
+            
+            # Generate both guided and unguided trajectories
+            sampled_guided_norm = model.sample(
+                target_norm, action, history, batch_size=1,
+                enable_guidance=True, guidance_gamma=config.guidance_gamma, plot_all_steps=False
+            )
+            sampled_unguided_norm = model.sample(
+                target_norm, action, history, batch_size=1,
+                enable_guidance=False, plot_all_steps=False
+            )
+            
+            sampled_guided_denorm = denormalize_trajectories(sampled_guided_norm, mean_state, std_state)
+            sampled_unguided_denorm = denormalize_trajectories(sampled_unguided_norm, mean_state, std_state)
+            
+            # Plot detailed comparison
+            plot_detailed_style_comparison(
+                sampled_guided_denorm[0].cpu().numpy(),
+                sampled_unguided_denorm[0].cpu().numpy(),
+                target_denorm[0].cpu().numpy(),
+                history[0].cpu().numpy() if history is not None else None,
+                obstacles,
+                style_name,
+                show_flag,
+                sample_idx=i+1
+            )
+
+def plot_detailed_style_comparison(guided_traj, unguided_traj, target, history, obstacles, style_name, show_flag, sample_idx=1):
+    """Plot detailed comparison between guided and unguided trajectories for a specific style"""
+    
+    fig = plt.figure(figsize=(20, 12))
+    fig.suptitle(f'Style: {style_name} - Guided vs Unguided Trajectory Comparison (Sample {sample_idx})', 
+                 fontsize=16, fontweight='bold')
+    
+    # Extract positions (x,y,z from indices 1,2,3)
+    guided_pos = guided_traj[:, 1:4]
+    unguided_pos = unguided_traj[:, 1:4]
+    
+    # Extract speeds (index 0)
+    guided_speed = guided_traj[:, 0]
+    unguided_speed = unguided_traj[:, 0]
+    
+    time_steps = np.arange(len(guided_pos))
+    
+    # 1. 3D trajectory comparison
+    ax1 = fig.add_subplot(231, projection='3d')
+    ax1.plot(guided_pos[:, 0], guided_pos[:, 1], guided_pos[:, 2], 
+             'g-', linewidth=2, label='Guided (CBF)', alpha=0.8)
+    ax1.plot(unguided_pos[:, 0], unguided_pos[:, 1], unguided_pos[:, 2], 
+             'r--', linewidth=2, label='Unguided', alpha=0.8)
+    
+    if history is not None:
+        history_pos = history[:, 1:4]
+        ax1.plot(history_pos[:, 0], history_pos[:, 1], history_pos[:, 2], 
+                 'm-', linewidth=3, label='History', alpha=0.7)
+    
+    if obstacles:
+        for obstacle in obstacles:
+            center = obstacle['center'].cpu().numpy() if hasattr(obstacle['center'], 'cpu') else obstacle['center']
+            radius = obstacle['radius']
+            u = np.linspace(0, 2 * np.pi, 10)
+            v = np.linspace(0, np.pi, 10)
+            x_sphere = center[0] + radius * np.outer(np.cos(u), np.sin(v))
+            y_sphere = center[1] + radius * np.outer(np.sin(u), np.sin(v))
+            z_sphere = center[2] + radius * np.outer(np.ones(np.size(u)), np.cos(v))
+            ax1.plot_surface(x_sphere, y_sphere, z_sphere, alpha=0.2, color='red')
+    
+    ax1.scatter(target[0], target[1], target[2], color='gold', s=100, marker='*', label='Target')
+    ax1.set_xlabel('X')
+    ax1.set_ylabel('Y')
+    ax1.set_zlabel('Z')
+    ax1.legend()
+    ax1.set_title('3D Trajectory Comparison')
+    
+    # 2-4. Position components over time
+    components = [
+        (232, 'X Position', 0, 'X'),
+        (233, 'Y Position', 1, 'Y'),
+        (234, 'Z Position', 2, 'Z')
+    ]
+    
+    for idx, (subplot, title, dim, label) in enumerate(components):
+        ax = fig.add_subplot(subplot)
+        ax.plot(time_steps, guided_pos[:, dim], 'g-', linewidth=2, label='Guided')
+        ax.plot(time_steps, unguided_pos[:, dim], 'r--', linewidth=2, label='Unguided')
+        if history is not None:
+            history_time = np.arange(-len(history), 0)
+            ax.plot(history_time, history[:, dim+1], 'm-', linewidth=2, label='History', alpha=0.7)
+        ax.axhline(y=target[dim], color='gold', linestyle=':', linewidth=2, label='Target')
+        ax.set_xlabel('Time Step')
+        ax.set_ylabel(label)
+        ax.legend()
+        ax.set_title(title)
+        ax.grid(True, alpha=0.3)
+    
+    # 5. Speed comparison
+    ax5 = fig.add_subplot(235)
+    ax5.plot(time_steps, guided_speed, 'g-', linewidth=2, label='Guided Speed')
+    ax5.plot(time_steps, unguided_speed, 'r--', linewidth=2, label='Unguided Speed')
+    ax5.set_xlabel('Time Step')
+    ax5.set_ylabel('Speed')
+    ax5.legend()
+    ax5.set_title('Speed Profile')
+    ax5.grid(True, alpha=0.3)
+    
+    # 6. Position error
+    ax6 = fig.add_subplot(236)
+    error = np.linalg.norm(guided_pos - unguided_pos, axis=1)
+    ax6.plot(time_steps, error, 'b-', linewidth=2)
+    ax6.fill_between(time_steps, 0, error, alpha=0.3)
+    ax6.set_xlabel('Time Step')
+    ax6.set_ylabel('L2 Distance')
+    ax6.set_title('Position Difference (Guided vs Unguided)')
+    ax6.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    
+    if show_flag:
+        plt.show()
+    else:
+        filename = f"Figs/style_{style_name}_sample_{sample_idx:03d}.svg"
+        plt.savefig(filename, format='svg', bbox_inches='tight')
+        plt.close()
+
+
 # the main execution
 if __name__ == "__main__":
 
@@ -2053,7 +2450,7 @@ if __name__ == "__main__":
         num_trajectories=num_trajectories, 
         seq_len=config.seq_len + config.history_len
     )
-    
+
     # trajectories = generate_aerobatic_trajectories_deformation(    
     #     num_trajectories=num_trajectories, 
     #     seq_len=config.seq_len + config.history_len
@@ -2139,6 +2536,11 @@ if __name__ == "__main__":
             style_indices = style_index.long()
             action = F.one_hot(style_indices, num_classes=config.action_dim).float()  # Shape: (B, action_dim)
             
+            # Print action information
+            # print(f"Style indices: {style_indices.cpu().numpy()}")
+            # print(f"Action shape: {action.shape}")
+            # print(f"Action (one-hot):\n{action.cpu().numpy()}")
+
             # Sample time step t
             t = torch.randint(0, config.diffusion_steps, (actual_batch_size,), device=device).long()
             
@@ -2242,4 +2644,7 @@ if __name__ == "__main__":
         torch.save(checkpoint, "model/aerodm_v2_test.pth")
 
     # Run the visualization test
-    test_model_performance(model, test_norm, mean, std, num_test_samples=100, show_flag=config.show_flag)
+    # test_model_performance(model, test_norm, mean, std, num_test_samples=100, show_flag=config.show_flag)
+
+    # Run the action effect test with detailed plots for each style
+    test_action_effect(model, test_norm, mean, std, num_test_samples=3, show_flag=config.show_flag)
