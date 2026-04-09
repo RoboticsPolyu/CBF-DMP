@@ -40,7 +40,7 @@ def generate_circular_end_trajectories(
         start_point = torch.tensor(start_point)
     
     # Initialize trajectory tensor
-    trajectories = torch.zeros(num_trajectories, seq_len, 11, device=device)
+    trajectories = torch.zeros(num_trajectories, seq_len, 8, device=device)
     
     # Generate end points on a circular ring
     angles = torch.linspace(0, 2 * torch.pi, num_trajectories + 1)[:num_trajectories]
@@ -121,7 +121,7 @@ def generate_circular_end_trajectories(
         # - Pitch (θ): vertical angle (arcsin(vz/speed))
         # - Roll (φ): bank angle, we'll assume small bank proportional to curvature
         
-        attitude = torch.zeros(seq_len, 6, device=device)
+        attitude = torch.zeros(seq_len, 3, device=device)
         
         for k in range(seq_len):
             if speed[k] > 0.01:  # Avoid division by zero
@@ -147,22 +147,15 @@ def generate_circular_end_trajectories(
                 attitude[k, 0] = roll
                 attitude[k, 1] = pitch
                 attitude[k, 2] = yaw
-                
-                # Angular rates (simplified as finite differences)
-                if k > 0:
-                    attitude[k, 3] = attitude[k, 0] - attitude[k-1, 0]  # roll rate
-                    attitude[k, 4] = attitude[k, 1] - attitude[k-1, 1]  # pitch rate
-                    attitude[k, 5] = attitude[k, 2] - attitude[k-1, 2]  # yaw rate
-                else:
-                    attitude[k, 3:] = torch.zeros(3, device=device)
+
             else:
                 # Zero velocity: use neutral attitude
-                attitude[k] = torch.tensor([0.0, 0.0, 0.0, 0.0, 0.0, 0.0], device=device)
+                attitude[k] = torch.tensor([0.0, 0.0, 0.0], device=device)
         
         # Fill trajectory data
         trajectories[i, :, 0] = speed.squeeze()  # Speed magnitude
         trajectories[i, :, 1:4] = trajectory  # Position (x, y, z)
-        trajectories[i, :, 4:10] = attitude  # Attitude (6D)
+        trajectories[i, :, 4:7] = attitude  # Attitude (6D)
         
         # Add style label (last dimension)
         trajectories[i, :, -1] = 0  # Cycle through 14 styles

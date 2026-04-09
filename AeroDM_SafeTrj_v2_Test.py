@@ -564,7 +564,7 @@ class ObstacleAwareDiffusionProcess:
             # Model prediction with obstacle information
             pred_x0 = model(x_t, t, target, action, history, obstacles_data)
             
-            print(f"Action: {action[0, :5].cpu().numpy()}...")  # Print first 5 elements
+            # print(f"Action: {action[0, :5].cpu().numpy()}...")  # Print first 5 elements
 
             # Conditional prediction (with action) for guidance
             pred_x0_cond = model(x_t, t, target, action, history, obstacles_data)
@@ -1090,7 +1090,7 @@ class AeroDMLoss(nn.Module):
 #     std = torch.where(std < 1e-8, torch.ones_like(std), std) # avoid division by zero
 #     return (trajectories - mean) / std, mean, std
 
-def normalize_trajectories(trajectories):
+def normalize_trajectories(trajectories, mean=None, std=None):
     """
     Normalize all dimensions to zero mean and unit variance, 
     but then restore the original style dimension values.
@@ -1106,10 +1106,12 @@ def normalize_trajectories(trajectories):
     # Save original style values (last dimension)
     original_style = trajectories[:, :, -1:]  # Shape: (batch, seq_len, 1)
     
-    # Normalize everything (including style)
-    mean = trajectories.mean(dim=(0, 1), keepdim=True)
-    std = trajectories.std(dim=(0, 1), keepdim=True)
-    std = torch.where(std < 1e-8, torch.ones_like(std), std)
+    if mean is None:
+            # Normalize everything (including style)
+            mean = trajectories.mean(dim=(0, 1), keepdim=True)
+    if std is None:
+            std = trajectories.std(dim=(0, 1), keepdim=True)
+            std = torch.where(std < 1e-8, torch.ones_like(std), std)
     
     normalized = (trajectories - mean) / std
     
@@ -1725,11 +1727,30 @@ def plot_error_analysis(ax, time_steps, original_pos, reconstructed_pos, sampled
     ax.set_title('L2 Position Error w.r.t Original')
     ax.grid(True, alpha=0.3)
 
+# Main Testing Function
 def test_model_performance(model, trajectories_norm, mean, std, num_test_samples=3, show_flag=True):
     """testing with obstacle-aware transformer"""
     print("\nTesting obstacle-aware model performance...")
     config = model.config
     device = next(model.parameters()).device
+    
+    # Define style names mapping
+    style_names = {
+        0: 'power_loop',
+        1: 'barrel_roll',
+        2: 'split_s',
+        3: 'immelmann',
+        4: 'wall_ride',
+        5: 'eight_figure',
+        6: 'star',
+        7: 'half_moon',
+        8: 'sphinx',
+        9: 'clover',
+        10: 'spiral_inward',
+        11: 'spiral_outward',
+        12: 'spiral_vertical_up',
+        13: 'spiral_vertical_down'
+    }
     
     mean_state = mean[..., :-1]  # Shape: (1, 1, 10)
     std_state = std[..., :-1]    # Shape: (1, 1, 10)
@@ -1743,12 +1764,6 @@ def test_model_performance(model, trajectories_norm, mean, std, num_test_samples
             # Prepare test sample
             full_traj = trajectories_norm[i:i+1]
             
-
-            # history = generate_history_segments(full_traj, config.history_len, device=device)
-            # x_0 = full_traj[:, config.history_len:, :]
-            # style_indices = x_0[:, 0, -1].long()  # Use style index from first timestep
-            # action = F.one_hot(style_indices, num_classes=config.action_dim).float()
-
             style_info = full_traj[:, :, -1:]  # Shape: (B, T_full, 1)
             state_without_style = full_traj[:, :, :-1]  # Shape: (B, T_full, state_dim-1)
 
@@ -1761,9 +1776,12 @@ def test_model_performance(model, trajectories_norm, mean, std, num_test_samples
             x_0_denorm = denormalize_trajectories(x_0, mean_state, std_state)
             target_denorm = target_norm * std_state[0, 0, 1:4] + mean_state[0, 0, 1:4]
             
-            style_index = style_info[:, 0, 0]  # Shape: (B,) - take first timestep, first feature
-            style_indices = style_index.long()
-            action = F.one_hot(style_indices, num_classes=config.action_dim).float()  # Shape: (B, action_dim)
+            # Extract style information
+            history_style = style_info[:, 0, 0]  # Style from history segment (first timestep)
+            pred_style = style_info[:, -1, 0]  # Style from prediction segment
+            
+            style_indices = pred_style.long()
+            action = F.one_hot(style_indices, num_classes=config.action_dim).float()
 
             # Generate random obstacles
             obstacles = generate_random_obstacles(x_0_denorm[0], 
@@ -1772,18 +1790,21 @@ def test_model_performance(model, trajectories_norm, mean, std, num_test_samples
                                                   check_collision=False, 
                                                   device=device)
             
-            # obstacles = generate_guaranteed_colliding_obstacles(x_0_denorm[0], num_obstacles_range=(0, 3), radius_range=(0.8, 2.5), allow_obstacle_overlap=True, device=device)
-
             # Set obstacles data for model input
             model.set_obstacles_data([obstacles])
             
+            # Get style names for display
+            hist_idx = history_style.item()
+            pred_idx = pred_style.item()
+            
             print(f"\n{'='*60}")
             print(f"TEST SAMPLE {i+1}")
+            print(f"History Style: {style_names.get(hist_idx, f'Style_{hist_idx}')} (idx={hist_idx})")
+            print(f"Prediction Style: {style_names.get(pred_idx, f'Style_{pred_idx}')} (idx={pred_idx})")
             print(f"Generated {len(obstacles)} random obstacles")
-            print(f"Obstacle information integrated into transformer via MLP encoder")
             print(f"{'='*60}")
-            
-            # 1. Sample Un-Guided Trajectory (to test base model/reconstruction)
+
+            # 1. Sample Un-Guided Trajectory
             sampled_unguided_norm = model.sample(
                 target_norm, action, 
                 history, 
@@ -1794,8 +1815,7 @@ def test_model_performance(model, trajectories_norm, mean, std, num_test_samples
             sampled_unguided_denorm = denormalize_trajectories(sampled_unguided_norm, mean_state, std_state)
 
             # 2. Sample CBF-Guided Trajectory
-            # Use a smaller number of steps for guided sampling visualization
-            config.set_show_flag(False) # Ensure plotting is off during sampling loop
+            config.set_show_flag(False)
             
             sampled_guided_norm = model.sample(
                 target_norm, 
@@ -1804,11 +1824,11 @@ def test_model_performance(model, trajectories_norm, mean, std, num_test_samples
                 batch_size=1, 
                 enable_guidance=True, 
                 guidance_gamma=config.guidance_gamma, 
-                plot_all_steps=False # Plotting is too slow, rely on final plot
+                plot_all_steps=False
             )
             sampled_guided_denorm = denormalize_trajectories(sampled_guided_norm, mean_state, std_state)
             
-            # 3. Final Plotting (denormalized)
+            # 3. Final Plotting with style information
             plot_test_results(
                 x_0_denorm, 
                 sampled_unguided_denorm, 
@@ -1817,8 +1837,106 @@ def test_model_performance(model, trajectories_norm, mean, std, num_test_samples
                 target_denorm,
                 obstacles,
                 show_flag,
-                step_idx=i+1
+                step_idx=i+1,
+                history_style=history_style,
+                pred_style=pred_style,
+                style_names=style_names
             )
+
+# def test_model_performance(model, trajectories_norm, mean, std, num_test_samples=3, show_flag=True):
+#     """testing with obstacle-aware transformer"""
+#     print("\nTesting obstacle-aware model performance...")
+#     config = model.config
+#     device = next(model.parameters()).device
+    
+#     mean_state = mean[..., :-1]  # Shape: (1, 1, 10)
+#     std_state = std[..., :-1]    # Shape: (1, 1, 10)
+
+#     # Set normalization parameters
+#     model.set_normalization_params(mean, std)
+    
+#     model.eval()
+#     with torch.no_grad():
+#         for i in range(min(num_test_samples, trajectories_norm.shape[0])):
+#             # Prepare test sample
+#             full_traj = trajectories_norm[i:i+1]
+            
+
+#             # history = generate_history_segments(full_traj, config.history_len, device=device)
+#             # x_0 = full_traj[:, config.history_len:, :]
+#             # style_indices = x_0[:, 0, -1].long()  # Use style index from first timestep
+#             # action = F.one_hot(style_indices, num_classes=config.action_dim).float()
+
+#             style_info = full_traj[:, :, -1:]  # Shape: (B, T_full, 1)
+#             state_without_style = full_traj[:, :, :-1]  # Shape: (B, T_full, state_dim-1)
+
+#             # Split into history and sequence-to-predict
+#             history = state_without_style[:, :config.history_len, :]
+#             x_0 = state_without_style[:, config.history_len:config.history_len+config.seq_len, :]
+#             target_norm = generate_target_waypoints(x_0)
+
+#             # Denormalize for obstacle generation and plotting
+#             x_0_denorm = denormalize_trajectories(x_0, mean_state, std_state)
+#             target_denorm = target_norm * std_state[0, 0, 1:4] + mean_state[0, 0, 1:4]
+            
+#             style_index = style_info[:, 0, 0]  # Shape: (B,) - take first timestep, first feature
+#             style_indices = style_index.long()
+#             action = F.one_hot(style_indices, num_classes=config.action_dim).float()  # Shape: (B, action_dim)
+
+#             # Generate random obstacles
+#             obstacles = generate_random_obstacles(x_0_denorm[0], 
+#                                                   num_obstacles_range=(3, 5), 
+#                                                   radius_range=(0.5, 1.0), 
+#                                                   check_collision=False, 
+#                                                   device=device)
+            
+#             # obstacles = generate_guaranteed_colliding_obstacles(x_0_denorm[0], num_obstacles_range=(0, 3), radius_range=(0.8, 2.5), allow_obstacle_overlap=True, device=device)
+
+#             # Set obstacles data for model input
+#             model.set_obstacles_data([obstacles])
+            
+#             print(f"\n{'='*60}")
+#             print(f"TEST SAMPLE {i+1}")
+#             print(f"Generated {len(obstacles)} random obstacles")
+#             print(f"Obstacle information integrated into transformer via MLP encoder")
+#             print(f"{'='*60}")
+            
+#             # 1. Sample Un-Guided Trajectory (to test base model/reconstruction)
+#             sampled_unguided_norm = model.sample(
+#                 target_norm, action, 
+#                 history, 
+#                 batch_size=1, 
+#                 enable_guidance=False, 
+#                 plot_all_steps=False
+#             )
+#             sampled_unguided_denorm = denormalize_trajectories(sampled_unguided_norm, mean_state, std_state)
+
+#             # 2. Sample CBF-Guided Trajectory
+#             # Use a smaller number of steps for guided sampling visualization
+#             config.set_show_flag(False) # Ensure plotting is off during sampling loop
+            
+#             sampled_guided_norm = model.sample(
+#                 target_norm, 
+#                 action, 
+#                 history, 
+#                 batch_size=1, 
+#                 enable_guidance=True, 
+#                 guidance_gamma=config.guidance_gamma, 
+#                 plot_all_steps=False # Plotting is too slow, rely on final plot
+#             )
+#             sampled_guided_denorm = denormalize_trajectories(sampled_guided_norm, mean_state, std_state)
+            
+#             # 3. Final Plotting (denormalized)
+#             plot_test_results(
+#                 x_0_denorm, 
+#                 sampled_unguided_denorm, 
+#                 sampled_guided_denorm, 
+#                 denormalize_trajectories(history, mean_state, std_state) if history is not None else None,
+#                 target_denorm,
+#                 obstacles,
+#                 show_flag,
+#                 step_idx=i+1
+#             )
 
 def format_progress(epoch, num_epochs, start_time, avg_total, avg_position, avg_vel, avg_obstacle, avg_continuity, use_obstacle_loss):
     progress = (epoch + 1) / num_epochs
@@ -2408,6 +2526,768 @@ def plot_detailed_style_comparison(guided_traj, unguided_traj, target, history, 
         plt.savefig(filename, format='svg', bbox_inches='tight')
         plt.close()
 
+def random_concatenate_trajectories(trajectories, history_len, seq_len, num_concatenated=None):
+    """
+    Randomly concatenate different trajectories to generate new augmented trajectories.
+    
+    Method: Select first [0:history_len] from trajectory 1 + [history_len:history_len+seq_len] from trajectory 2.
+    The style (last dimension) is inherited from trajectory 2 since it determines the maneuver type.
+    
+    Args:
+        trajectories (torch.Tensor): Original trajectories tensor of shape (num_trajectories, total_len, state_dim)
+        history_len (int): Length of history segment to take from first trajectory
+        seq_len (int): Length of future segment to take from second trajectory
+        num_concatenated (int, optional): Number of concatenated trajectories to generate. 
+                                          If None, defaults to half of original trajectories.
+    
+    Returns:
+        torch.Tensor: Concatenated trajectories with same shape as input
+    """
+    num_original = trajectories.shape[0]
+    total_len = history_len + seq_len
+    
+    if num_concatenated is None:
+        num_concatenated = num_original // 2
+    
+    device = trajectories.device
+    
+    concatenated_trajectories = []
+    
+    for i in range(num_concatenated):
+        # Randomly select two different trajectories
+        idx1 = torch.randint(0, num_original, (1,)).item()
+        idx2 = torch.randint(0, num_original, (1,)).item()
+        
+        # Ensure they are different trajectories
+        while idx1 == idx2 and num_original > 1:
+            idx2 = torch.randint(0, num_original, (1,)).item()
+        
+        # Extract segments
+        # Trajectory 1: first history_len steps
+        history_segment = trajectories[idx1, :history_len, :]  # (history_len, state_dim)
+        
+        # Trajectory 2: from history_len to history_len+seq_len steps
+        future_segment = trajectories[idx2, history_len:history_len+seq_len, :]  # (seq_len, state_dim)
+        
+        # Concatenate along time dimension
+        new_trajectory = torch.cat([history_segment, future_segment], dim=0)  # (total_len, state_dim)
+        
+        concatenated_trajectories.append(new_trajectory)
+    
+    # Stack all concatenated trajectories
+    concatenated_trajectories = torch.stack(concatenated_trajectories, dim=0)
+    
+    return concatenated_trajectories
+
+
+def augment_trajectories_with_concatenation(trajectories, history_len, seq_len, 
+                                            concat_ratio=0.5, smooth_transition=True):
+    """
+    Augment trajectory dataset by randomly concatenating different trajectories.
+    
+    This creates new trajectories by combining history from one trajectory with 
+    future from another, which helps the model learn to handle diverse history-future
+    combinations and improves generalization.
+    
+    Args:
+        trajectories (torch.Tensor): Original trajectories of shape (N, total_len, state_dim)
+        history_len (int): Length of history segment
+        seq_len (int): Length of future prediction segment  
+        concat_ratio (float): Ratio of concatenated trajectories to original (default: 0.5)
+        smooth_transition (bool): If True, apply smoothing at the connection point to avoid 
+                                  abrupt changes (default: True)
+    
+    Returns:
+        torch.Tensor: Augmented trajectories (original + concatenated)
+    """
+    num_original = trajectories.shape[0]
+    num_concatenated = int(num_original * concat_ratio)
+    
+    print(f"Augmenting trajectories: {num_original} original + {num_concatenated} concatenated")
+    
+    # Generate concatenated trajectories
+    concatenated = random_concatenate_trajectories(
+        trajectories, history_len, seq_len, num_concatenated
+    )
+    
+    if smooth_transition and history_len > 0 and seq_len > 0:
+        # Apply smoothing at the connection boundary to avoid abrupt velocity changes
+        # Smooth over a small window around the connection point
+        smooth_window = min(3, history_len, seq_len)
+        
+        for i in range(num_concatenated):
+            # Get positions at boundary (indices 1:4 are x,y,z)
+            pos_before = concatenated[i, history_len-1, 1:4].clone()
+            pos_after = concatenated[i, history_len, 1:4].clone()
+            
+            # Linear interpolation for smooth transition
+            for j in range(1, smooth_window + 1):
+                alpha = j / (smooth_window + 1)
+                # Blend positions near boundary
+                if history_len - j >= 0:
+                    original_pos = concatenated[i, history_len - j, 1:4].clone()
+                    target_pos = pos_before * (1 - alpha * 0.3) + pos_after * (alpha * 0.3)
+                    concatenated[i, history_len - j, 1:4] = original_pos * 0.7 + target_pos * 0.3
+                
+                if history_len + j - 1 < concatenated.shape[1]:
+                    original_pos = concatenated[i, history_len + j - 1, 1:4].clone()
+                    target_pos = pos_before * (alpha * 0.3) + pos_after * (1 - alpha * 0.3)
+                    concatenated[i, history_len + j - 1, 1:4] = original_pos * 0.7 + target_pos * 0.3
+    
+    # Combine original and concatenated trajectories
+    augmented_trajectories = torch.cat([trajectories, concatenated], dim=0)
+    
+    print(f"Total trajectories after augmentation: {augmented_trajectories.shape[0]}")
+    
+    return augmented_trajectories
+
+
+def compute_trajectory_connection_transform(history_end_pos, history_end_vel, future_start_pos):
+    """
+    Compute translation and rotation to smoothly connect two trajectory segments.
+    
+    Args:
+        history_end_pos (torch.Tensor): Final position of history segment (3,)
+        history_end_vel (torch.Tensor): Final velocity of history segment (3,)
+        future_start_pos (torch.Tensor): First position of future segment (3,)
+    
+    Returns:
+        tuple: (translation vector, rotation matrix) to apply to future segment
+    """
+    # Translation: align future start to history end
+    translation = history_end_pos - future_start_pos
+    
+    # For simplicity, we use identity rotation (no rotation)
+    # Full rotation alignment would require more complex computation
+    rotation = torch.eye(3, device=history_end_pos.device)
+    
+    return translation, rotation
+
+
+def apply_smooth_connection(history_segment, future_segment, smooth_window=5):
+    """
+    Apply smooth blending at the connection boundary between history and future segments.
+    
+    Uses cosine-weighted blending to ensure C1 continuity (position and velocity continuous).
+    
+    Args:
+        history_segment (torch.Tensor): History segment of shape (history_len, state_dim)
+        future_segment (torch.Tensor): Future segment of shape (seq_len, state_dim)
+        smooth_window (int): Number of frames to blend on each side of the connection
+    
+    Returns:
+        tuple: (adjusted_history_segment, adjusted_future_segment)
+    """
+    history_len = history_segment.shape[0]
+    seq_len = future_segment.shape[0]
+    
+    # Ensure window doesn't exceed available frames
+    window = min(smooth_window, history_len, seq_len)
+    
+    if window < 2:
+        return history_segment, future_segment
+    
+    # Get positions at the boundary
+    history_pos = history_segment[:, 1:4]  # (history_len, 3)
+    future_pos = future_segment[:, 1:4]    # (seq_len, 3)
+    
+    # Compute velocities at boundary (using finite differences)
+    if history_len >= 2:
+        history_vel = history_pos[-1] - history_pos[-2]
+    else:
+        history_vel = torch.zeros(3, device=history_pos.device)
+    
+    if seq_len >= 2:
+        future_vel = future_pos[1] - future_pos[0]
+    else:
+        future_vel = torch.zeros(3, device=future_pos.device)
+    
+    # Compute desired connection velocity (average of both sides for smoothness)
+    connection_vel = (history_vel + future_vel) / 2.0
+    
+    # Adjust history segment near the end
+    adjusted_history = history_segment.clone()
+    adjusted_future = future_segment.clone()
+    
+    for i in range(1, window + 1):
+        # Cosine blending weight: smooth transition from 0 to 1
+        alpha = 0.5 * (1 - torch.cos(torch.tensor(i / (window + 1) * 3.14159, device=history_pos.device)))
+        
+        # Adjust history positions near the end
+        hist_idx = history_len - window + i - 1
+        if hist_idx >= 0 and hist_idx < history_len:
+            # Target position based on smooth velocity integration
+            target_pos = history_pos[-1] - connection_vel * (window - i + 1)
+            # Blend between original and target
+            adjusted_history[hist_idx, 1:4] = (1 - alpha) * history_pos[hist_idx] + alpha * target_pos
+        
+        # Adjust future positions near the start
+        fut_idx = i - 1
+        if fut_idx < seq_len:
+            # Target position based on smooth velocity integration
+            target_pos = history_pos[-1] + connection_vel * i
+            # Blend between original and target
+            adjusted_future[fut_idx, 1:4] = (1 - alpha) * future_pos[fut_idx] + alpha * target_pos
+    
+    # Ensure exact continuity at the boundary
+    adjusted_future[0, 1:4] = history_pos[-1]
+    
+    # Update velocities (speed component at index 0)
+    adjusted_history = update_speed_from_positions(adjusted_history)
+    adjusted_future = update_speed_from_positions(adjusted_future)
+    
+    return adjusted_history, adjusted_future
+
+
+def update_speed_from_positions(trajectory):
+    """
+    Update speed component (index 0) based on position differences.
+    
+    Args:
+        trajectory (torch.Tensor): Trajectory of shape (seq_len, state_dim)
+    
+    Returns:
+        torch.Tensor: Trajectory with updated speed values
+    """
+    traj = trajectory.clone()
+    positions = traj[:, 1:4]
+    
+    if positions.shape[0] >= 2:
+        # Compute speeds as magnitude of velocity
+        velocities = positions[1:] - positions[:-1]
+        speeds = torch.norm(velocities, dim=1)
+        
+        # Assign speeds (first frame uses second frame's speed)
+        traj[0, 0] = speeds[0]
+        traj[1:, 0] = speeds
+    
+    return traj
+
+
+def random_concatenate_trajectories_smooth(trajectories, history_len, seq_len, 
+                                           num_concatenated=None, smooth_window=5):
+    """
+    Randomly concatenate different trajectories with smooth connection.
+    
+    Method: 
+    1. Select history segment from trajectory 1: [0:history_len]
+    2. Select future segment from trajectory 2: [history_len:history_len+seq_len]
+    3. Translate future segment to align with history end point
+    4. Apply smooth blending at the connection boundary
+    
+    Args:
+        trajectories (torch.Tensor): Original trajectories of shape (N, total_len, state_dim)
+        history_len (int): Length of history segment
+        seq_len (int): Length of future prediction segment
+        num_concatenated (int, optional): Number of concatenated trajectories to generate
+        smooth_window (int): Number of frames to blend at the connection
+    
+    Returns:
+        torch.Tensor: Smoothly concatenated trajectories
+    """
+    num_original = trajectories.shape[0]
+    
+    if num_concatenated is None:
+        num_concatenated = num_original // 2
+    
+    device = trajectories.device
+    concatenated_trajectories = []
+    
+    for i in range(num_concatenated):
+        # Randomly select two different trajectories
+        idx1 = torch.randint(0, num_original, (1,)).item()
+        idx2 = torch.randint(0, num_original, (1,)).item()
+        
+        # Ensure they are different trajectories
+        while idx1 == idx2 and num_original > 1:
+            idx2 = torch.randint(0, num_original, (1,)).item()
+        
+        style1 = trajectories[idx1, 0, -1].item()
+        style2 = trajectories[idx2, 0, -1].item()
+        
+        if style1 != style2:
+            # different_style_count += 1
+            print(f"Concatenating different styles: {style1} -> {style2}")
+    
+        # print(f"Total concatenations with different styles: {different_style_count}/{num_concatenated}")
+
+        # Extract segments
+        history_segment = trajectories[idx1, :history_len, :].clone()  # (history_len, state_dim)
+        future_segment = trajectories[idx2, history_len:history_len+seq_len, :].clone()  # (seq_len, state_dim)
+        
+        # Get boundary positions
+        history_end_pos = history_segment[-1, 1:4]  # (3,)
+        future_start_pos = future_segment[0, 1:4]   # (3,)
+        
+        # Compute translation to align future start with history end
+        translation = history_end_pos - future_start_pos
+        
+        # Apply translation to all positions in future segment
+        future_segment[:, 1:4] = future_segment[:, 1:4] + translation.unsqueeze(0)
+        
+        # Apply smooth blending at the connection
+        history_segment, future_segment = apply_smooth_connection(
+            history_segment, future_segment, smooth_window
+        )
+        
+        # Concatenate along time dimension
+        new_trajectory = torch.cat([history_segment, future_segment], dim=0)  # (total_len, state_dim)
+        
+        concatenated_trajectories.append(new_trajectory)
+    
+    # Stack all concatenated trajectories
+    concatenated_trajectories = torch.stack(concatenated_trajectories, dim=0)
+    
+    return concatenated_trajectories
+
+
+def augment_trajectories_with_smooth_concatenation(trajectories, history_len, seq_len,
+                                                   concat_ratio=0.5, smooth_window=5,
+                                                   validate_continuity=True):
+    """
+    Augment trajectory dataset by smoothly concatenating different trajectories.
+    
+    This creates new trajectories by combining history from one trajectory with 
+    future from another, ensuring smooth position and velocity continuity at the boundary.
+    
+    Args:
+        trajectories (torch.Tensor): Original trajectories of shape (N, total_len, state_dim)
+        history_len (int): Length of history segment
+        seq_len (int): Length of future prediction segment  
+        concat_ratio (float): Ratio of concatenated trajectories to original (default: 0.5)
+        smooth_window (int): Number of frames for smooth blending at connection
+        validate_continuity (bool): If True, print continuity validation statistics
+    
+    Returns:
+        torch.Tensor: Augmented trajectories (original + concatenated)
+    """
+    num_original = trajectories.shape[0]
+    num_concatenated = int(num_original * concat_ratio)
+    
+    print(f"Augmenting trajectories with smooth concatenation:")
+    print(f"  - Original trajectories: {num_original}")
+    print(f"  - Concatenated trajectories: {num_concatenated}")
+    print(f"  - Smooth window: {smooth_window}")
+    
+    # Generate smoothly concatenated trajectories
+    concatenated = random_concatenate_trajectories_smooth(
+        trajectories, history_len, seq_len, num_concatenated, smooth_window
+    )
+    
+    if validate_continuity:
+        validate_connection_continuity(concatenated, history_len)
+    
+    # Combine original and concatenated trajectories
+    augmented_trajectories = torch.cat([trajectories, concatenated], dim=0)
+    
+    print(f"  - Total trajectories after augmentation: {augmented_trajectories.shape[0]}")
+    
+    return concatenated
+
+
+def validate_connection_continuity(concatenated_trajectories, history_len):
+    """
+    Validate the continuity at the connection point of concatenated trajectories.
+    
+    Computes position jump and velocity discontinuity at the boundary.
+    
+    Args:
+        concatened_trajectories (torch.Tensor): Concatenated trajectories
+        history_len (int): Length of history segment (boundary index)
+    """
+    num_traj = concatenated_trajectories.shape[0]
+    device = concatenated_trajectories.device
+    
+    position_jumps = []
+    velocity_jumps = []
+    
+    with torch.no_grad():
+        for i in range(num_traj):
+            # Get positions around boundary
+            pos_before = concatenated_trajectories[i, history_len-1, 1:4]
+            pos_at = concatenated_trajectories[i, history_len, 1:4]
+            pos_after = concatenated_trajectories[i, history_len+1, 1:4] if history_len+1 < concatenated_trajectories.shape[1] else pos_at
+            
+            # Position jump at boundary (should be near zero)
+            pos_jump = torch.norm(pos_at - pos_before)
+            position_jumps.append(pos_jump.item())
+            
+            # Velocity continuity
+            vel_before = pos_at - pos_before
+            vel_after = pos_after - pos_at
+            vel_jump = torch.norm(vel_after - vel_before)
+            velocity_jumps.append(vel_jump.item())
+    
+    # Compute statistics
+    pos_jumps = torch.tensor(position_jumps)
+    vel_jumps = torch.tensor(velocity_jumps)
+    
+    print(f"\nConnection Continuity Validation:")
+    print(f"  - Position jump at boundary:")
+    print(f"      Mean: {pos_jumps.mean():.6f}, Max: {pos_jumps.max():.6f}, Std: {pos_jumps.std():.6f}")
+    print(f"  - Velocity discontinuity at boundary:")
+    print(f"      Mean: {vel_jumps.mean():.6f}, Max: {vel_jumps.max():.6f}, Std: {vel_jumps.std():.6f}")
+    
+    # Check if continuity is good (position jump < 1e-4)
+    if pos_jumps.mean() < 1e-4:
+        print(f"  ✓ Position continuity is excellent")
+    elif pos_jumps.mean() < 1e-2:
+        print(f"  ✓ Position continuity is good")
+    else:
+        print(f"  ⚠ Position continuity may need improvement")
+
+
+def plot_test_results(original, sampled_unguided_denorm, sampled_guided_denorm, history, target, 
+                      obstacles=None, show_flag=True, step_idx=0, 
+                      history_style=None, pred_style=None, style_names=None):
+    """
+    Plot test results including original, reconstructed (unguided), and guided samples.
+    Supports 3D, 2D projections, time-series plots, and style information display.
+    
+    Args:
+        original: Original trajectory (1, seq_len, state_dim)
+        sampled_unguided_denorm: Unguided sampled trajectory (1, seq_len, state_dim)
+        sampled_guided_denorm: Guided sampled trajectory (1, seq_len, state_dim)
+        history: History segment (1, history_len, state_dim)
+        target: Target waypoint (1, 3)
+        obstacles: List of obstacle dictionaries
+        show_flag: Whether to display plot or save to file
+        step_idx: Sample index for filename
+        history_style: Style index of history segment (int or tensor)
+        pred_style: Style index of prediction segment (int or tensor)
+        style_names: Dictionary mapping style indices to names
+    """
+    # Precompute all data at once to avoid repeated operations
+    original_pos = original[0, :, 1:4].detach().cpu().numpy()
+    reconstructed_pos = sampled_unguided_denorm[0, :, 1:4].detach().cpu().numpy()
+    sampled_pos = sampled_guided_denorm[0, :, 1:4].detach().cpu().numpy()
+    
+    # Extract speeds
+    original_speed = original[0, :, 0].detach().cpu().numpy()
+    reconstructed_speed = sampled_unguided_denorm[0, :, 0].detach().cpu().numpy()
+    sampled_speed = sampled_guided_denorm[0, :, 0].detach().cpu().numpy()
+    
+    time_steps = np.arange(len(original_pos))
+    history_pos = history[0, :, 1:4].detach().cpu().numpy() if history is not None else None
+    target_pos = target[0, :].detach().cpu().numpy() if target is not None else None
+    
+    # Process style information
+    history_style_name = "Unknown"
+    pred_style_name = "Unknown"
+    if style_names is not None:
+        if history_style is not None:
+            hist_idx = history_style.item() if hasattr(history_style, 'item') else history_style
+            history_style_name = style_names.get(hist_idx, f"Style_{hist_idx}")
+        if pred_style is not None:
+            pred_idx = pred_style.item() if hasattr(pred_style, 'item') else pred_style
+            pred_style_name = style_names.get(pred_idx, f"Style_{pred_idx}")
+
+    # Create figure with optimized layout (added one more subplot for style info)
+    fig = plt.figure(figsize=(24, 18))
+    
+    # Main title with style information
+    title_text = f'AeroDM Trajectory Generation Results (Test Sample {step_idx})'
+    if history_style is not None or pred_style is not None:
+        title_text += f'\nHistory Style: {history_style_name} | Prediction Style: {pred_style_name}'
+    fig.suptitle(title_text, fontsize=16, fontweight='bold', y=0.98)
+    
+    # Define consistent styling
+    STYLES = {
+        'history': {'color': 'magenta', 'linewidth': 4, 'alpha': 0.8, 'marker': 'o', 'markersize': 4},
+        'original': {'color': 'blue', 'linewidth': 3, 'alpha': 0.9},
+        'reconstructed': {'color': 'red', 'linewidth': 2, 'alpha': 0.8, 'linestyle': '--', 'marker': '.'},
+        'sampled': {'color': 'green', 'linewidth': 2, 'alpha': 0.8, 'linestyle': '-.', 'marker': '.'},
+        'target': {'color': 'yellow', 's': 200, 'marker': '*', 'edgecolors': 'black', 'linewidth': 2}
+    }
+    
+    # Fixed bounds for consistent scaling
+    fixed_bounds = {
+        'xlim': (-20, 20),
+        'ylim': (-20, 20), 
+        'zlim': (-20, 20)
+    }
+
+    # 1. 3D trajectory plot
+    ax1 = fig.add_subplot(341, projection='3d')
+    plot_3d_trajectory(ax1, original_pos, reconstructed_pos, sampled_pos, history_pos, target_pos, obstacles, STYLES, fixed_bounds)
+    
+    # 2-4. 2D Projections
+    projections = [
+        (342, 'X-Y Projection', 0, 1, 'X', 'Y'),
+        (343, 'X-Z Projection', 0, 2, 'X', 'Z'), 
+        (344, 'Y-Z Projection', 1, 2, 'Y', 'Z')
+    ]
+    
+    for subplot_idx, title, dim1, dim2, xlabel, ylabel in projections:
+        ax = fig.add_subplot(subplot_idx)
+        plot_2d_projection(ax, original_pos, reconstructed_pos, sampled_pos, history_pos, 
+                          target_pos, obstacles, STYLES, dim1, dim2, title, xlabel, ylabel)
+
+    # 5-7. Position over time
+    positions = [
+        (345, 'X Position Over Time', 0, 'X Position'),
+        (346, 'Y Position Over Time', 1, 'Y Position'), 
+        (347, 'Z Position Over Time', 2, 'Z Position')
+    ]
+    
+    for subplot_idx, title, dim, ylabel in positions:
+        ax = fig.add_subplot(subplot_idx)
+        plot_position_time(ax, time_steps, original_pos, reconstructed_pos, sampled_pos, 
+                          history_pos, dim, title, ylabel, STYLES)
+
+    # 8. Speed comparison
+    ax8 = fig.add_subplot(348)
+    plot_speed_comparison(ax8, time_steps, original_speed, reconstructed_speed, sampled_speed, STYLES)
+
+    # 9. Error analysis
+    ax9 = fig.add_subplot(349)
+    plot_error_analysis(ax9, time_steps, original_pos, reconstructed_pos, sampled_pos)
+    
+    # 10. Style information display
+    ax10 = fig.add_subplot(3, 4, 10)
+    plot_style_information(ax10, history_style_name, pred_style_name, style_names, 
+                           history_pos, original_pos, history_style, pred_style)
+    
+    # 11. Trajectory statistics
+    ax11 = fig.add_subplot(3, 4, 11)
+    plot_trajectory_statistics(ax11, original_pos, reconstructed_pos, sampled_pos)
+    
+    # 12. Style distribution or additional info
+    ax12 = fig.add_subplot(3, 4, 12)
+    plot_connection_info(ax12, history_pos, original_pos, history_len=history_pos.shape[0] if history_pos is not None else 0)
+
+    plt.tight_layout(rect=[0, 0.02, 1, 0.94])
+    
+    if show_flag:
+        plt.show()
+    else:
+        filename = f"Figs/test_sample_{step_idx:03d}_results.svg"
+        plt.savefig(filename, format='svg', bbox_inches='tight', dpi=300)
+        plt.close()
+
+
+def plot_style_information(ax, history_style_name, pred_style_name, style_names, 
+                           history_pos, original_pos, history_style, pred_style):
+    """
+    Plot style information for history and prediction segments.
+    
+    Args:
+        ax: Matplotlib axis
+        history_style_name: Name of history style
+        pred_style_name: Name of prediction style
+        style_names: Dictionary of all style names
+        history_pos: History positions array
+        original_pos: Original prediction positions array
+        history_style: History style index
+        pred_style: Prediction style index
+    """
+    ax.axis('off')
+    
+    # Create style information text
+    info_lines = []
+    info_lines.append("=" * 40)
+    info_lines.append("STYLE INFORMATION")
+    info_lines.append("=" * 40)
+    info_lines.append("")
+    
+    # History segment style
+    if history_style is not None:
+        hist_idx = history_style.item() if hasattr(history_style, 'item') else history_style
+        info_lines.append(f"📜 HISTORY SEGMENT STYLE:")
+        info_lines.append(f"   Index: {hist_idx}")
+        info_lines.append(f"   Name:  {history_style_name}")
+        if history_pos is not None:
+            info_lines.append(f"   Length: {len(history_pos)} frames")
+    else:
+        info_lines.append(f"📜 HISTORY SEGMENT: None")
+    
+    info_lines.append("")
+    info_lines.append("-" * 40)
+    info_lines.append("")
+    
+    # Prediction segment style
+    if pred_style is not None:
+        pred_idx = pred_style.item() if hasattr(pred_style, 'item') else pred_style
+        info_lines.append(f"🎯 PREDICTION SEGMENT STYLE:")
+        info_lines.append(f"   Index: {pred_idx}")
+        info_lines.append(f"   Name:  {pred_style_name}")
+        info_lines.append(f"   Length: {len(original_pos)} frames")
+    else:
+        info_lines.append(f"🎯 PREDICTION SEGMENT: Unknown")
+    
+    info_lines.append("")
+    info_lines.append("=" * 40)
+    
+    # Check if styles match
+    if history_style is not None and pred_style is not None:
+        hist_idx = history_style.item() if hasattr(history_style, 'item') else history_style
+        pred_idx = pred_style.item() if hasattr(pred_style, 'item') else pred_style
+        if hist_idx == pred_idx:
+            info_lines.append("✓ Styles MATCH")
+        else:
+            info_lines.append("⚠ Styles DIFFERENT")
+    
+    # Color code based on style match
+    if history_style is not None and pred_style is not None:
+        hist_idx = history_style.item() if hasattr(history_style, 'item') else history_style
+        pred_idx = pred_style.item() if hasattr(pred_style, 'item') else pred_style
+        if hist_idx == pred_idx:
+            box_color = 'lightgreen'
+        else:
+            box_color = 'lightyellow'
+    else:
+        box_color = 'lightgray'
+    
+    # Display text in a box
+    info_text = '\n'.join(info_lines)
+    ax.text(0.5, 0.5, info_text, transform=ax.transAxes, fontsize=9,
+            verticalalignment='center', horizontalalignment='center',
+            fontfamily='monospace',
+            bbox=dict(boxstyle='round', facecolor=box_color, alpha=0.8))
+
+
+def plot_trajectory_statistics(ax, original_pos, reconstructed_pos, sampled_pos):
+    """
+    Plot trajectory statistics comparison.
+    
+    Args:
+        ax: Matplotlib axis
+        original_pos: Original trajectory positions
+        reconstructed_pos: Reconstructed (unguided) positions
+        sampled_pos: Sampled guided positions
+    """
+    # Compute statistics
+    def compute_stats(pos):
+        total_length = np.sum(np.linalg.norm(np.diff(pos, axis=0), axis=1))
+        max_height = np.max(pos[:, 2])
+        mean_speed = np.mean(np.linalg.norm(np.diff(pos, axis=0), axis=1))
+        return total_length, max_height, mean_speed
+    
+    orig_len, orig_height, orig_speed = compute_stats(original_pos)
+    recon_len, recon_height, recon_speed = compute_stats(reconstructed_pos)
+    sampled_len, sampled_height, sampled_speed = compute_stats(sampled_pos)
+    
+    # Create bar chart
+    categories = ['Path Length', 'Max Height', 'Mean Speed']
+    orig_values = [orig_len, orig_height, orig_speed]
+    recon_values = [recon_len, recon_height, recon_speed]
+    sampled_values = [sampled_len, sampled_height, sampled_speed]
+    
+    x = np.arange(len(categories))
+    width = 0.25
+    
+    bars1 = ax.bar(x - width, orig_values, width, label='Original', color='blue', alpha=0.7)
+    bars2 = ax.bar(x, recon_values, width, label='Unguided', color='red', alpha=0.7)
+    bars3 = ax.bar(x + width, sampled_values, width, label='Guided', color='green', alpha=0.7)
+    
+    ax.set_ylabel('Value')
+    ax.set_title('Trajectory Statistics Comparison')
+    ax.set_xticks(x)
+    ax.set_xticklabels(categories, fontsize=8)
+    ax.legend(fontsize=7)
+    ax.grid(True, alpha=0.3, axis='y')
+
+
+def plot_connection_info(ax, history_pos, original_pos, history_len=0):
+    """
+    Plot connection information between history and prediction.
+    
+    Args:
+        ax: Matplotlib axis
+        history_pos: History positions array
+        original_pos: Original prediction positions array
+        history_len: Length of history segment
+    """
+    ax.axis('off')
+    
+    info_lines = []
+    info_lines.append("=" * 40)
+    info_lines.append("CONNECTION INFORMATION")
+    info_lines.append("=" * 40)
+    info_lines.append("")
+    
+    if history_pos is not None and len(history_pos) > 0 and len(original_pos) > 0:
+        # Compute position jump at connection
+        history_end = history_pos[-1]
+        pred_start = original_pos[0]
+        pos_jump = np.linalg.norm(pred_start - history_end)
+        
+        # Compute velocity continuity
+        if len(history_pos) >= 2:
+            history_vel = history_pos[-1] - history_pos[-2]
+        else:
+            history_vel = np.zeros(3)
+        
+        if len(original_pos) >= 2:
+            pred_vel = original_pos[1] - original_pos[0]
+        else:
+            pred_vel = np.zeros(3)
+        
+        vel_jump = np.linalg.norm(pred_vel - history_vel)
+        
+        info_lines.append(f"History length: {len(history_pos)}")
+        info_lines.append(f"Prediction length: {len(original_pos)}")
+        info_lines.append("")
+        info_lines.append(f"Position jump at connection:")
+        info_lines.append(f"  {pos_jump:.4f}")
+        info_lines.append("")
+        info_lines.append(f"Velocity discontinuity:")
+        info_lines.append(f"  {vel_jump:.4f}")
+        
+        # Evaluate connection quality
+        info_lines.append("")
+        if pos_jump < 0.01:
+            info_lines.append("✓ Position: EXCELLENT")
+        elif pos_jump < 0.1:
+            info_lines.append("✓ Position: GOOD")
+        else:
+            info_lines.append("⚠ Position: POOR")
+            
+        if vel_jump < 0.1:
+            info_lines.append("✓ Velocity: SMOOTH")
+        elif vel_jump < 0.5:
+            info_lines.append("✓ Velocity: ACCEPTABLE")
+        else:
+            info_lines.append("⚠ Velocity: ABRUPT")
+    else:
+        info_lines.append("No connection information")
+        info_lines.append("(Missing history or prediction)")
+    
+    info_lines.append("")
+    info_lines.append("=" * 40)
+    
+    info_text = '\n'.join(info_lines)
+    ax.text(0.5, 0.5, info_text, transform=ax.transAxes, fontsize=9,
+            verticalalignment='center', horizontalalignment='center',
+            fontfamily='monospace',
+            bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.8))
+
+
+def plot_position_time(ax, time_steps, original_pos, reconstructed_pos, sampled_pos, 
+                       history_pos, dim, title, ylabel, styles):
+    """Plot position over time for a specific dimension, including history."""
+    # Plot history if available
+    if history_pos is not None:
+        history_time = np.arange(-len(history_pos), 0)
+        ax.plot(history_time, history_pos[:, dim], 
+                label='History', **{k: v for k, v in styles['history'].items() if k != 'marker'})
+    
+    ax.plot(time_steps, original_pos[:, dim], 
+            label=f'Original', **{k: v for k, v in styles['original'].items() if k != 'marker'})
+    ax.plot(time_steps, reconstructed_pos[:, dim], 
+            label=f'Reconstructed', **{k: v for k, v in styles['reconstructed'].items() if k != 'marker'})
+    ax.plot(time_steps, sampled_pos[:, dim], 
+            label=f'Sampled Guided', **{k: v for k, v in styles['sampled'].items() if k != 'marker'})
+    
+    # Add vertical line at connection point
+    ax.axvline(x=0, color='gray', linestyle=':', alpha=0.5, label='Connection')
+    
+    ax.set_xlabel('Time Step')
+    ax.set_ylabel(ylabel)
+    ax.legend(fontsize=8)
+    ax.set_title(title)
+    ax.grid(True, alpha=0.3)
+
 
 # the main execution
 if __name__ == "__main__":
@@ -2466,6 +3346,26 @@ if __name__ == "__main__":
     #     seq_len=config.seq_len + config.history_len
     # )
 
+    # Augment trajectories with random concatenation
+    # trajectories = augment_trajectories_with_concatenation(
+    #     trajectories, 
+    #     config.history_len, 
+    #     config.seq_len,
+    #     concat_ratio=0.5,  # Add 50% more trajectories through concatenation
+    #     smooth_transition=True
+    # )
+
+    # Augment trajectories with smooth concatenation
+    trajectories = augment_trajectories_with_smooth_concatenation(
+        trajectories, 
+        config.history_len, 
+        config.seq_len,
+        concat_ratio=1.0,      # Add 50% more trajectories
+        smooth_window=5,        # Blend over 5 frames
+        validate_continuity=True # Print continuity statistics
+    )
+    
+
     # Split trajectories into train and test sets (80/20 split)
     torch.manual_seed(42) # For reproducibility
     indices = torch.randperm(num_trajectories)
@@ -2478,11 +3378,11 @@ if __name__ == "__main__":
     
     # Normalize on train set and apply to test
     train_norm, mean, std = normalize_trajectories(train_trajectories)
-    test_norm = (test_trajectories - mean) / std
+    test_norm, _, _ = normalize_trajectories(test_trajectories, mean=mean, std=std)
     
+    # Move data to device
     train_norm = train_norm.to(device)
     test_norm = test_norm.to(device)
-    # Move to device for consistency in testing
     mean = mean.to(device)
     std = std.to(device)
     
@@ -2532,7 +3432,8 @@ if __name__ == "__main__":
 
             # FIXED: Use the style index from the FIRST timestep of the FULL trajectory
             # Since style is constant, any timestep works, but use the first for clarity
-            style_index = style_info[:, 0, 0]  # Shape: (B,) - take first timestep, first feature
+            # style_index = style_info[:, 0, 0]  # Shape: (B,) - take first timestep, first feature
+            style_index = style_info[:, -1, 0]  # Take the last timestep's style index, which should be the same as the first if consistent
             style_indices = style_index.long()
             action = F.one_hot(style_indices, num_classes=config.action_dim).float()  # Shape: (B, action_dim)
             
@@ -2644,7 +3545,7 @@ if __name__ == "__main__":
         torch.save(checkpoint, "model/aerodm_v2_test.pth")
 
     # Run the visualization test
-    # test_model_performance(model, test_norm, mean, std, num_test_samples=100, show_flag=config.show_flag)
+    test_model_performance(model, test_norm, mean, std, num_test_samples=100, show_flag=config.show_flag)
 
     # Run the action effect test with detailed plots for each style
-    test_action_effect(model, test_norm, mean, std, num_test_samples=3, show_flag=config.show_flag)
+    # test_action_effect(model, test_norm, mean, std, num_test_samples=3, show_flag=config.show_flag)
