@@ -62,6 +62,7 @@ class Config:
     acc_weight=1.0 # Weight for acceleration term
 
     drop_style_prob = 0.1  # Probability of dropping style information during training for robustness
+    drop_target_prob = 0.1  # Probability of dropping target waypoint information during training for robustness    
     guidance_scale = 2.0  # Classifier-free guidance scale for sampling (tune for best results)
 
     # Plotting control
@@ -311,7 +312,7 @@ class AttentionObstacleEncoder(nn.Module):
         # Stack all batch embeddings: [batch_size, obs_latent_dim]
         return torch.stack(batch_embeddings)
     
-# Condition Embedding with Obstacle Information
+# Condition embedding module that integrates diffusion timestep, target waypoint, action style, and obstacle information
 class ConditionEmbedding(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -331,6 +332,11 @@ class ConditionEmbedding(nn.Module):
             nn.Linear(config.latent_dim, config.latent_dim)
         )
         
+        # Learned null embeddings for missing conditions
+        self.null_target_embed = nn.Parameter(torch.randn(config.latent_dim))
+        self.null_action_embed = nn.Parameter(torch.randn(config.latent_dim))
+        self.null_obstacle_embed = nn.Parameter(torch.randn(config.latent_dim))
+        
         # Action embedding
         self.action_embed = nn.Sequential(
             nn.Linear(config.action_dim, config.latent_dim),
@@ -339,7 +345,6 @@ class ConditionEmbedding(nn.Module):
         )
         
         # Obstacle embedding
-        # self.obstacle_encoder = ObstacleEncoder(config)
         self.obstacle_encoder = AttentionObstacleEncoder(config)
 
         # Feature fusion layer
@@ -349,25 +354,49 @@ class ConditionEmbedding(nn.Module):
             nn.Linear(config.latent_dim * 2, config.latent_dim)
         )
 
-    def forward(self, t, target, action, obstacles_data=None):
-        # Individual embeddings
-        t_emb = self.t_embed(t.unsqueeze(-1).float())
-        target_emb = self.target_embed(target)
-        action_emb = self.action_embed(action)
+    def forward(self, t, target=None, action=None, obstacles_data=None):
+        """
+        Forward pass with optional None inputs for any condition.
         
-        # Obstacle embedding
+        Args:
+            t: Diffusion timestep (batch,)
+            target: Target waypoint (batch, target_dim) or None
+            action: Action style (batch, action_dim) or None
+            obstacles_data: List of obstacle dicts or None
+        
+        Returns:
+            cond_emb: Combined condition embedding (batch, latent_dim)
+        """
+        batch_size = t.shape[0]
+        device = t.device
+        
+        # Timestep embedding (always required)
+        t_emb = self.t_embed(t.unsqueeze(-1).float())
+        
+        # Target embedding (use null if None)
+        if target is not None:
+            target_emb = self.target_embed(target)
+        else:
+            target_emb = self.null_target_embed.unsqueeze(0).expand(batch_size, -1)
+        
+        # Action embedding (use null if None)
+        if action is not None:
+            action_emb = self.action_embed(action)
+        else:
+            action_emb = self.null_action_embed.unsqueeze(0).expand(batch_size, -1)
+        
+        # Obstacle embedding (use null if None or disabled)
         if obstacles_data is not None and self.config.enable_obstacle_encoding:
-            # print("obstacles are encoded.")
             obstacle_emb = self.obstacle_encoder(obstacles_data)
         else:
-            obstacle_emb = torch.zeros_like(t_emb)
+            obstacle_emb = self.null_obstacle_embed.unsqueeze(0).expand(batch_size, -1)
         
         # Combine all conditions with feature fusion
         combined_emb = torch.cat([t_emb, target_emb, action_emb, obstacle_emb], dim=-1)
         cond_emb = self.fusion_layer(combined_emb)
         
         return cond_emb
-
+    
 # Diffusion Transformer with Obstacle Awareness
 class ObstacleAwareDiffusionTransformer(nn.Module):
     def __init__(self, config):
@@ -398,14 +427,25 @@ class ObstacleAwareDiffusionTransformer(nn.Module):
         # Output projection
         self.output_proj = nn.Linear(config.latent_dim, config.state_dim)
 
-    def forward(self, x, t, target, action, history=None, obstacles_data=None):
+    def forward(self, x, t, target=None, action=None, history=None, obstacles_data=None):
         batch_size, seq_len, _ = x.shape
         
+        # Initialize if None
+        if target is None:
+            target = torch.ones(batch_size, self.config.target_dim, device=x.device) * 1e-6  # or some default value
+        
+        if action is None:
+            action = torch.zeros(batch_size, self.config.action_dim, device=x.device)  # or some default value
+    
         # During training, randomly drop style information to improve robustness
-        if self.training:
+        if self.training and action is not None:
             drop_mask = torch.rand(x.size(0), device=x.device) < self.config.drop_style_prob
             action = action.clone()
             action[drop_mask] = 0  
+        if self.training and target is not None:
+            drop_mask = torch.rand(x.size(0), device=x.device) < self.config.drop_target_prob
+            target = target.clone()
+            target[drop_mask] =  1e-6 
 
         # Project input to latent space (no PE yet)
         x_proj = self.input_proj(x)
@@ -552,7 +592,7 @@ class ObstacleAwareDiffusionProcess:
         
         return x_t, noise
     
-    def p_sample(self, model, x_t, t, target, action, history=None, enable_guidance=True, guidance_gamma=None, 
+    def p_sample(self, model, x_t, t, target=None, action=None, history=None, enable_guidance=True, guidance_gamma=None, 
                 mean=None, std=None, plot_step=False, step_idx=0, obstacles_data=None):
         """
         Reverse diffusion process with obstacle-aware sampling.
@@ -563,8 +603,6 @@ class ObstacleAwareDiffusionProcess:
         with torch.no_grad():
             # Model prediction with obstacle information
             pred_x0 = model(x_t, t, target, action, history, obstacles_data)
-            
-            # print(f"Action: {action[0, :5].cpu().numpy()}...")  # Print first 5 elements
 
             # Conditional prediction (with action) for guidance
             pred_x0_cond = model(x_t, t, target, action, history, obstacles_data)
@@ -823,7 +861,7 @@ class AeroDM(nn.Module):
         self.std = None
         self.obstacles_data = None
         
-    def forward(self, x_t, t, target, action, history=None, obstacles_data=None):
+    def forward(self, x_t, t, target=None, action=None, history=None, obstacles_data=None):
         return self.diffusion_model(x_t, t, target, action, history, obstacles_data)
     
     def set_normalization_params(self, mean, std):
@@ -844,10 +882,15 @@ class AeroDM(nn.Module):
             self.obstacles_data = obstacles_data
         print(f"Set obstacles_data: {len(self.obstacles_data) if self.obstacles_data else 0} batches")
 
-    def sample(self, target, action, history=None, batch_size=1, enable_guidance=True, 
+    def sample(self, target=None, action=None, history=None, batch_size=1, enable_guidance=True, 
                guidance_gamma=None, plot_all_steps=False):
         device = next(self.parameters()).device
         
+        if target is None:
+            target = torch.zeros(batch_size, self.config.target_dim).to(device) 
+        if action is None:
+            action = torch.zeros(batch_size, self.config.action_dim).to(device)
+
         if target.size(0) != batch_size:
             if target.size(0) == 1:
                 target = target.repeat(batch_size, 1)
@@ -1494,16 +1537,17 @@ def plot_test_results(original, sampled_unguided_denorm, sampled_guided_denorm, 
     }
     
     # Fixed bounds for consistent scaling
-    fixed_bounds = {
-        'xlim': (-20, 20),
-        'ylim': (-20, 20), 
-        'zlim': (-20, 20)
-    }
+    # fixed_bounds = {
+    #     'xlim': (-20, 20),
+    #     'ylim': (-20, 20), 
+    #     'zlim': (-20, 20)
+    # }
 
     # 1. 3D trajectory plot
     ax1 = fig.add_subplot(331, projection='3d')
-    plot_3d_trajectory(ax1, original_pos, reconstructed_pos, sampled_pos, history_pos, target_pos, obstacles, STYLES, fixed_bounds)
-    
+    # plot_3d_trajectory(ax1, original_pos, reconstructed_pos, sampled_pos, history_pos, target_pos, obstacles, STYLES, fixed_bounds)
+    plot_3d_trajectory(ax1, original_pos, reconstructed_pos, sampled_pos, history_pos, target_pos, obstacles, STYLES)
+
     # 2-4. 2D Projections
     projections = [
         (332, 'X-Y Projection', 0, 1, 'X', 'Y'),
@@ -1548,23 +1592,6 @@ def plot_test_results(original, sampled_unguided_denorm, sampled_guided_denorm, 
 # Helper functions for modular plotting
 def plot_3d_trajectory(ax, original_pos, reconstructed_pos, sampled_pos, history_pos, target_pos, obstacles, styles, bounds):
     """Plot 3D trajectory with obstacles"""
-    # # Plot trajectories
-    # if history_pos is not None:
-    #     ax.plot(history_pos[:, 0], history_pos[:, 1], history_pos[:, 2], 
-    #             label='History', **styles['history'])
-    
-    # ax.plot(original_pos[:, 0], original_pos[:, 1], original_pos[:, 2], 
-    #         label='Original Trajectory', **styles['original'])
-    # ax.plot(reconstructed_pos[:, 0], reconstructed_pos[:, 1], reconstructed_pos[:, 2], 
-    #         label='Reconstructed Trajectory', **styles['reconstructed'])
-    # ax.plot(sampled_pos[:, 0], sampled_pos[:, 1], sampled_pos[:, 2], 
-    #         label='Sampled Guided Trajectory', **styles['sampled'])
-    
-    # # Plot target
-    # if target_pos is not None:
-    #     ax.scatter(target_pos[0], target_pos[1], target_pos[2], 
-    #               label='Target Waypoint', **styles['target'])
-    
         # Plot trajectories
     if history_pos is not None:
         ax.plot(history_pos[:, 0], history_pos[:, 1], history_pos[:, 2], 
@@ -1806,7 +1833,8 @@ def test_model_performance(model, trajectories_norm, mean, std, num_test_samples
 
             # 1. Sample Un-Guided Trajectory
             sampled_unguided_norm = model.sample(
-                target_norm, action, 
+                target_norm, 
+                action, 
                 history, 
                 batch_size=1, 
                 enable_guidance=False, 
@@ -1818,7 +1846,7 @@ def test_model_performance(model, trajectories_norm, mean, std, num_test_samples
             config.set_show_flag(False)
             
             sampled_guided_norm = model.sample(
-                target_norm, 
+                None, 
                 action, 
                 history, 
                 batch_size=1, 
@@ -2579,7 +2607,6 @@ def random_concatenate_trajectories(trajectories, history_len, seq_len, num_conc
     
     return concatenated_trajectories
 
-
 def augment_trajectories_with_concatenation(trajectories, history_len, seq_len, 
                                             concat_ratio=0.5, smooth_transition=True):
     """
@@ -2641,7 +2668,6 @@ def augment_trajectories_with_concatenation(trajectories, history_len, seq_len,
     
     return augmented_trajectories
 
-
 def compute_trajectory_connection_transform(history_end_pos, history_end_vel, future_start_pos):
     """
     Compute translation and rotation to smoothly connect two trajectory segments.
@@ -2662,7 +2688,6 @@ def compute_trajectory_connection_transform(history_end_pos, history_end_vel, fu
     rotation = torch.eye(3, device=history_end_pos.device)
     
     return translation, rotation
-
 
 def apply_smooth_connection(history_segment, future_segment, smooth_window=5):
     """
@@ -2738,7 +2763,6 @@ def apply_smooth_connection(history_segment, future_segment, smooth_window=5):
     
     return adjusted_history, adjusted_future
 
-
 def update_speed_from_positions(trajectory):
     """
     Update speed component (index 0) based on position differences.
@@ -2762,7 +2786,6 @@ def update_speed_from_positions(trajectory):
         traj[1:, 0] = speeds
     
     return traj
-
 
 def random_concatenate_trajectories_smooth(trajectories, history_len, seq_len, 
                                            num_concatenated=None, smooth_window=5):
@@ -2812,7 +2835,9 @@ def random_concatenate_trajectories_smooth(trajectories, history_len, seq_len,
         # print(f"Total concatenations with different styles: {different_style_count}/{num_concatenated}")
 
         # Extract segments
-        history_segment = trajectories[idx1, :history_len, :].clone()  # (history_len, state_dim)
+        # history_segment = trajectories[idx1, :history_len, :].clone()  # (history_len, state_dim)
+        start_idx = trajectories.shape[1] - history_len
+        history_segment = trajectories[idx1, start_idx:, :].clone()
         future_segment = trajectories[idx2, history_len:history_len+seq_len, :].clone()  # (seq_len, state_dim)
         
         # Get boundary positions
@@ -2839,7 +2864,6 @@ def random_concatenate_trajectories_smooth(trajectories, history_len, seq_len,
     concatenated_trajectories = torch.stack(concatenated_trajectories, dim=0)
     
     return concatenated_trajectories
-
 
 def augment_trajectories_with_smooth_concatenation(trajectories, history_len, seq_len,
                                                    concat_ratio=0.5, smooth_window=5,
@@ -2882,8 +2906,7 @@ def augment_trajectories_with_smooth_concatenation(trajectories, history_len, se
     
     print(f"  - Total trajectories after augmentation: {augmented_trajectories.shape[0]}")
     
-    return concatenated
-
+    return augmented_trajectories
 
 def validate_connection_continuity(concatenated_trajectories, history_len):
     """
@@ -2935,7 +2958,6 @@ def validate_connection_continuity(concatenated_trajectories, history_len):
         print(f"  ✓ Position continuity is good")
     else:
         print(f"  ⚠ Position continuity may need improvement")
-
 
 def plot_test_results(original, sampled_unguided_denorm, sampled_guided_denorm, history, target, 
                       obstacles=None, show_flag=True, step_idx=0, 
@@ -3065,7 +3087,6 @@ def plot_test_results(original, sampled_unguided_denorm, sampled_guided_denorm, 
         plt.savefig(filename, format='svg', bbox_inches='tight', dpi=300)
         plt.close()
 
-
 def plot_style_information(ax, history_style_name, pred_style_name, style_names, 
                            history_pos, original_pos, history_style, pred_style):
     """
@@ -3145,7 +3166,6 @@ def plot_style_information(ax, history_style_name, pred_style_name, style_names,
             fontfamily='monospace',
             bbox=dict(boxstyle='round', facecolor=box_color, alpha=0.8))
 
-
 def plot_trajectory_statistics(ax, original_pos, reconstructed_pos, sampled_pos):
     """
     Plot trajectory statistics comparison.
@@ -3186,7 +3206,6 @@ def plot_trajectory_statistics(ax, original_pos, reconstructed_pos, sampled_pos)
     ax.set_xticklabels(categories, fontsize=8)
     ax.legend(fontsize=7)
     ax.grid(True, alpha=0.3, axis='y')
-
 
 def plot_connection_info(ax, history_pos, original_pos, history_len=0):
     """
@@ -3262,7 +3281,6 @@ def plot_connection_info(ax, history_pos, original_pos, history_len=0):
             fontfamily='monospace',
             bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.8))
 
-
 def plot_position_time(ax, time_steps, original_pos, reconstructed_pos, sampled_pos, 
                        history_pos, dim, title, ylabel, styles):
     """Plot position over time for a specific dimension, including history."""
@@ -3323,11 +3341,11 @@ if __name__ == "__main__":
     # Training parameters
     num_epochs = 100
     batch_size = 32
-    num_trajectories = 3000
+    _base_num_trajectories = 2000 # Base number of trajectories before augmentation (will be increased by concatenation)
     
     print("Generating training data with obstacle-aware transformer...")
     trajectories = generate_aerobatic_trajectories(
-        num_trajectories=num_trajectories, 
+        num_trajectories=_base_num_trajectories, 
         seq_len=config.seq_len + config.history_len
     )
 
@@ -3354,18 +3372,18 @@ if __name__ == "__main__":
     #     concat_ratio=0.5,  # Add 50% more trajectories through concatenation
     #     smooth_transition=True
     # )
-
+    
     # Augment trajectories with smooth concatenation
     trajectories = augment_trajectories_with_smooth_concatenation(
         trajectories, 
         config.history_len, 
         config.seq_len,
-        concat_ratio=1.0,      # Add 50% more trajectories
+        concat_ratio=0.5,      # Add 50% more trajectories
         smooth_window=5,        # Blend over 5 frames
         validate_continuity=True # Print continuity statistics
     )
     
-
+    num_trajectories = trajectories.shape[0]
     # Split trajectories into train and test sets (80/20 split)
     torch.manual_seed(42) # For reproducibility
     indices = torch.randperm(num_trajectories)
@@ -3430,6 +3448,11 @@ if __name__ == "__main__":
             # Generate condition inputs
             target = generate_target_waypoints(x_0)
 
+            if config.drop_target_prob > 0:
+                    drop_mask = torch.rand(actual_batch_size, device=device) < config.drop_target_prob
+                    # Set valid flag to 0 for dropped samples (position doesn't matter)
+                    target[drop_mask, -1] = 0.0
+            
             # FIXED: Use the style index from the FIRST timestep of the FULL trajectory
             # Since style is constant, any timestep works, but use the first for clarity
             # style_index = style_info[:, 0, 0]  # Shape: (B,) - take first timestep, first feature
