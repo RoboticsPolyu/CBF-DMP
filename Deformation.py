@@ -10,6 +10,275 @@ import matplotlib.pyplot as plt
 import sys
 import time
 
+
+def apply_smooth_connection(history_segment, future_segment, smooth_window=5):
+    """
+    Apply smooth blending at the connection boundary between history and future segments.
+    
+    Uses cosine-weighted blending to ensure C1 continuity (position and velocity continuous).
+    
+    Args:
+        history_segment (torch.Tensor): History segment of shape (history_len, state_dim)
+        future_segment (torch.Tensor): Future segment of shape (seq_len, state_dim)
+        smooth_window (int): Number of frames to blend on each side of the connection
+    
+    Returns:
+        tuple: (adjusted_history_segment, adjusted_future_segment)
+    """
+    history_len = history_segment.shape[0]
+    seq_len = future_segment.shape[0]
+    
+    # Ensure window doesn't exceed available frames
+    window = min(smooth_window, history_len, seq_len)
+    
+    if window < 2:
+        return history_segment, future_segment
+    
+    # Get positions at the boundary
+    history_pos = history_segment[:, 1:4]  # (history_len, 3)
+    future_pos = future_segment[:, 1:4]    # (seq_len, 3)
+    
+    # Compute velocities at boundary (using finite differences)
+    if history_len >= 2:
+        history_vel = history_pos[-1] - history_pos[-2]
+    else:
+        history_vel = torch.zeros(3, device=history_pos.device)
+    
+    if seq_len >= 2:
+        future_vel = future_pos[1] - future_pos[0]
+    else:
+        future_vel = torch.zeros(3, device=future_pos.device)
+    
+    # Compute desired connection velocity (average of both sides for smoothness)
+    connection_vel = (history_vel + future_vel) / 2.0
+    
+    # Adjust history segment near the end
+    adjusted_history = history_segment.clone()
+    adjusted_future = future_segment.clone()
+    
+    for i in range(1, window + 1):
+        # Cosine blending weight: smooth transition from 0 to 1
+        alpha = 0.5 * (1 - torch.cos(torch.tensor(i / (window + 1) * 3.14159, device=history_pos.device)))
+        
+        # Adjust history positions near the end
+        hist_idx = history_len - window + i - 1
+        if hist_idx >= 0 and hist_idx < history_len:
+            # Target position based on smooth velocity integration
+            target_pos = history_pos[-1] - connection_vel * (window - i + 1)
+            # Blend between original and target
+            adjusted_history[hist_idx, 1:4] = (1 - alpha) * history_pos[hist_idx] + alpha * target_pos
+        
+        # Adjust future positions near the start
+        fut_idx = i - 1
+        if fut_idx < seq_len:
+            # Target position based on smooth velocity integration
+            target_pos = history_pos[-1] + connection_vel * i
+            # Blend between original and target
+            adjusted_future[fut_idx, 1:4] = (1 - alpha) * future_pos[fut_idx] + alpha * target_pos
+    
+    # Ensure exact continuity at the boundary
+    adjusted_future[0, 1:4] = history_pos[-1]
+    
+    # Update velocities (speed component at index 0)
+    adjusted_history = update_speed_from_positions(adjusted_history)
+    adjusted_future = update_speed_from_positions(adjusted_future)
+    
+    return adjusted_history, adjusted_future
+
+def update_speed_from_positions(trajectory):
+    """
+    Update speed component (index 0) based on position differences.
+    
+    Args:
+        trajectory (torch.Tensor): Trajectory of shape (seq_len, state_dim)
+    
+    Returns:
+        torch.Tensor: Trajectory with updated speed values
+    """
+    traj = trajectory.clone()
+    positions = traj[:, 1:4]
+    
+    if positions.shape[0] >= 2:
+        # Compute speeds as magnitude of velocity
+        velocities = positions[1:] - positions[:-1]
+        speeds = torch.norm(velocities, dim=1)
+        
+        # Assign speeds (first frame uses second frame's speed)
+        traj[0, 0] = speeds[0]
+        traj[1:, 0] = speeds
+    
+    return traj
+
+def random_concatenate_trajectories_smooth(trajectories, history_len, seq_len, 
+                                           num_concatenated=None, smooth_window=5):
+    """
+    Randomly concatenate different trajectories with smooth connection.
+    
+    Method: 
+    1. Select history segment from trajectory 1: [0:history_len]
+    2. Select future segment from trajectory 2: [history_len:history_len+seq_len]
+    3. Translate future segment to align with history end point
+    4. Apply smooth blending at the connection boundary
+    
+    Args:
+        trajectories (torch.Tensor): Original trajectories of shape (N, total_len, state_dim)
+        history_len (int): Length of history segment
+        seq_len (int): Length of future prediction segment
+        num_concatenated (int, optional): Number of concatenated trajectories to generate
+        smooth_window (int): Number of frames to blend at the connection
+    
+    Returns:
+        torch.Tensor: Smoothly concatenated trajectories
+    """
+    num_original = trajectories.shape[0]
+    
+    if num_concatenated is None:
+        num_concatenated = num_original // 2
+    
+    device = trajectories.device
+    concatenated_trajectories = []
+    
+    for i in range(num_concatenated):
+        # Randomly select two different trajectories
+        idx1 = torch.randint(0, num_original, (1,)).item()
+        idx2 = torch.randint(0, num_original, (1,)).item()
+        
+        # Ensure they are different trajectories
+        while idx1 == idx2 and num_original > 1:
+            idx2 = torch.randint(0, num_original, (1,)).item()
+        
+        style1 = trajectories[idx1, 0, -1].item()
+        style2 = trajectories[idx2, 0, -1].item()
+        
+        # if style1 != style2:
+        #     print(f"Concatenating different styles: {style1} -> {style2}")
+    
+        # Extract segments
+        # history_segment = trajectories[idx1, :history_len, :].clone()  # (history_len, state_dim)
+        start_idx = trajectories.shape[1] - history_len
+        history_segment = trajectories[idx1, start_idx:, :].clone()
+        future_segment = trajectories[idx2, history_len:history_len+seq_len, :].clone()  # (seq_len, state_dim)
+        
+        # Get boundary positions
+        history_end_pos = history_segment[-1, 1:4]  # (3,)
+        future_start_pos = future_segment[0, 1:4]   # (3,)
+        
+        # Compute translation to align future start with history end
+        translation = history_end_pos - future_start_pos
+        
+        # Apply translation to all positions in future segment
+        future_segment[:, 1:4] = future_segment[:, 1:4] + translation.unsqueeze(0)
+        
+        # Apply smooth blending at the connection
+        history_segment, future_segment = apply_smooth_connection(
+            history_segment, future_segment, smooth_window
+        )
+        
+        # Concatenate along time dimension
+        new_trajectory = torch.cat([history_segment, future_segment], dim=0)  # (total_len, state_dim)
+        
+        concatenated_trajectories.append(new_trajectory)
+    
+    # Stack all concatenated trajectories
+    concatenated_trajectories = torch.stack(concatenated_trajectories, dim=0)
+    
+    return concatenated_trajectories
+
+def augment_trajectories_with_smooth_concatenation(trajectories, history_len, seq_len,
+                                                   concat_ratio=0.5, smooth_window=5,
+                                                   validate_continuity=True):
+    """
+    Augment trajectory dataset by smoothly concatenating different trajectories.
+    
+    This creates new trajectories by combining history from one trajectory with 
+    future from another, ensuring smooth position and velocity continuity at the boundary.
+    
+    Args:
+        trajectories (torch.Tensor): Original trajectories of shape (N, total_len, state_dim)
+        history_len (int): Length of history segment
+        seq_len (int): Length of future prediction segment  
+        concat_ratio (float): Ratio of concatenated trajectories to original (default: 0.5)
+        smooth_window (int): Number of frames for smooth blending at connection
+        validate_continuity (bool): If True, print continuity validation statistics
+    
+    Returns:
+        torch.Tensor: Augmented trajectories (original + concatenated)
+    """
+    num_original = trajectories.shape[0]
+    num_concatenated = int(num_original * concat_ratio)
+    
+    print(f"Augmenting trajectories with smooth concatenation:")
+    print(f"  - Original trajectories: {num_original}")
+    print(f"  - Concatenated trajectories: {num_concatenated}")
+    print(f"  - Smooth window: {smooth_window}")
+    
+    # Generate smoothly concatenated trajectories
+    concatenated = random_concatenate_trajectories_smooth(
+        trajectories, history_len, seq_len, num_concatenated, smooth_window
+    )
+    
+    if validate_continuity:
+        validate_connection_continuity(concatenated, history_len)
+    
+    # Combine original and concatenated trajectories
+    augmented_trajectories = torch.cat([trajectories, concatenated], dim=0)
+    
+    print(f"  - Total trajectories after augmentation: {augmented_trajectories.shape[0]}")
+    
+    return augmented_trajectories
+
+def validate_connection_continuity(concatenated_trajectories, history_len):
+    """
+    Validate the continuity at the connection point of concatenated trajectories.
+    
+    Computes position jump and velocity discontinuity at the boundary.
+    
+    Args:
+        concatened_trajectories (torch.Tensor): Concatenated trajectories
+        history_len (int): Length of history segment (boundary index)
+    """
+    num_traj = concatenated_trajectories.shape[0]
+    device = concatenated_trajectories.device
+    
+    position_jumps = []
+    velocity_jumps = []
+    
+    with torch.no_grad():
+        for i in range(num_traj):
+            # Get positions around boundary
+            pos_before = concatenated_trajectories[i, history_len-1, 1:4]
+            pos_at = concatenated_trajectories[i, history_len, 1:4]
+            pos_after = concatenated_trajectories[i, history_len+1, 1:4] if history_len+1 < concatenated_trajectories.shape[1] else pos_at
+            
+            # Position jump at boundary (should be near zero)
+            pos_jump = torch.norm(pos_at - pos_before)
+            position_jumps.append(pos_jump.item())
+            
+            # Velocity continuity
+            vel_before = pos_at - pos_before
+            vel_after = pos_after - pos_at
+            vel_jump = torch.norm(vel_after - vel_before)
+            velocity_jumps.append(vel_jump.item())
+    
+    # Compute statistics
+    pos_jumps = torch.tensor(position_jumps)
+    vel_jumps = torch.tensor(velocity_jumps)
+    
+    print(f"\nConnection Continuity Validation:")
+    print(f"  - Position jump at boundary:")
+    print(f"      Mean: {pos_jumps.mean():.6f}, Max: {pos_jumps.max():.6f}, Std: {pos_jumps.std():.6f}")
+    print(f"  - Velocity discontinuity at boundary:")
+    print(f"      Mean: {vel_jumps.mean():.6f}, Max: {vel_jumps.max():.6f}, Std: {vel_jumps.std():.6f}")
+    
+    # Check if continuity is good (position jump < 1e-4)
+    if pos_jumps.mean() < 1e-4:
+        print(f"  ✓ Position continuity is excellent")
+    elif pos_jumps.mean() < 1e-2:
+        print(f"  ✓ Position continuity is good")
+    else:
+        print(f"  ⚠ Position continuity may need improvement")
+
+
 def generate_single_style_trajectory(style, seq_len=60, height=10.0, radius=5.0):
     """Generate trajectory data for a single style"""
     
@@ -174,71 +443,6 @@ def generate_single_style_trajectory(style, seq_len=60, height=10.0, radius=5.0)
     state = np.column_stack([x, y, z])
     return state
 
-# def generate_aerobatic_trajectories(num_trajectories, seq_len, height=10.0, radius=5.0):
-#     """Generates synthetic aerobatic trajectories based on generate_single_style_trajectory."""
-#     trajectories = []
-
-#     maneuver_styles = ['power_loop', 'barrel_roll', 'split_s', 'immelmann', 'wall_ride', 'eight_figure', 'star', 'half_moon', 'sphinx', 'clover', 'spiral_inward', 'spiral_outward', 'spiral_vertical_up', 'spiral_vertical_down']
-    
-#     for i in range(num_trajectories):
-#         # Randomly select a maneuver style
-#         style = np.random.choice(maneuver_styles)
-        
-#         style_to_index = {
-#             'power_loop': 0,
-#             'barrel_roll': 1,
-#             'split_s': 2,
-#             'immelmann': 3,
-#             'wall_ride': 4,
-#             'eight_figure': 5,
-#             'star': 6,
-#             'half_moon': 7,
-#             'sphinx': 8,
-#             'clover': 9,
-#             'spiral_inward': 10,
-#             'spiral_outward': 11,
-#             'spiral_vertical_up': 12,
-#             'spiral_vertical_down': 13
-#         }
-        
-#         style_idx = style_to_index.get(style, 0)
-
-#         # Random centers and scales
-#         center_x = np.random.uniform(-3, 3)
-#         center_y = np.random.uniform(-3, 3)
-#         center_z = height + np.random.uniform(0, 3)
-#         current_radius = radius * np.random.uniform(0.3, 1.2)
-        
-#         # Generate the base trajectory using generate_single_style_trajectory
-#         base_trajectory = generate_single_style_trajectory(style, seq_len, center_z, current_radius)
-        
-#         # Extract positions and apply random translation
-#         x = base_trajectory[:, 0] + center_x
-#         y = base_trajectory[:, 1] + center_y  
-#         z = base_trajectory[:, 2]
-        
-#         # Calculate velocities using gradient
-#         # dt = 1.0 / seq_len
-#         dt = 0.10 # 0.1 second
-#         vx = np.gradient(x, dt)
-#         vy = np.gradient(y, dt)
-#         vz = np.gradient(z, dt)
-        
-#         # Compute speed and direction
-#         speed = np.sqrt(vx**2 + vy**2 + vz**2)
-#         direction = np.stack([vx, vy, vz], axis=-1)
-#         norms = np.linalg.norm(direction, axis=-1, keepdims=True)
-#         direction = np.divide(direction, norms, where=norms>0, out=np.zeros_like(direction))
-        
-#         # Attitude: direction + fixed components (e.g., for roll/pitch/yaw approximation)
-#         attitude = np.concatenate([direction, np.full((seq_len, 3), 0.1)], axis=-1)
-        
-#         # Full state: [speed, x, y, z, attitude(6)]
-#         state = np.column_stack([speed, x, y, z, attitude, np.full(seq_len, style_idx)])
-#         trajectories.append(state)
-        
-#     return torch.tensor(np.stack(trajectories), dtype=torch.float32)
-
 def generate_aerobatic_trajectories(num_trajectories, seq_len, height=10.0, radius=5.0):
     """Generates synthetic aerobatic trajectories with correct attitude angles."""
     trajectories = []
@@ -363,6 +567,7 @@ def generate_aerobatic_trajectories(num_trajectories, seq_len, height=10.0, radi
         trajectories.append(state)
         
     return torch.tensor(np.stack(trajectories), dtype=torch.float32)
+
 
 # Trajectory deformation module
 class TrajectoryDeformer:
@@ -1023,6 +1228,7 @@ def test_random_intensity_generation():
         print(f"  Deformation - Mean: {results[dist]['mean_deformation']:.3f}, Std: {results[dist]['std_deformation']:.3f}")
     
     return results
+
 
 if __name__ == "__main__":
     # Run the random intensity visualization
