@@ -15,6 +15,7 @@ import time
 
 
 from Deformation import generate_aerobatic_trajectories
+from Deformation import generate_aerobatic_trajectories_pvR
 from Deformation import augment_trajectories_with_smooth_concatenation
 from Deformation import generate_aerobatic_trajectories_deformation
 from circular_trajectories import generate_circular_end_trajectories
@@ -37,7 +38,7 @@ class Config:
     
     # Sequence parameters
     seq_len = 60  # N_a = 60 time steps; 6s-long future trajectory sequence
-    state_dim = 7  # x_i ∈ R^7: s(1) + p(3) + r(3) + style(1)
+    state_dim = 10  # x_i ∈ R^10: p(3) + v(3) + r(4) + style(1) = 11, but we will use 10 by excluding style from the state vector and handling it as a condition
     history_len = 20  # 20-frame historical observations
 
     # Condition dimensions
@@ -58,11 +59,12 @@ class Config:
     
     last_xyz_weight=5.0 # Extra weight for final timestep's position error
     xyz_weight=1.0 # Extra weight for Z-axis (height) in aviation
-    diff_vel_weight=0.0 # Weight for velocity term
+    vel_weight=1.0 # Weight for velocity term
     other_weight=1.0 # Weight for other losses
     obstacle_weight=1.0 # Weight for obstacle term
     continuity_weight=5.0 # Weight for continuity term
     acc_weight=1.0 # Weight for acceleration term
+    delta_T = 0.1 # Time step duration (0.1s for 10Hz control frequency)
 
     drop_style_prob = 0.1  # Probability of dropping style information during training for robustness
     drop_target_prob = 0.1  # Probability of dropping target waypoint information during training for robustness    
@@ -562,6 +564,118 @@ def compute_barrier_and_grad(x, config, mean, std, obstacles_data=None, safety_m
     
     return V_avg, grad_x
 
+# Barrier Function Computation for Multiple Obstacles using Logistic (Sigmoid) Approach
+def compute_barrier_and_grad_logistic(x, config, mean, std, obstacles_data=None, safety_margin=0.20, sigma=0.5):
+    """
+    Compute barrier V and its gradient ∇V for the trajectory x using Logistic (Sigmoid) approach.
+    
+    Logistic probability function:
+        P(d) = 1 / (1 + exp(-(d^2 - R_s^2) / sigma))
+        where R_s = radius + safety_margin, d = distance to obstacle center
+    
+    The barrier value V = -log(P(d)) encourages the trajectory to stay away from obstacles.
+    This provides a smooth, differentiable barrier with probabilistic interpretation.
+    
+    Args:
+        x: Normalized trajectory tensor (batch, seq_len, state_dim)
+        config: Configuration object
+        mean: Normalization mean tensor
+        std: Normalization std tensor
+        obstacles_data: List of obstacle dictionaries for each batch sample
+        safety_margin: Additional safety buffer beyond obstacle radius
+        sigma: Smoothness parameter for logistic function (controls transition sharpness)
+    
+    Returns:
+        V_avg: Average barrier violation value (scalar tensor)
+        grad_x: Gradient of barrier w.r.t normalized trajectory (same shape as x)
+    """
+    # Denormalize positions for barrier computation
+    pos_denorm = x[:, :, 1:4] * std[0, 0, 1:4] + mean[0, 0, 1:4]
+    batch_size, seq_len, _ = pos_denorm.shape
+    
+    # Initialize gradient tensor for denormalized positions
+    grad_pos_denorm = torch.zeros_like(pos_denorm)
+    
+    # Detach positions to avoid in-place modification issues
+    pos_denorm = pos_denorm.clone().detach()
+    
+    # Initialize barrier value (negative log probability)
+    V_total = torch.zeros(batch_size, device=x.device)
+    
+    # Process each obstacle
+    if obstacles_data is not None:
+        for batch_idx in range(batch_size):
+            # Get obstacles for this sample
+            batch_obs = obstacles_data[batch_idx] if batch_idx < len(obstacles_data) else []
+            
+            for obstacle in batch_obs:
+                center = obstacle['center'].to(x.device)
+                radius = obstacle['radius'] + safety_margin  # Add safety margin
+                
+                # Compute squared Euclidean distances (batch, seq_len)
+                # dist_sq = ||p - c||^2
+                delta = pos_denorm[batch_idx] - center.unsqueeze(0)  # (seq_len, 3)
+                dist_sq = torch.sum(delta * delta, dim=1)  # (seq_len,)
+                
+                # Compute logistic probability: P = sigmoid((R_s^2 - d^2) / sigma)
+                # Note: Using (R_s^2 - d^2) gives high probability when d < R_s
+                R_sq = radius * radius
+                logit = (R_sq - dist_sq) / sigma  # Positive when inside safety radius
+                P = torch.sigmoid(logit)  # P in [0, 1], high when close to obstacle
+                
+                # Barrier: V = -log(P) = log(1 + exp(-logit))
+                # This is the negative log probability (softplus formulation)
+                # V is small when P is high (close to obstacle), large when far away
+                # Wait - careful: We want V to be HIGH when close to obstacle (barrier violation)
+                # Actually, -log(P) is large when P is small (far from obstacle)
+                # So we use V = -log(1 - P) or V = log(1/P) with P being collision probability
+                
+                # Alternative: Define barrier as -log(1 - P) which grows as P -> 1
+                # P = probability of being safe? Let's define P_safe = sigmoid((d^2 - R_s^2)/sigma)
+                # Then V = -log(P_safe) grows as trajectory enters obstacle region
+                
+                # Using: P_safe = sigmoid((d^2 - R_s^2)/sigma) = 1 / (1 + exp(-(d^2 - R_s^2)/sigma))
+                # This gives P_safe -> 0 when d << R_s (inside obstacle), P_safe -> 1 when d >> R_s
+                # Then V = -log(P_safe) is large when inside obstacle, small when outside
+                logit_safe = (dist_sq - R_sq) / sigma  # Negative inside, positive outside
+                P_safe = torch.sigmoid(logit_safe)  # Safe probability
+                
+                # Barrier value: negative log probability of being safe
+                # Add epsilon to avoid log(0)
+                V_obstacle = -torch.log(P_safe + 1e-8)
+                V_total[batch_idx] += torch.sum(V_obstacle)
+                
+                # Compute gradient of V w.r.t positions
+                # V = -log(P_safe) = -log(sigmoid(logit_safe))
+                # dV/dp = - (1/P_safe) * dP_safe/dp
+                # dP_safe/dp = P_safe * (1 - P_safe) * d(logit_safe)/dp
+                # d(logit_safe)/dp = (2 * delta) / sigma
+                # Therefore: dV/dp = - (1 - P_safe) * (2 * delta) / sigma
+                
+                # Compute P_safe gradient factor
+                # P_safe = sigmoid(logit_safe)
+                # dV/dp = - (1 - P_safe) * (2 * delta) / sigma
+                
+                # Gradient magnitude factor: - (1 - P_safe) * 2 / sigma
+                grad_factor = - (1 - P_safe) * 2.0 / sigma  # (seq_len,)
+                
+                # Direction vectors from points to obstacle center
+                # Note: delta = p - c, so gradient points away from obstacle (repulsive)
+                grad_V_obs = grad_factor.unsqueeze(1) * delta  # (seq_len, 3)
+                
+                # Accumulate gradient
+                grad_pos_denorm[batch_idx] = grad_pos_denorm[batch_idx] + grad_V_obs
+    
+    # Map gradient back to normalized space
+    grad_x = torch.zeros_like(x, device=x.device)
+    std_scaled = std[0, 0, 1:4].to(x.device)
+    grad_x[:, :, 1:4] = grad_pos_denorm / std_scaled
+    
+    # V_total is sum of barrier violations
+    V_avg = V_total.mean()
+    
+    return V_avg, grad_x
+
 # Diffusion Process with Obstacle-Aware Sampling
 class ObstacleAwareDiffusionProcess:
     def __init__(self, config):
@@ -638,7 +752,7 @@ class ObstacleAwareDiffusionProcess:
                 gamma_t = guidance_gamma * (1.0 - t_exp.squeeze(1).float() / self.config.diffusion_steps)
                 
                 # Compute barrier gradient ∇V with multiple obstacles
-                V, grad_V = compute_barrier_and_grad(pred_x0, self.config, mean, std, obstacles_data)
+                V, grad_V = compute_barrier_and_grad_logistic(pred_x0, self.config, mean, std, obstacles_data)
                 barrier_info = {'V': V, 'grad_V': grad_V, 'gamma_t': gamma_t}
                 # print(barrier_info)
                 # Guided score: s_guided = s_theta - γ_t ∇V
@@ -935,7 +1049,7 @@ class AeroDMLoss(nn.Module):
     Supports switching obstacle term via flag; always returns 4 values for consistency.
     Fixes: Proper safety margin for obstacles, Z-weighting, normalization by avg obstacles.
     """
-    def __init__(self, config, enable_obstacle_term=False, safe_extra_factor=0.2, last_xyz_weight=1.5, xyz_weight=1.5, diff_vel_weight=1.0, other_weight=1.0, obstacle_weight=10.0, continuity_weight=15.0, acc_weight=1.0):
+    def __init__(self, config, enable_obstacle_term=False, safe_extra_factor=0.2, last_xyz_weight=1.5, xyz_weight=1.5, vel_weight=1.0, other_weight=1.0, obstacle_weight=10.0, continuity_weight=15.0, acc_weight=1.0):
         super().__init__()
         self.config = config
         # Flag to enable/disable obstacle distance penalty in total loss
@@ -947,7 +1061,7 @@ class AeroDMLoss(nn.Module):
         # Extra weight for Z-axis losses (height is critical in aviation trajectories)
         self.xyz_weight = xyz_weight
         # Weight for velocity loss
-        self.diff_vel_weight = diff_vel_weight
+        self.vel_weight = vel_weight
         # Weight for other losses
         self.other_weight = other_weight
         # Scaling factor for the entire obstacle loss term
@@ -1035,8 +1149,10 @@ class AeroDMLoss(nn.Module):
         gt_pos = gt_trajectory[:, :, 1:4]
         pred_speed = pred_trajectory[:, :, 0:1]  # (B, T, 1) - speed
         gt_speed = gt_trajectory[:, :, 0:1]
-        pred_attitude = pred_trajectory[:, :, 4:7]  # (B, T, 3) - attitude (roll/pitch/yaw approx)
-        gt_attitude = gt_trajectory[:, :, 4:7]
+        gt_vel = gt_trajectory[:, :, 4:7] # (B, T, 3) - velocity from GT (if available)
+        pred_vel = pred_trajectory[:,:,4:7]
+        pred_attitude = pred_trajectory[:, :, 7:10]  # (B, T, 3) - attitude (roll/pitch/yaw)
+        gt_attitude = gt_trajectory[:, :, 7:10]
         
         # Position losses: Per-dimension MSE
         x_loss = self.xyz_weight * self.mse_loss(pred_pos[:, :, 0], gt_pos[:, :, 0])
@@ -1053,11 +1169,7 @@ class AeroDMLoss(nn.Module):
         # Combine: Base + 10x last point
         position_loss = x_loss + y_loss + z_loss
         
-        # Velocity loss: From position differences (assumes uniform dt=1)
         if seq_len > 1:
-            # Compute deltas: (B, T-1, 3)
-            pred_vel = pred_pos[:, 1:, :] - pred_pos[:, :-1, :]
-            gt_vel = gt_pos[:, 1:, :] - gt_pos[:, :-1, :]
             # Per-dimension MSE on velocities
             vel_x_loss = self.xyz_weight * self.mse_loss(pred_vel[:, :, 0], gt_vel[:, :, 0])
             vel_y_loss = self.xyz_weight * self.mse_loss(pred_vel[:, :, 1], gt_vel[:, :, 1])
@@ -1100,7 +1212,7 @@ class AeroDMLoss(nn.Module):
             #     continuity_loss += self.mse_loss(first_pred_vel, last_history_vel)
         
         # Total weighted loss
-        total_loss = self.xyz_weight * last_xyz_loss + self.xyz_weight * position_loss + self.diff_vel_weight * vel_loss + self.other_weight * other_loss + self.obstacle_weight * obstacle_loss + self.continuity_weight * continuity_loss + self.acc_weight * acc_smoothness
+        total_loss = self.xyz_weight * last_xyz_loss + self.xyz_weight * position_loss + self.vel_weight * vel_loss + self.other_weight * other_loss + self.obstacle_weight * obstacle_loss + self.continuity_weight * continuity_loss + self.acc_weight * acc_smoothness
         
         return total_loss, position_loss, vel_loss, obstacle_loss, continuity_loss
 
@@ -3128,7 +3240,7 @@ if __name__ == "__main__":
         safe_extra_factor=config.safe_extra_factor, # Safety buffer as fraction of radius (e.g., 20%)
         last_xyz_weight=config.last_xyz_weight, # Extra weight for final timestep's position error
         xyz_weight=config.xyz_weight, # Extra weight for Z-axis (height) in aviation
-        diff_vel_weight=config.diff_vel_weight, # Weight for velocity term
+        vel_weight=config.vel_weight, # Weight for velocity term
         other_weight=config.other_weight, # Weight for other losses
         obstacle_weight=config.obstacle_weight, # Weight for obstacle term
         continuity_weight=config.continuity_weight, # Weight for continuity term
@@ -3143,9 +3255,10 @@ if __name__ == "__main__":
     _base_num_trajectories = 2000 # Base number of trajectories before augmentation (will be increased by concatenation)
     
     print("Generating training data with obstacle-aware transformer...")
-    trajectories = generate_aerobatic_trajectories(
+    trajectories = generate_aerobatic_trajectories_pvR(
         num_trajectories=_base_num_trajectories, 
-        seq_len=config.seq_len + config.history_len
+        seq_len=config.seq_len + config.history_len,
+        delta_T=config.delta_T
     )
 
     # trajectories = generate_aerobatic_trajectories_deformation(    

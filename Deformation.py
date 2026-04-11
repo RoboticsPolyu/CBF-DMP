@@ -568,6 +568,131 @@ def generate_aerobatic_trajectories(num_trajectories, seq_len, height=10.0, radi
         
     return torch.tensor(np.stack(trajectories), dtype=torch.float32)
 
+def generate_aerobatic_trajectories_pvR(num_trajectories, seq_len, height=10.0, radius=5.0, delta_T=0.10):
+    """Generates synthetic aerobatic trajectories with correct attitude angles."""
+    trajectories = []
+
+    maneuver_styles = ['power_loop', 'barrel_roll', 'split_s', 'immelmann', 'wall_ride', 'eight_figure', 'star', 'half_moon', 'sphinx', 'clover', 'spiral_inward', 'spiral_outward', 'spiral_vertical_up', 'spiral_vertical_down']
+    
+    for i in range(num_trajectories):
+        # Randomly select a maneuver style
+        style = np.random.choice(maneuver_styles)
+        
+        style_to_index = {
+            'power_loop': 0,
+            'barrel_roll': 1,
+            'split_s': 2,
+            'immelmann': 3,
+            'wall_ride': 4,
+            'eight_figure': 5,
+            'star': 6,
+            'half_moon': 7,
+            'sphinx': 8,
+            'clover': 9,
+            'spiral_inward': 10,
+            'spiral_outward': 11,
+            'spiral_vertical_up': 12,
+            'spiral_vertical_down': 13
+        }
+        
+        style_idx = style_to_index.get(style, 0)
+
+        # Random centers and scales
+        center_x = np.random.uniform(-3, 3)
+        center_y = np.random.uniform(-3, 3)
+        center_z = height + np.random.uniform(0, 3)
+        current_radius = radius * np.random.uniform(0.3, 1.2)
+        
+        # Generate the base trajectory using generate_single_style_trajectory
+        base_trajectory = generate_single_style_trajectory(style, seq_len, center_z, current_radius)
+        
+        # Extract positions and apply random translation
+        x = base_trajectory[:, 0] + center_x
+        y = base_trajectory[:, 1] + center_y  
+        z = base_trajectory[:, 2]
+        
+        # Calculate velocities using gradient
+        dt = 0.10  # 0.1 second
+        vx = np.gradient(x, dt)
+        vy = np.gradient(y, dt)
+        vz = np.gradient(z, dt)
+        
+        # Compute speed
+        speed = np.sqrt(vx**2 + vy**2 + vz**2)
+        
+        # Calculate attitude angles from velocity direction
+        # Yaw is fixed to 0 degrees (aircraft points along X-axis in horizontal plane)
+        # Roll and pitch are derived from velocity vector
+        
+        # Pitch angle (θ): angle between velocity vector and horizontal plane
+        # pitch = arcsin(vz / speed)  (positive = nose up, negative = nose down)
+        horizontal_speed = np.sqrt(vx**2 + vy**2 + 1e-8)  # Avoid division by zero
+        pitch = np.arcsin(np.clip(vz / (speed + 1e-8), -1.0, 1.0))
+        
+        # Roll angle (φ): rotation around the forward axis
+        # With yaw fixed at 0, the aircraft's body X-axis aligns with world X-axis in horizontal projection
+        # Roll is determined by the lateral acceleration or bank angle
+        # For coordinated flight, roll relates to turn rate: tan(φ) = v * ψ̇ / g
+        # Simplified: roll indicates how much the aircraft is banking into turns
+        
+        # Calculate heading angle (ψ) in horizontal plane
+        heading = np.arctan2(vy, vx)  # ψ = atan2(vy, vx)
+        
+        # Calculate change in heading (turn rate)
+        heading_rate = np.gradient(heading, dt)
+        
+        # Coordinated turn bank angle: tan(φ) = (v * ψ̇) / g
+        # Use centripetal acceleration: a_centripetal = v * ψ̇
+        v = speed + 1e-8
+        centripetal_acc = v * heading_rate
+        g = 9.81  # gravity
+        
+        # Roll angle from coordinated turn (clamp to reasonable range ±π/2)
+        roll_turn = np.arctan2(centripetal_acc, g)
+        
+        # Additional roll component for maneuvers like barrel rolls
+        # For barrel rolls, we can add a sinusoidal component
+        roll_maneuver = np.zeros_like(roll_turn)
+        
+        # Add maneuver-specific roll effects
+        if style in ['barrel_roll']:
+            # Full roll rotation over the trajectory
+            t = np.linspace(0, 2*np.pi, seq_len)
+            roll_maneuver = 2 * np.pi * (t / (2*np.pi))  # One full rotation
+        elif style in ['power_loop', 'split_s', 'immelmann']:
+            # Loops involve pitch changes, minimal roll
+            roll_maneuver = np.zeros_like(roll_turn)
+        elif style in ['spiral_inward', 'spiral_outward']:
+            # Spirals have continuous roll
+            t = np.linspace(0, 2*np.pi, seq_len)
+            roll_maneuver = np.pi * np.sin(t)  # Oscillating roll
+        
+        # Combine turn-based roll and maneuver-specific roll
+        roll = roll_turn + roll_maneuver
+        
+        # Clamp roll to reasonable range [-π, π]
+        roll = np.clip(roll, -np.pi, np.pi)
+        
+        # For straight-line flight (low turn rate), roll should be near 0
+        # Smooth out small variations
+        roll[np.abs(heading_rate) < 0.1] = roll[np.abs(heading_rate) < 0.1] * 0.5
+        
+        # Attitude representation: [roll, pitch, yaw]
+        # Yaw is fixed to 0 as requested
+        yaw = np.zeros(seq_len)
+        
+        # Combine into attitude array
+        attitude = np.column_stack([roll, pitch, yaw])
+        
+        # Full state: [vx, x, y, z, vy, vz, roll, pitch, yaw, style_idx]
+        attitude_3d = np.column_stack([roll, pitch, yaw])
+        
+        state = np.column_stack([speed, x, y, z, vx, vy, vz, attitude_3d, np.full(seq_len, style_idx)])
+        
+        trajectories.append(state)
+        
+    return torch.tensor(np.stack(trajectories), dtype=torch.float32)
+
 
 # Trajectory deformation module
 class TrajectoryDeformer:

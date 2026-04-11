@@ -400,9 +400,9 @@ class ExponentialBarrierSafety:
         exp_probs_max = []
         for d in distances:
             # Simplified: b = (safety_radius)² / (d² + ε)
-            b = (d**2) - (safety_radius**2)
-            # if b < 0:
-            #     b = 0
+            b = - (d**2) + (safety_radius**2)
+            if b < 0:
+                 b = 0
             exp_probs_max.append(np.exp(- b/sigma))
         exp_probs_inv = []
         for d in distances:
@@ -413,7 +413,7 @@ class ExponentialBarrierSafety:
             exp_probs_inv.append(np.exp(- b/sigma))
 
         # Plot comparison
-        plt.figure(figsize=(5, 3.1))
+        plt.figure(figsize=(4.3, 3.1))
         
         # plt.plot(distances, exp_probs, 'b-', linewidth=2, 
         #         label=f'exp(-b(x)/σ), b=(R+r)²/(d²+ε)')
@@ -426,14 +426,14 @@ class ExponentialBarrierSafety:
         # plt.plot(distances, hybrid_probs, 'g-.', linewidth=1.5, 
         #         label=f'1/(1+exp(-h/σ)), h=d²-(R+r)²')
         
-        plt.plot(distances, exp_probs_max, 'r:', linewidth=1.5, 
-                label=r'$P_1(d)$')
-        plt.plot(distances, exp_probs_inv, color='black', linestyle='--', linewidth=1.5, 
-                label=r'$P_2(d)$')
+        plt.plot(distances, exp_probs_max, 'r-', linewidth=1.5, 
+                label=r'P1')
+        # plt.plot(distances, exp_probs_inv, color='black', linestyle='--', linewidth=1.5, 
+        #         label=r'$P_2(d)$')
         plt.plot(distances, cdf_probs, 'b-,', linewidth=1.5, 
-                label=r'$P_{CDF}(d)$')
+                label=r'CDF')
         plt.plot(distances, hybrid_probs, 'g-.', linewidth=1.5, 
-                label=r'$P_{logistic}(d)$')
+                label=r'logistic')
         # plt.plot(distances, exp_probs, 'b-', linewidth=2)
         # plt.plot(distances, exp_probs_max, 'r-', linewidth=2)
         # plt.plot(distances, exp_probs_inv, color='black', linestyle='--', linewidth=2)
