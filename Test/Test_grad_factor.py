@@ -114,7 +114,7 @@ def compare_guidance_effects_corrected():
     divide_series = gamma_ts / (sigma_ts + 1e-8) * grad_V_norm
     
     # Create comprehensive visualization
-    fig = plt.figure(figsize=(4.8, 3.1))
+    fig = plt.figure(figsize=(4.3, 3.1))
     
     # 1. Main comparison: Guidance strength over REVERSE diffusion steps
     diffusion_steps = torch.arange(T)  # 0 to T-1 (forward diffusion indices)
@@ -146,7 +146,7 @@ def compare_guidance_effects_corrected():
         fontsize=9,
         loc='upper left',
         bbox_to_anchor=(0.40, 0.98),
-        frameon=False  # 完全关闭图例框架
+        frameon=False 
     )
     
     plt.grid(True, alpha=0.3)

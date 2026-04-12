@@ -17,8 +17,8 @@ import time
 from Deformation import generate_aerobatic_trajectories
 from Deformation import augment_trajectories_with_smooth_concatenation
 from Deformation import generate_aerobatic_trajectories_deformation
-from circular_trajectories import generate_circular_end_trajectories
-from distribute_trajectories import generate_distributed_trajectories
+from Test.circular_trajectories import generate_circular_end_trajectories
+from Test.distribute_trajectories import generate_distributed_trajectories
 
 
 # Configuration parameters based on the paper
