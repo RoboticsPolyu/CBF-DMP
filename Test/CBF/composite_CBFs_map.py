@@ -5,8 +5,6 @@ from matplotlib.lines import Line2D
 from matplotlib import font_manager
 
 # Set Times New Roman font globally
-font_path = 'figs/timr45w.ttf'  # Adjust path if necessary
-font_prop = font_manager.FontProperties(fname=font_path, size=10)
 plt.rcParams['font.family'] = 'Times New Roman'
 plt.rcParams['font.size'] = 10
 
@@ -73,7 +71,7 @@ plt.figure(figsize=(fig_width, fig_height))
 sc = plt.scatter(robot_positions[:, 0], robot_positions[:, 1], c=log_sum_exp_values,
                  cmap='viridis', s=50, alpha=0.6)
 cbar = plt.colorbar(sc)
-cbar.set_label('Log-sum-exp', fontproperties=font_prop)
+cbar.set_label('Log-sum-exp')
 
 # Plot obstacles
 plt.scatter(obstacle_pos[:, 0], obstacle_pos[:, 1], c='red', marker='o', s=100, label='Obstacles')
@@ -91,14 +89,14 @@ plt.contour(X, Y, Z, levels=[0], colors='blue', linewidths=2, linestyles='solid'
 # Set plot properties
 plt.xlim(0, space_size)
 plt.ylim(0, space_size)
-plt.xlabel('X (m)', fontproperties=font_prop)
-plt.ylabel('Y (m)', fontproperties=font_prop)
-plt.title('Log-sum-exp values with variable safety distances', fontproperties=font_prop)
+plt.xlabel('X (m)')
+plt.ylabel('Y (m)')
+plt.title('Log-sum-exp values with variable safety distances')
 plt.grid(True)
 plt.gca().set_aspect('equal', adjustable='box')
 
 # Save plot with high resolution
-plt.savefig('figs/log_sum_exp_heatmap_variable_d_safe.svg', dpi=300, bbox_inches='tight')
+plt.savefig('log_sum_exp_heatmap_variable_d_safe.svg', dpi=300, bbox_inches='tight')
 plt.show()
 
 # Print sample results

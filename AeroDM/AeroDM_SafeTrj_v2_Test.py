@@ -14,9 +14,8 @@ import sys
 import time
 
 
-from Deformation import generate_aerobatic_trajectories
-from Deformation import augment_trajectories_with_smooth_concatenation
-from Deformation import generate_aerobatic_trajectories_deformation
+from Trajectory_Gen import generate_aerobatic_trajectories
+from Trajectory_Gen import augment_trajectories_with_smooth_concatenation
 from Test.circular_trajectories import generate_circular_end_trajectories
 from Test.distribute_trajectories import generate_distributed_trajectories
 
@@ -306,7 +305,6 @@ class AttentionObstacleEncoder(nn.Module):
         
         # Stack all batch embeddings: [batch_size, obs_latent_dim]
         return torch.stack(batch_embeddings)
-    
 # Condition embedding module that integrates diffusion timestep, target waypoint, action style, and obstacle information
 class ConditionEmbedding(nn.Module):
     def __init__(self, config):
@@ -1100,7 +1098,7 @@ class AeroDMLoss(nn.Module):
             #     continuity_loss += self.mse_loss(first_pred_vel, last_history_vel)
         
         # Total weighted loss
-        total_loss = self.xyz_weight * last_xyz_loss + self.xyz_weight * position_loss + self.diff_vel_weight * vel_loss + self.other_weight * other_loss + self.obstacle_weight * obstacle_loss + self.continuity_weight * continuity_loss + self.acc_weight * acc_smoothness
+        total_loss = self.last_xyz_weight * last_xyz_loss + self.xyz_weight * position_loss + self.diff_vel_weight * vel_loss + self.other_weight * other_loss + self.obstacle_weight * obstacle_loss + self.continuity_weight * continuity_loss + self.acc_weight * acc_smoothness
         
         return total_loss, position_loss, vel_loss, obstacle_loss, continuity_loss
 
@@ -1298,7 +1296,7 @@ def plot_test_results(original, sampled_unguided_denorm, sampled_guided_denorm, 
 
     # Create figure with optimized layout
     fig = plt.figure(figsize=(24, 16))
-    fig.suptitle(f'AeroDM Trajectory Generation Results (Test Sample {step_idx})', 
+    fig.suptitle(f'AeroTrajGen Trajectory Generation Results (Test Sample {step_idx})', 
                  fontsize=12, fontweight='bold', y=0.98)
     
     # Define consistent styling
@@ -2818,7 +2816,7 @@ def plot_test_results(original, sampled_unguided_denorm, sampled_guided_denorm, 
     fig = plt.figure(figsize=(24, 18))
     
     # Main title with style information
-    title_text = f'AeroDM Trajectory Generation Results (Test Sample {step_idx})'
+    title_text = f'AeroTrajGen Trajectory Generation Results (Test Sample {step_idx})'
     if history_style is not None or pred_style is not None:
         title_text += f'\nHistory Style: {history_style_name} | Prediction Style: {pred_style_name}'
     fig.suptitle(title_text, fontsize=16, fontweight='bold', y=0.98)

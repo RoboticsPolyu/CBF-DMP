@@ -371,9 +371,9 @@ class ExponentialBarrierSafety:
         safety_radius = 1.0 + self.robot_radius
         
         # Distance values
-        distances = np.linspace(0, 3 * safety_radius, 500)
+        distances = np.linspace(0, 2* safety_radius, 500)
         
-        sigma = 0.3  # Uncertainty parameter
+        sigma = 0.5  # Uncertainty parameter
         # 1. Exponential barrier function (type 1)
         exp_probs = []
         for d in distances:
@@ -497,17 +497,14 @@ class ExponentialBarrierSafety:
         
         return distances, exp_probs, cdf_probs, hybrid_probs
 
-# 主程序演示
 if __name__ == "__main__":
     print("="*70)
     print("EXPONENTIAL BARRIER FUNCTION SAFETY PROBABILITY")
     print("="*70)
     print("\nExploring: P(x) = exp(-b(x)) where b(x) is a barrier function")
     
-    # 创建障碍物（为了可视化，只用一个在原点）
     obstacles = [(0, 0, 1.0)]
     
-    # 初始化指数障碍函数安全评估器
     exp_safety = ExponentialBarrierSafety(
         obstacles=obstacles,
         robot_radius=0.2,

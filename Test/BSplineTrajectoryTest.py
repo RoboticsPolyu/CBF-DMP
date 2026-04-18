@@ -395,18 +395,18 @@ def demo_bspline_trajectory():
     
     # Test case 1: Simple 2D trajectory
     print("Test 1: 2D Trajectory with 5 control points")
-    # control_points_2d = torch.tensor([
-    #     [0.0, 0.0],
-    #     [1.0, 2.0], 
-    #     [3.0, 1.0],
-    #     [4.0, 3.0],
-    #     [5.0, 0.0]
-    # ], dtype=torch.float32)
-    seq_len = 10
-    trajectories = generate_aerobatic_trajectories(1, seq_len)
-    control_points_2d = trajectories[0]
+    control_points_2d = torch.tensor([
+        [0.0, 0.0],
+        [1.0, 2.0], 
+        [3.0, 1.0],
+        [4.0, 3.0],
+        [5.0, 0.0]
+    ], dtype=torch.float32)
+    # seq_len = 10
+    # trajectories = generate_aerobatic_trajectories(1, seq_len)
+    # control_points_2d = trajectories[0]
 
-    bspline_2d = BSplineTrajectory(control_points_2d, degree=3, seq_len=seq_len*12)
+    bspline_2d = BSplineTrajectory(control_points_2d, degree=3, seq_len=5*12)
     trajectory_2d = bspline_2d.evaluate()
     
     print(f"Control points shape: {control_points_2d.shape}")

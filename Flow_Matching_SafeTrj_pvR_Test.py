@@ -13,10 +13,9 @@ import matplotlib.pyplot as plt
 import sys
 import time
 
-from Deformation import generate_aerobatic_trajectories
-from Deformation import generate_aerobatic_trajectories_pvR
-from Deformation import augment_trajectories_with_smooth_concatenation
-from Deformation import generate_aerobatic_trajectories_deformation
+from Trajectory_Gen import generate_aerobatic_trajectories
+from Trajectory_Gen import generate_aerobatic_trajectories_pvR
+from Trajectory_Gen import augment_trajectories_with_smooth_concatenation
 from Test.circular_trajectories import generate_circular_end_trajectories
 from Test.distribute_trajectories import generate_distributed_trajectories
 
@@ -31,7 +30,7 @@ class Config:
 
     # Flow Matching parameters (replaces diffusion steps)
     num_time_steps = 100  # Number of time steps for ODE solver
-    ode_solver = 'euler'  # 'euler' or 'rk4' for ODE integration
+    ode_solver = 'rk4'  # 'euler' or 'rk4' for ODE integration
     
     # Sequence parameters
     seq_len = 60  # N_a = 60 time steps; 6s-long future trajectory sequence
@@ -913,6 +912,12 @@ class AeroFMLoss(nn.Module):
                 acc = vel[:, 1:, :] - vel[:, :-1, :]
                 acc_smoothness = acc.pow(2).mean()
             
+            vel_seq = pred_trajectory[:, 1:, 1:4] - pred_trajectory[:, :-1, 1:4]
+            acc_seq = vel_seq[:, 1:, :] - vel_seq[:, :-1, :]
+            jerk_seq = acc_seq[:, 1:, :] - acc_seq[:, :-1, :]
+
+            smooth_loss = acc_seq.pow(2).mean() + 0.1 * jerk_seq.pow(2).mean()
+
             # Speed and attitude losses
             speed_loss = self.mse_loss(pred_speed, gt_speed)
             attitude_loss = self.mse_loss(pred_attitude, gt_attitude)
@@ -935,7 +940,8 @@ class AeroFMLoss(nn.Module):
                      self.other_weight * other_loss + 
                      self.obstacle_weight * obstacle_loss + 
                      self.continuity_weight * continuity_loss + 
-                     self.acc_weight * acc_smoothness)
+                     self.acc_weight * acc_smoothness +
+                     smooth_loss)
         
         return total_loss, velocity_loss, position_loss, obstacle_loss, continuity_loss
 
@@ -1030,7 +1036,7 @@ def train_flow_matching_model():
     # Training parameters
     num_epochs = 100
     batch_size = 32
-    num_trajectories = 2000
+    num_trajectories = 10000
     
     print("Generating training data...")
     trajectories = generate_aerobatic_trajectories_pvR(
@@ -1127,9 +1133,15 @@ def train_flow_matching_model():
             # Predict velocity field
             pred_u = model(x_t, t, target, action, history, obstacles_for_batch)
             
+            t_expanded = t.view(-1, 1, 1)
+            pred_x1 = x_t + (1 - t_expanded) * pred_u
+            
+            # def forward(self, pred_velocity, gt_velocity, pred_trajectory=None, gt_trajectory=None, 
+            # obstacles_data=None, mean=None, std=None, history=None):
             # Compute loss
             total_loss, velocity_loss, position_loss, obstacle_loss, continuity_loss = criterion(
-                pred_u, u_t, x_1, x_1,  # Use x_1 as ground truth for trajectory
+                pred_u, u_t, 
+                pred_x1, x_1, 
                 obstacles_for_batch if config.use_obstacle_loss else None,
                 mean, std, history
             )
@@ -1182,8 +1194,8 @@ def train_flow_matching_model():
     
     import os
     os.makedirs('model', exist_ok=True)
-    torch.save(checkpoint, "model/aerofm_model.pth")
-    print("Model saved to model/aerofm_model.pth")
+    torch.save(checkpoint, "model/Flow_matching_aero_model.pth")
+    print("Model saved to model/Flow_matching_aero_model.pth")
     
     return model, test_norm, mean, std
 

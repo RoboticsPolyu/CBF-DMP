@@ -1769,7 +1769,7 @@ def plot_test_results(original, sampled_unguided_denorm, sampled_guided_denorm, 
 
     # Create figure with optimized layout
     fig = plt.figure(figsize=(24, 16))
-    fig.suptitle(f'AeroDM Trajectory Generation Results (Test Sample {step_idx})', 
+    fig.suptitle(f'AeroTrajGen Trajectory Generation Results (Test Sample {step_idx})', 
                  fontsize=20, fontweight='bold', y=0.98)
     
     # Define consistent styling

@@ -47,7 +47,7 @@ sum_exp = np.sum(exp_violations)
 result = -1/k* np.log(sum_exp)
 
 # Create plot
-plt.figure(figsize=(8, 8))
+# plt.figure(figsize=(8, 8))
 
 # Plot robot
 plt.scatter(robot_pos[0], robot_pos[1], c='green', marker='*', s=200, label='Robot')

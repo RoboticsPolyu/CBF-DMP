@@ -12,18 +12,23 @@ import numpy as np
 import matplotlib.pyplot as plt
 import sys
 import time
+from datetime import datetime
 
-
-from Deformation import generate_aerobatic_trajectories
-from Deformation import generate_aerobatic_trajectories_pvR
-from Deformation import augment_trajectories_with_smooth_concatenation
-from Deformation import generate_aerobatic_trajectories_deformation
+from Trajectory_Gen import generate_aerobatic_trajectories
+from Trajectory_Gen import generate_aerobatic_trajectories_pvR
+from Trajectory_Gen import augment_trajectories_with_smooth_concatenation
 from Test.circular_trajectories import generate_circular_end_trajectories
 from Test.distribute_trajectories import generate_distributed_trajectories
 
 
 # Configuration parameters based on the paper
 class Config:
+    # Training parameters
+    num_epochs = 100
+    batch_size = 32
+    _base_num_trajectories = 10000 # Base number of trajectories before augmentation (will be increased by concatenation)
+    num_test_samples = 100
+
     # Model dimensions
     latent_dim = 128
     obs_latent_dim = 128
@@ -32,7 +37,7 @@ class Config:
     dropout = 0.1
 
     # Diffusion parameters
-    diffusion_steps = 100
+    diffusion_steps = 60
     beta_start = 0.0001
     beta_end = 0.02
     
@@ -53,11 +58,11 @@ class Config:
 
     # CBF Guidance parameters (from CoDiG paper)
     # enable_cbf_guidance = True  # Disabled by default; toggle for inference
-    guidance_gamma = 2000.0  # Base gamma for barrier guidance
-    
-    safe_extra_factor=0.2 # Safety buffer as fraction of radius (e.g., 20%)
-    
-    last_xyz_weight=5.0 # Extra weight for final timestep's position error
+    guidance_gamma = 4000.0  # Base gamma for barrier guidance
+    safe_extra_factor=0.20 # Safety buffer as fraction of radius (e.g., 20%)
+    barrier_sigma = 0.5 # Smoothness parameter for logistic barrier function (tune for best results)
+
+    last_xyz_weight=50.0 # Extra weight for final timestep's position error
     xyz_weight=1.0 # Extra weight for Z-axis (height) in aviation
     vel_weight=1.0 # Weight for velocity term
     other_weight=1.0 # Weight for other losses
@@ -502,7 +507,7 @@ class ObstacleAwareDiffusionTransformer(nn.Module):
         return mask
 
 # Barrier Function Computation for Multiple Obstacles
-def compute_barrier_and_grad(x, config, mean, std, obstacles_data=None, safety_margin = 0.20):
+def compute_barrier_and_grad(x, mean, std, obstacles_data=None, safety_margin = 0.20):
     """
     Compute barrier V and its gradient ∇V for the trajectory x.
     Fixed version with proper gradient computation.
@@ -565,7 +570,7 @@ def compute_barrier_and_grad(x, config, mean, std, obstacles_data=None, safety_m
     return V_avg, grad_x
 
 # Barrier Function Computation for Multiple Obstacles using Logistic (Sigmoid) Approach
-def compute_barrier_and_grad_logistic(x, config, mean, std, obstacles_data=None, safety_margin=0.20, sigma=0.5):
+def compute_barrier_and_grad_logistic(x, mean, std, obstacles_data=None, safety_margin=0.20, sigma=0.5):
     """
     Compute barrier V and its gradient ∇V for the trajectory x using Logistic (Sigmoid) approach.
     
@@ -752,7 +757,8 @@ class ObstacleAwareDiffusionProcess:
                 gamma_t = guidance_gamma * (1.0 - t_exp.squeeze(1).float() / self.config.diffusion_steps)
                 
                 # Compute barrier gradient ∇V with multiple obstacles
-                V, grad_V = compute_barrier_and_grad_logistic(pred_x0, self.config, mean, std, obstacles_data)
+                V, grad_V = compute_barrier_and_grad_logistic(pred_x0, mean, std, obstacles_data, safety_margin=config.safe_extra_factor, sigma=config.barrier_sigma)
+
                 barrier_info = {'V': V, 'grad_V': grad_V, 'gamma_t': gamma_t}
                 # print(barrier_info)
                 # Guided score: s_guided = s_theta - γ_t ∇V
@@ -1212,7 +1218,7 @@ class AeroDMLoss(nn.Module):
             #     continuity_loss += self.mse_loss(first_pred_vel, last_history_vel)
         
         # Total weighted loss
-        total_loss = self.xyz_weight * last_xyz_loss + self.xyz_weight * position_loss + self.vel_weight * vel_loss + self.other_weight * other_loss + self.obstacle_weight * obstacle_loss + self.continuity_weight * continuity_loss + self.acc_weight * acc_smoothness
+        total_loss = self.last_xyz_weight * last_xyz_loss + self.xyz_weight * position_loss + self.vel_weight * vel_loss + self.other_weight * other_loss + self.obstacle_weight * obstacle_loss + self.continuity_weight * continuity_loss + self.acc_weight * acc_smoothness
         
         return total_loss, position_loss, vel_loss, obstacle_loss, continuity_loss
 
@@ -1277,6 +1283,26 @@ def generate_target_waypoints(trajectory):
     
     # Concatenate: [x, y, z, valid]
     return torch.cat([target_pos, valid_flag], dim=-1)
+
+def add_target_noise(target, bound=1.0):
+    """
+    Add uniform noise to the target waypoint's position components (x, y, z).
+    
+    Args:
+        target: Tensor of shape (batch_size, 4) where last dimension = [x, y, z, valid_flag]
+        bound: Float, noise range is (-bound, +bound) for each coordinate
+    
+    Returns:
+        target_noisy: Tensor with same shape, where x, y, z have added noise
+    """
+    # Generate uniform noise in range [-bound, bound] for x, y, z
+    noise = (torch.rand_like(target[:, :3]) * 2 - 1) * bound  # Shape: (batch_size, 3)
+    
+    # Add noise to position components
+    target_noisy = target.clone()
+    target_noisy[:, :3] = target_noisy[:, :3] + noise
+    
+    return target_noisy
 
 def generate_random_obstacles(trajectory, num_obstacles_range=(1, 5), radius_range=(0.5, 2.0), check_collision=False, device='cpu'):
     """
@@ -1388,84 +1414,6 @@ def plot_trajectories_demo(demo_trajectories, rows=3, cols=6):
         
     plt.tight_layout(rect=[0, 0.05, 1, 0.95])  # Adjust layout to accommodate title and text
     plt.show()
-
-def plot_test_results(original, sampled_unguided_denorm, sampled_guided_denorm, history, target, obstacles=None, show_flag=True, step_idx=0):
-    """
-    Plot test results including original, reconstructed (unguided), and guided samples.
-    Supports 3D, 2D projections, and time-series plots.
-    """
-    # Precompute all data at once to avoid repeated operations
-    original_pos = original[0, :, 1:4].detach().cpu().numpy()
-    reconstructed_pos = sampled_unguided_denorm[0, :, 1:4].detach().cpu().numpy()
-    sampled_pos = sampled_guided_denorm[0, :, 1:4].detach().cpu().numpy()
-    
-    # Extract speeds
-    original_speed = original[0, :, 0].detach().cpu().numpy()
-    reconstructed_speed = sampled_unguided_denorm[0, :, 0].detach().cpu().numpy()
-    sampled_speed = sampled_guided_denorm[0, :, 0].detach().cpu().numpy()
-    
-    time_steps = np.arange(len(original_pos))
-    history_pos = history[0, :, 1:4].detach().cpu().numpy() if history is not None else None
-    target_pos = target[0, :].detach().cpu().numpy() if target is not None else None
-
-    # Create figure with optimized layout
-    fig = plt.figure(figsize=(24, 16))
-    fig.suptitle(f'AeroDM Trajectory Generation Results (Test Sample {step_idx})', 
-                 fontsize=12, fontweight='bold', y=0.98)
-    
-    # Define consistent styling
-    STYLES = {
-        'history': {'color': 'magenta', 'linewidth': 4, 'alpha': 0.8, 'marker': 'o', 'markersize': 4},
-        'original': {'color': 'blue', 'linewidth': 3, 'alpha': 0.9},
-        'reconstructed': {'color': 'red', 'linewidth': 2, 'alpha': 0.8, 'linestyle': '--', 'marker': '.'},
-        'sampled': {'color': 'green', 'linewidth': 2, 'alpha': 0.8, 'linestyle': '-.', 'marker': '.'},
-        'target': {'color': 'yellow', 's': 200, 'marker': '*', 'edgecolors': 'black', 'linewidth': 2}
-    }
-
-    # 1. 3D trajectory plot
-    ax1 = fig.add_subplot(331, projection='3d')
-    plot_3d_trajectory(ax1, original_pos, reconstructed_pos, sampled_pos, history_pos, target_pos, obstacles, STYLES)
-
-    # 2-4. 2D Projections
-    projections = [
-        (332, 'X-Y Projection', 0, 1, 'X', 'Y'),
-        (333, 'X-Z Projection', 0, 2, 'X', 'Z'), 
-        (334, 'Y-Z Projection', 1, 2, 'Y', 'Z')
-    ]
-    
-    for subplot_idx, title, dim1, dim2, xlabel, ylabel in projections:
-        ax = fig.add_subplot(subplot_idx)
-        plot_2d_projection(ax, original_pos, reconstructed_pos, sampled_pos, history_pos, 
-                          target_pos, obstacles, STYLES, dim1, dim2, title, xlabel, ylabel)
-
-    # 5-7. Position over time
-    positions = [
-        (335, 'X Position Over Time', 0, 'X Position'),
-        (336, 'Y Position Over Time', 1, 'Y Position'), 
-        (337, 'Z Position Over Time', 2, 'Z Position')
-    ]
-    
-    for subplot_idx, title, dim, ylabel in positions:
-        ax = fig.add_subplot(subplot_idx)
-        plot_position_time(ax, time_steps, original_pos, reconstructed_pos, sampled_pos, 
-                          dim, title, ylabel, STYLES)
-
-    # 8. Speed comparison
-    ax8 = fig.add_subplot(338)
-    plot_speed_comparison(ax8, time_steps, original_speed, reconstructed_speed, sampled_speed, STYLES)
-
-    # 9. Error analysis
-    ax9 = fig.add_subplot(339)
-    plot_error_analysis(ax9, time_steps, original_pos, reconstructed_pos, sampled_pos)
-
-    plt.tight_layout(rect=[0, 0.02, 1, 0.96])
-    
-    if show_flag:
-        plt.show()
-    else:
-        filename = f"Figs/test_sample_{step_idx:03d}_results.svg"
-        plt.savefig(filename, format='svg', bbox_inches='tight', dpi=300)
-        plt.close()
 
 # Helper functions for modular plotting
 def plot_3d_trajectory(ax, original_pos, reconstructed_pos, sampled_pos, history_pos, target_pos, obstacles, styles, bounds=None):
@@ -1716,7 +1664,9 @@ def test_model_performance_cb_eva(model, trajectories_norm, mean, std, num_test_
             # Denormalize for obstacle generation and plotting
             x_0_denorm = denormalize_trajectories(x_0, mean_state, std_state)
             target_denorm = denormalize_target(target_norm, mean_state, std_state)
-            
+            target_denorm = add_target_noise(target_denorm, bound=1.0)
+            target_norm = normalize_target(target_denorm, mean_state, std_state)  # Re-normalize after adding noise
+
             # Extract style information
             history_style = style_info[:, 0, 0]
             pred_style = style_info[:, -1, 0]
@@ -2006,112 +1956,191 @@ def compute_success_rates(trajectories_pos, ground_truth_positions, target_posit
     
     return results
 
+def config_to_string(config):
+    """Convert Config parameters to a formatted string."""
+    lines = []
+    lines.append("="*80)
+    lines.append("CONFIGURATION PARAMETERS")
+    lines.append("="*80)
+    lines.append(f"Training Parameters:")
+    lines.append(f"  num_epochs: {config.num_epochs}")
+    lines.append(f"  batch_size: {config.batch_size}")
+    lines.append(f"  base_num_trajectories: {config._base_num_trajectories}")
+    lines.append(f"  num_test_samples: {config.num_test_samples}")
+    lines.append("")
+    lines.append(f"Model Dimensions:")
+    lines.append(f"  latent_dim: {config.latent_dim}")
+    lines.append(f"  obs_latent_dim: {config.obs_latent_dim}")
+    lines.append(f"  num_layers: {config.num_layers}")
+    lines.append(f"  num_heads: {config.num_heads}")
+    lines.append(f"  dropout: {config.dropout}")
+    lines.append("")
+    lines.append(f"Diffusion Parameters:")
+    lines.append(f"  diffusion_steps: {config.diffusion_steps}")
+    lines.append(f"  beta_start: {config.beta_start}")
+    lines.append(f"  beta_end: {config.beta_end}")
+    lines.append("")
+    lines.append(f"Sequence Parameters:")
+    lines.append(f"  seq_len: {config.seq_len}")
+    lines.append(f"  state_dim: {config.state_dim}")
+    lines.append(f"  history_len: {config.history_len}")
+    lines.append("")
+    lines.append(f"Condition Dimensions:")
+    lines.append(f"  target_dim: {config.target_dim}")
+    lines.append(f"  action_dim: {config.action_dim}")
+    lines.append("")
+    lines.append(f"Obstacle Parameters:")
+    lines.append(f"  max_obstacles: {config.max_obstacles}")
+    lines.append(f"  obstacle_feat_dim: {config.obstacle_feat_dim}")
+    lines.append(f"  enable_obstacle_encoding: {config.enable_obstacle_encoding}")
+    lines.append(f"  use_obstacle_loss: {config.use_obstacle_loss}")
+    lines.append("")
+    lines.append(f"CBF Guidance Parameters:")
+    lines.append(f"  guidance_gamma: {config.guidance_gamma}")
+    lines.append(f"  safe_extra_factor: {config.safe_extra_factor}")
+    lines.append(f"  barrier_sigma: {config.barrier_sigma}")
+    lines.append("")
+    lines.append(f"Loss Weights:")
+    lines.append(f"  last_xyz_weight: {config.last_xyz_weight}")
+    lines.append(f"  xyz_weight: {config.xyz_weight}")
+    lines.append(f"  vel_weight: {config.vel_weight}")
+    lines.append(f"  other_weight: {config.other_weight}")
+    lines.append(f"  obstacle_weight: {config.obstacle_weight}")
+    lines.append(f"  continuity_weight: {config.continuity_weight}")
+    lines.append(f"  acc_weight: {config.acc_weight}")
+    lines.append("")
+    lines.append(f"Other Parameters:")
+    lines.append(f"  delta_T: {config.delta_T}")
+    lines.append(f"  drop_style_prob: {config.drop_style_prob}")
+    lines.append(f"  drop_target_prob: {config.drop_target_prob}")
+    lines.append(f"  guidance_scale: {config.guidance_scale}")
+    lines.append(f"  show_flag: {config.show_flag}")
+    lines.append("="*80)
+    
+    return '\n'.join(lines)
+
 def print_metrics_with_success_rates(unguided_positions, guided_positions, 
                                       ground_truth_positions, target_positions, 
                                       obstacles_data):
-    """Print comprehensive metrics including success rates."""
+    """Print comprehensive metrics including success rates and save to timestamped file."""
     
-    print("\n" + "="*80)
-    print("COMPREHENSIVE METRICS SUMMARY WITH SUCCESS RATES")
-    print("="*80)
+    # Generate timestamp for filename
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"Results/metrics_summary_{timestamp}.txt"
+    
+    # Capture all output
+    output_lines = []
+    
+    def write_and_print(text):
+        """Write text to both console and file buffer."""
+        print(text)
+        output_lines.append(text)
+    
+    # Write config parameters first
+    write_and_print(config_to_string(config))
+    write_and_print("\n")
+    
+    write_and_print("\n" + "="*80)
+    write_and_print("COMPREHENSIVE METRICS SUMMARY WITH SUCCESS RATES")
+    write_and_print("="*80)
     
     # Compute collision rates
-    print("\n" + "-"*60)
-    print("COLLISION RATE ANALYSIS")
-    print("-"*60)
+    write_and_print("\n" + "-"*60)
+    write_and_print("COLLISION RATE ANALYSIS")
+    write_and_print("-"*60)
     
     unguided_collision = compute_collision_rate(unguided_positions, obstacles_data, safety_margin=0.0)
     guided_collision = compute_collision_rate(guided_positions, obstacles_data, safety_margin=0.0)
     
-    print(f"\nUNGuided Trajectories (without CBF):")
-    print(f"  - Collision Rate: {unguided_collision['collision_rate']*100:.2f}%")
-    print(f"  - Avg Collision % per trajectory: {unguided_collision['avg_collision_percentage']:.2f}%")
-    print(f"  - Trajectories with collision: {unguided_collision['trajectories_with_collision']}/{unguided_collision['total_trajectories']}")
+    write_and_print(f"\nUNGuided Trajectories (without CBF):")
+    write_and_print(f"  - Collision Rate: {unguided_collision['collision_rate']*100:.2f}%")
+    write_and_print(f"  - Avg Collision % per trajectory: {unguided_collision['avg_collision_percentage']:.2f}%")
+    write_and_print(f"  - Trajectories with collision: {unguided_collision['trajectories_with_collision']}/{unguided_collision['total_trajectories']}")
     
-    print(f"\nGuided Trajectories (with CBF):")
-    print(f"  - Collision Rate: {guided_collision['collision_rate']*100:.2f}%")
-    print(f"  - Avg Collision % per trajectory: {guided_collision['avg_collision_percentage']:.2f}%")
-    print(f"  - Trajectories with collision: {guided_collision['trajectories_with_collision']}/{guided_collision['total_trajectories']}")
+    write_and_print(f"\nGuided Trajectories (with CBF):")
+    write_and_print(f"  - Collision Rate: {guided_collision['collision_rate']*100:.2f}%")
+    write_and_print(f"  - Avg Collision % per trajectory: {guided_collision['avg_collision_percentage']:.2f}%")
+    write_and_print(f"  - Trajectories with collision: {guided_collision['trajectories_with_collision']}/{guided_collision['total_trajectories']}")
     
     # Compute trajectory errors
-    print("\n" + "-"*60)
-    print("TRAJECTORY PREDICTION ERROR ANALYSIS")
-    print("-"*60)
+    write_and_print("\n" + "-"*60)
+    write_and_print("TRAJECTORY PREDICTION ERROR ANALYSIS")
+    write_and_print("-"*60)
     
     unguided_errors = compute_trajectory_errors(unguided_positions, ground_truth_positions)
     guided_errors = compute_trajectory_errors(guided_positions, ground_truth_positions)
     
-    print(f"\nUNGuided Trajectory Errors:")
-    print(f"  - Mean AE: {unguided_errors['mean_ae']:.4f}")
-    print(f"  - RMSE: {unguided_errors['rmse']:.4f}")
-    print(f"  - Mean Final Error: {unguided_errors['mean_final_error']:.4f}")
-    print(f"  - 95th Percentile: {unguided_errors['percentile_95']:.4f}")
+    write_and_print(f"\nUNGuided Trajectory Errors:")
+    write_and_print(f"  - Mean AE: {unguided_errors['mean_ae']:.4f}")
+    write_and_print(f"  - RMSE: {unguided_errors['rmse']:.4f}")
+    write_and_print(f"  - Mean Final Error: {unguided_errors['mean_final_error']:.4f}")
+    write_and_print(f"  - 95th Percentile: {unguided_errors['percentile_95']:.4f}")
     
-    print(f"\nGuided Trajectory Errors:")
-    print(f"  - Mean AE: {guided_errors['mean_ae']:.4f}")
-    print(f"  - RMSE: {guided_errors['rmse']:.4f}")
-    print(f"  - Mean Final Error: {guided_errors['mean_final_error']:.4f}")
-    print(f"  - 95th Percentile: {guided_errors['percentile_95']:.4f}")
+    write_and_print(f"\nGuided Trajectory Errors:")
+    write_and_print(f"  - Mean AE: {guided_errors['mean_ae']:.4f}")
+    write_and_print(f"  - RMSE: {guided_errors['rmse']:.4f}")
+    write_and_print(f"  - Mean Final Error: {guided_errors['mean_final_error']:.4f}")
+    write_and_print(f"  - 95th Percentile: {guided_errors['percentile_95']:.4f}")
     
     # Compute success rates
-    print("\n" + "-"*60)
-    print("SUCCESS RATE ANALYSIS")
-    print("-"*60)
+    write_and_print("\n" + "-"*60)
+    write_and_print("SUCCESS RATE ANALYSIS")
+    write_and_print("-"*60)
     
-    print("\nSuccess Criteria:")
-    print("  ✓ Collision-free: No intersection with obstacles")
-    print("  ✓ Trajectory accuracy: Max position error < 2.0")
-    print("  ✓ Final point accuracy: Final position error < 1.0")
-    print("  ✓ Target reach: Distance to target < 2.0 at final step")
-    print("  ✓ Overall success: Meets ALL above criteria")
+    write_and_print("\nSuccess Criteria:")
+    write_and_print("  ✓ Collision-free: No intersection with obstacles")
+    write_and_print("  ✓ Trajectory accuracy: Max position error < 2.0")
+    write_and_print("  ✓ Final point accuracy: Final position error < 1.0")
+    write_and_print("  ✓ Target reach: Distance to target < 2.0 at final step")
+    write_and_print("  ✓ Overall success: Meets ALL above criteria")
     
     # Unguided success rates
-    print("\n" + "="*60)
-    print("UNGuided Trajectories (without CBF)")
-    print("="*60)
+    write_and_print("\n" + "="*60)
+    write_and_print("UNGuided Trajectories (without CBF)")
+    write_and_print("="*60)
     unguided_success = compute_success_rates(
         unguided_positions, ground_truth_positions, target_positions, obstacles_data
     )
     
-    print(f"\n  📊 Collision-Free Rate:     {unguided_success['collision_free_rate']:6.2f}%")
-    print(f"  📊 Trajectory Accuracy Rate: {unguided_success['trajectory_accuracy_rate']:6.2f}%")
-    print(f"  📊 Final Point Accuracy Rate:{unguided_success['final_point_accuracy_rate']:6.2f}%")
-    print(f"  📊 Target Reach Rate:        {unguided_success['target_reach_rate']:6.2f}%")
-    print(f"  📊 Safety Distance Rate:     {unguided_success['safety_distance_rate']:6.2f}%")
-    print(f"  ⭐ OVERALL SUCCESS RATE:     {unguided_success['overall_success_rate']:6.2f}%")
+    write_and_print(f"\n  📊 Collision-Free Rate:     {unguided_success['collision_free_rate']:6.2f}%")
+    write_and_print(f"  📊 Trajectory Accuracy Rate: {unguided_success['trajectory_accuracy_rate']:6.2f}%")
+    write_and_print(f"  📊 Final Point Accuracy Rate:{unguided_success['final_point_accuracy_rate']:6.2f}%")
+    write_and_print(f"  📊 Target Reach Rate:        {unguided_success['target_reach_rate']:6.2f}%")
+    write_and_print(f"  📊 Safety Distance Rate:     {unguided_success['safety_distance_rate']:6.2f}%")
+    write_and_print(f"  ⭐ OVERALL SUCCESS RATE:     {unguided_success['overall_success_rate']:6.2f}%")
     
     # Guided success rates
-    print("\n" + "="*60)
-    print("Guided Trajectories (with CBF)")
-    print("="*60)
+    write_and_print("\n" + "="*60)
+    write_and_print("Guided Trajectories (with CBF)")
+    write_and_print("="*60)
     guided_success = compute_success_rates(
         guided_positions, ground_truth_positions, target_positions, obstacles_data
     )
     
-    print(f"\n  📊 Collision-Free Rate:     {guided_success['collision_free_rate']:6.2f}%")
-    print(f"  📊 Trajectory Accuracy Rate: {guided_success['trajectory_accuracy_rate']:6.2f}%")
-    print(f"  📊 Final Point Accuracy Rate:{guided_success['final_point_accuracy_rate']:6.2f}%")
-    print(f"  📊 Target Reach Rate:        {guided_success['target_reach_rate']:6.2f}%")
-    print(f"  📊 Safety Distance Rate:     {guided_success['safety_distance_rate']:6.2f}%")
-    print(f"  ⭐ OVERALL SUCCESS RATE:     {guided_success['overall_success_rate']:6.2f}%")
+    write_and_print(f"\n  📊 Collision-Free Rate:     {guided_success['collision_free_rate']:6.2f}%")
+    write_and_print(f"  📊 Trajectory Accuracy Rate: {guided_success['trajectory_accuracy_rate']:6.2f}%")
+    write_and_print(f"  📊 Final Point Accuracy Rate:{guided_success['final_point_accuracy_rate']:6.2f}%")
+    write_and_print(f"  📊 Target Reach Rate:        {guided_success['target_reach_rate']:6.2f}%")
+    write_and_print(f"  📊 Safety Distance Rate:     {guided_success['safety_distance_rate']:6.2f}%")
+    write_and_print(f"  ⭐ OVERALL SUCCESS RATE:     {guided_success['overall_success_rate']:6.2f}%")
     
     # Improvement analysis
-    print("\n" + "-"*60)
-    print("IMPROVEMENT ANALYSIS (Guided vs Unguided)")
-    print("-"*60)
+    write_and_print("\n" + "-"*60)
+    write_and_print("IMPROVEMENT ANALYSIS (Guided vs Unguided)")
+    write_and_print("-"*60)
     
     collision_improvement = (unguided_collision['collision_rate'] - guided_collision['collision_rate']) / max(unguided_collision['collision_rate'], 1e-6) * 100
     error_improvement = (unguided_errors['mean_ae'] - guided_errors['mean_ae']) / max(unguided_errors['mean_ae'], 1e-6) * 100
     success_improvement = guided_success['overall_success_rate'] - unguided_success['overall_success_rate']
     
-    print(f"\n  🚀 Collision Rate Reduction:  {collision_improvement:+.2f}%")
-    print(f"  🚀 Mean AE Reduction:         {error_improvement:+.2f}%")
-    print(f"  🚀 Overall Success Increase:  {success_improvement:+.2f} percentage points")
+    write_and_print(f"\n  🚀 Collision Rate Reduction:  {collision_improvement:+.2f}%")
+    write_and_print(f"  🚀 Mean AE Reduction:         {error_improvement:+.2f}%")
+    write_and_print(f"  🚀 Overall Success Increase:  {success_improvement:+.2f} percentage points")
     
     # Safety summary
-    print("\n" + "-"*60)
-    print("SAFETY & PERFORMANCE SUMMARY")
-    print("-"*60)
+    write_and_print("\n" + "-"*60)
+    write_and_print("SAFETY & PERFORMANCE SUMMARY")
+    write_and_print("-"*60)
     
     if guided_success['overall_success_rate'] >= 80:
         grade = "A (Excellent)"
@@ -2122,28 +2151,48 @@ def print_metrics_with_success_rates(unguided_positions, guided_positions,
     else:
         grade = "D (Poor)"
     
-    print(f"\n  Performance Grade: {grade}")
-    print(f"  CBF Guidance prevents {collision_improvement:.1f}% of collisions")
-    print(f"  Trade-off: {abs(error_improvement):.1f}% change in trajectory error for {collision_improvement:.1f}% safety improvement")
+    write_and_print(f"\n  Performance Grade: {grade}")
+    write_and_print(f"  CBF Guidance prevents {collision_improvement:.1f}% of collisions")
+    write_and_print(f"  Trade-off: {abs(error_improvement):.1f}% change in trajectory error for {collision_improvement:.1f}% safety improvement")
     
     # Print detailed metrics
-    print("\n" + "-"*60)
-    print("DETAILED METRICS")
-    print("-"*60)
+    write_and_print("\n" + "-"*60)
+    write_and_print("DETAILED METRICS")
+    write_and_print("-"*60)
     
-    print(f"\n  Unguided - Mean Max Error: {unguided_success['detailed_metrics']['mean_max_error']:.4f} ± {unguided_success['detailed_metrics']['std_max_error']:.4f}")
-    print(f"  Guided   - Mean Max Error: {guided_success['detailed_metrics']['mean_max_error']:.4f} ± {guided_success['detailed_metrics']['std_max_error']:.4f}")
+    write_and_print(f"\n  Unguided - Mean Max Error: {unguided_success['detailed_metrics']['mean_max_error']:.4f} ± {unguided_success['detailed_metrics']['std_max_error']:.4f}")
+    write_and_print(f"  Guided   - Mean Max Error: {guided_success['detailed_metrics']['mean_max_error']:.4f} ± {guided_success['detailed_metrics']['std_max_error']:.4f}")
     
-    print(f"\n  Unguided - Mean Final Error: {unguided_success['detailed_metrics']['mean_final_error']:.4f} ± {unguided_success['detailed_metrics']['std_final_error']:.4f}")
-    print(f"  Guided   - Mean Final Error: {guided_success['detailed_metrics']['mean_final_error']:.4f} ± {guided_success['detailed_metrics']['std_final_error']:.4f}")
+    write_and_print(f"\n  Unguided - Mean Final Error: {unguided_success['detailed_metrics']['mean_final_error']:.4f} ± {unguided_success['detailed_metrics']['std_final_error']:.4f}")
+    write_and_print(f"  Guided   - Mean Final Error: {guided_success['detailed_metrics']['mean_final_error']:.4f} ± {guided_success['detailed_metrics']['std_final_error']:.4f}")
     
-    print(f"\n  Unguided - Mean Target Distance: {unguided_success['detailed_metrics']['mean_target_distance']:.4f}")
-    print(f"  Guided   - Mean Target Distance: {guided_success['detailed_metrics']['mean_target_distance']:.4f}")
+    write_and_print(f"\n  Unguided - Mean Target Distance: {unguided_success['detailed_metrics']['mean_target_distance']:.4f}")
+    write_and_print(f"  Guided   - Mean Target Distance: {guided_success['detailed_metrics']['mean_target_distance']:.4f}")
     
-    print(f"\n  Unguided - Mean Min Surface Dist: {unguided_success['detailed_metrics']['mean_min_surface_dist']:.4f}")
-    print(f"  Guided   - Mean Min Surface Dist: {guided_success['detailed_metrics']['mean_min_surface_dist']:.4f}")
+    write_and_print(f"\n  Unguided - Mean Min Surface Dist: {unguided_success['detailed_metrics']['mean_min_surface_dist']:.4f}")
+    write_and_print(f"  Guided   - Mean Min Surface Dist: {guided_success['detailed_metrics']['mean_min_surface_dist']:.4f}")
     
-    print("\n" + "="*80)
+    write_and_print("\n" + "="*80)
+    
+    # Save to file
+    try:
+        # Create Results directory if it doesn't exist
+        import os
+        os.makedirs("Results", exist_ok=True)
+        
+        with open(filename, 'w', encoding='utf-8') as f:
+            f.write('\n'.join(output_lines))
+        print(f"\n✅ Metrics saved to: {filename}")
+    except Exception as e:
+        print(f"\n❌ Error saving file: {e}")
+    
+    return {
+        'unguided_success': unguided_success,
+        'guided_success': guided_success,
+        'unguided_errors': unguided_errors,
+        'guided_errors': guided_errors,
+        'filename': filename
+    }
 
 def compute_trajectory_errors(pred_trajectory, gt_trajectory):
     """Compute trajectory prediction errors."""
@@ -2323,8 +2372,7 @@ def plot_combined_trajectories(combined_cases, show_flag=True):
     
     # Create large figure
     fig = plt.figure(figsize=(18, 18))
-    fig.suptitle('AeroDM Obstacle-Aware Trajectory Generation - 9 Test Cases (CBF-Guided vs Unguided)', 
-                 fontsize=16, fontweight='bold', y=0.98)
+    fig.suptitle('AeroTrajGen Obstacle-Aware Trajectory Generation - 9 Test Cases (CBF-Guided vs Unguided)',  fontsize=16, fontweight='bold', y=0.98)
     
     # Color scheme for different trajectory types
     HISTORY_COLOR = 'magenta'
@@ -2930,7 +2978,7 @@ def plot_test_results(original, sampled_unguided_denorm, sampled_guided_denorm, 
     fig = plt.figure(figsize=(24, 18))
     
     # Main title with style information
-    title_text = f'AeroDM Trajectory Generation Results (Test Sample {step_idx})'
+    title_text = f'AeroTrajGen Trajectory Generation Results (Test Sample {step_idx})'
     if history_style is not None or pred_style is not None:
         title_text += f'\nHistory Style: {history_style_name} | Prediction Style: {pred_style_name}'
     fig.suptitle(title_text, fontsize=16, fontweight='bold', y=0.98)
@@ -2945,14 +2993,14 @@ def plot_test_results(original, sampled_unguided_denorm, sampled_guided_denorm, 
     }
 
     # 1. 3D trajectory plot
-    ax1 = fig.add_subplot(341, projection='3d')
+    ax1 = fig.add_subplot(241, projection='3d')
     plot_3d_trajectory(ax1, original_pos, reconstructed_pos, sampled_pos, history_pos, target_pos, obstacles, STYLES)
     
     # 2-4. 2D Projections
     projections = [
-        (342, 'X-Y Projection', 0, 1, 'X', 'Y'),
-        (343, 'X-Z Projection', 0, 2, 'X', 'Z'), 
-        (344, 'Y-Z Projection', 1, 2, 'Y', 'Z')
+        (242, 'X-Y Projection', 0, 1, 'X', 'Y'),
+        (243, 'X-Z Projection', 0, 2, 'X', 'Z'), 
+        (244, 'Y-Z Projection', 1, 2, 'Y', 'Z')
     ]
     
     for subplot_idx, title, dim1, dim2, xlabel, ylabel in projections:
@@ -2962,9 +3010,9 @@ def plot_test_results(original, sampled_unguided_denorm, sampled_guided_denorm, 
 
     # 5-7. Position over time
     positions = [
-        (345, 'X Position Over Time', 0, 'X Position'),
-        (346, 'Y Position Over Time', 1, 'Y Position'), 
-        (347, 'Z Position Over Time', 2, 'Z Position')
+        (245, 'X Position Over Time', 0, 'X Position'),
+        (246, 'Y Position Over Time', 1, 'Y Position'), 
+        (247, 'Z Position Over Time', 2, 'Z Position')
     ]
     
     for subplot_idx, title, dim, ylabel in positions:
@@ -2973,12 +3021,12 @@ def plot_test_results(original, sampled_unguided_denorm, sampled_guided_denorm, 
                           history_pos, dim, title, ylabel, STYLES)
 
     # 8. Speed comparison
-    ax8 = fig.add_subplot(348)
+    ax8 = fig.add_subplot(248)
     plot_speed_comparison(ax8, time_steps, original_speed, reconstructed_speed, sampled_speed, STYLES)
 
-    # 9. Error analysis
-    ax9 = fig.add_subplot(349)
-    plot_error_analysis(ax9, time_steps, original_pos, reconstructed_pos, sampled_pos)
+    # # 9. Error analysis
+    # ax9 = fig.add_subplot(349)
+    # plot_error_analysis(ax9, time_steps, original_pos, reconstructed_pos, sampled_pos)
     
     # # 10. Style information display
     # ax10 = fig.add_subplot(3, 4, 10)
@@ -3250,9 +3298,9 @@ if __name__ == "__main__":
     print(f"Using AeroDMLoss (obstacle term: {config.use_obstacle_loss})")
     
     # Training parameters
-    num_epochs = 100
-    batch_size = 32
-    _base_num_trajectories = 2000 # Base number of trajectories before augmentation (will be increased by concatenation)
+    num_epochs = config.num_epochs
+    batch_size = config.batch_size
+    _base_num_trajectories = config._base_num_trajectories
     
     print("Generating training data with obstacle-aware transformer...")
     trajectories = generate_aerobatic_trajectories_pvR(
@@ -3260,11 +3308,6 @@ if __name__ == "__main__":
         seq_len=config.seq_len + config.history_len,
         delta_T=config.delta_T
     )
-
-    # trajectories = generate_aerobatic_trajectories_deformation(    
-    #     num_trajectories=num_trajectories, 
-    #     seq_len=config.seq_len + config.history_len
-    # )
 
     # trajectories = generate_circular_end_trajectories(    
     #     num_trajectories=num_trajectories, 
@@ -3459,7 +3502,7 @@ if __name__ == "__main__":
         torch.save(checkpoint, "model/aerodm_v2_test.pth")
 
     # Run the visualization test
-    test_model_performance_cb_eva(model, test_norm, mean, std, num_test_samples=50, show_flag=config.show_flag)
+    test_model_performance_cb_eva(model, test_norm, mean, std, num_test_samples=config.num_test_samples, show_flag=config.show_flag)
 
     # Run the action effect test with detailed plots for each style
-    # test_action_effect(model, test_norm, mean, std, num_test_samples=100, show_flag=config.show_flag)
+    # test_action_effect(model, test_norm, mean, std, num_test_samples=config.num_test_samples, show_flag=config.show_flag)

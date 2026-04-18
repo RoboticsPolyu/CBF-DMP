@@ -10,6 +10,74 @@ import matplotlib.pyplot as plt
 import sys
 import time
 
+def smooth_connection_with_spline(history_segment, future_segment, num_blend=10):
+    """
+    Smoothly connect two trajectory segments using cubic spline interpolation.
+    
+    This method creates a smooth transition by fitting a cubic spline through the
+    overlapping region between history and future segments, ensuring C2 continuity.
+    
+    Args:
+        history_segment: Tensor of shape (history_len, state_dim) - the historical trajectory
+        future_segment: Tensor of shape (seq_len, state_dim) - the future trajectory to connect
+        num_blend: Number of frames to blend on each side of the connection
+    
+    Returns:
+        adjusted_history: History segment with smoothed end portion
+        adjusted_future: Future segment with smoothed beginning portion
+    """
+    from scipy import interpolate
+    
+    history_len = history_segment.shape[0]
+    seq_len = future_segment.shape[0]
+    
+    # Extract the last 'num_blend' points from history and first 'num_blend' points from future
+    # These form the overlapping region that will be interpolated
+    hist_blend = history_segment[-num_blend:, 1:4].cpu().numpy()  # (num_blend, 3)
+    future_blend = future_segment[:num_blend, 1:4].cpu().numpy()  # (num_blend, 3)
+    
+    # Concatenate all points in the blending region
+    # Order: history end points first, then future start points
+    blend_points = np.vstack([hist_blend, future_blend])  # (2*num_blend, 3)
+    
+    # Create a normalized parameter t from 0 to 1 for the blending region
+    # This parameterizes the curve regardless of the number of points
+    t = np.linspace(0, 1, len(blend_points))
+    
+    # Create cubic spline interpolators for each spatial dimension (X, Y, Z)
+    # CubicSpline provides C2 continuity (continuous position, velocity, and acceleration)
+    t_new = np.linspace(0, 1, len(blend_points))  # Same parameterization for evaluation
+    spline_x = interpolate.CubicSpline(t, blend_points[:, 0])
+    spline_y = interpolate.CubicSpline(t, blend_points[:, 1])
+    spline_z = interpolate.CubicSpline(t, blend_points[:, 2])
+    
+    # Generate smoothly interpolated points along the spline
+    smooth_points = np.column_stack([
+        spline_x(t_new),
+        spline_y(t_new),
+        spline_z(t_new)
+    ])  # (2*num_blend, 3)
+    
+    # Clone original tensors to avoid in-place modifications
+    adjusted_history = history_segment.clone()
+    adjusted_future = future_segment.clone()
+    
+    # Update the blending region in both segments
+    # The first half of smooth_points corresponds to the history end
+    # The second half corresponds to the future start
+    for i in range(num_blend):
+        # Update history segment end portion (working backwards from the connection point)
+        adjusted_history[history_len - num_blend + i, 1:4] = torch.tensor(smooth_points[i])
+        
+        # Update future segment beginning portion (working forwards from the connection point)
+        # Use symmetric indexing: smooth_points[-(num_blend - i)] maps to future positions
+        adjusted_future[i, 1:4] = torch.tensor(smooth_points[-(num_blend - i)])
+    
+    # Update speed component based on new positions
+    adjusted_history = update_speed_from_positions(adjusted_history)
+    adjusted_future = update_speed_from_positions(adjusted_future)
+    
+    return adjusted_history, adjusted_future
 
 def apply_smooth_connection(history_segment, future_segment, smooth_window=5):
     """
@@ -170,10 +238,16 @@ def random_concatenate_trajectories_smooth(trajectories, history_len, seq_len,
         future_segment[:, 1:4] = future_segment[:, 1:4] + translation.unsqueeze(0)
         
         # Apply smooth blending at the connection
-        history_segment, future_segment = apply_smooth_connection(
-            history_segment, future_segment, smooth_window
-        )
+        # history_segment, future_segment = apply_smooth_connection(
+        #     history_segment, future_segment, smooth_window
+        # )
         
+        history_segment, future_segment = smooth_connection_with_spline(
+            history_segment, 
+            future_segment, 
+            num_blend=8  # Blend over 8 frames (0.8 seconds at 10Hz)
+        )
+
         # Concatenate along time dimension
         new_trajectory = torch.cat([history_segment, future_segment], dim=0)  # (total_len, state_dim)
         
@@ -277,7 +351,6 @@ def validate_connection_continuity(concatenated_trajectories, history_len):
         print(f"  ✓ Position continuity is good")
     else:
         print(f"  ⚠ Position continuity may need improvement")
-
 
 def generate_single_style_trajectory(style, seq_len=60, height=10.0, radius=5.0):
     """Generate trajectory data for a single style"""
@@ -693,668 +766,6 @@ def generate_aerobatic_trajectories_pvR(num_trajectories, seq_len, height=10.0, 
         
     return torch.tensor(np.stack(trajectories), dtype=torch.float32)
 
-
-# Trajectory deformation module
-class TrajectoryDeformer:
-    """
-    Trajectory deformer for applying physically-inspired deformations and stretching
-    to trajectory points while maintaining start and end constraints
-    """
-    
-    def __init__(self, deformation_strength=0.3, modes=None):
-        """
-        Initialize trajectory deformer
-        
-        Args:
-            deformation_strength: Deformation strength (0.0-1.0)
-            modes: Deformation mode list, options: ['stretch', 'twist', 'wave', 'bend', 'random']
-        """
-        self.deformation_strength = deformation_strength
-        if modes is None:
-            self.modes = ['stretch', 'twist', 'wave', 'bend', 'random']
-        else:
-            self.modes = modes
-    
-    def apply_deformation(self, trajectory_points, fix_start=True, fix_end=True, intensity_scale=1.0):
-        """
-        Apply deformation to trajectory points with intensity control
-        
-        Args:
-            trajectory_points: (N, 3) trajectory points array
-            fix_start: Whether to fix start point
-            fix_end: Whether to fix end point
-            intensity_scale: Intensity scaling factor (0.0-2.0) to control deformation degree
-            
-        Returns:
-            deformed_points: Deformed trajectory points
-        """
-        if len(trajectory_points) < 3:
-            return trajectory_points.copy()
-        
-        points = trajectory_points.copy()
-        N = len(points)
-        
-        # Apply randomly selected deformation mode
-        mode = np.random.choice(self.modes)
-        
-        # Scale the deformation strength based on intensity parameter
-        effective_strength = self.deformation_strength * intensity_scale
-        
-        if mode == 'stretch':
-            points = self._apply_stretch(points, fix_start, fix_end, effective_strength)
-        elif mode == 'twist':
-            points = self._apply_twist(points, fix_start, fix_end, effective_strength)
-        elif mode == 'wave':
-            points = self._apply_wave(points, fix_start, fix_end, effective_strength)
-        elif mode == 'bend':
-            points = self._apply_bend(points, fix_start, fix_end, effective_strength)
-        elif mode == 'random':
-            points = self._apply_random(points, fix_start, fix_end, effective_strength)
-        
-        # Ensure start and end point constraints
-        if fix_start:
-            points[0] = trajectory_points[0]
-        if fix_end:
-            points[-1] = trajectory_points[-1]
-        
-        # Apply intensity scaling to the smoothing process
-        smoothing_intensity = min(1.0, intensity_scale)
-        points = self._smooth_deformation(points, trajectory_points, smoothing_intensity)
-        
-        return points
-    
-    def apply_deformation_with_random_intensity(self, trajectory_points, fix_start=True, fix_end=True, 
-                                                intensity_range=(0.0, 2.0), distribution='uniform'):
-        """
-        Apply deformation with randomly generated intensity
-        
-        Args:
-            trajectory_points: (N, 3) trajectory points array
-            fix_start: Whether to fix start point
-            fix_end: Whether to fix end point
-            intensity_range: Tuple (min_intensity, max_intensity) for random generation
-            distribution: Random distribution type - 'uniform', 'normal', 'beta', or 'mixed'
-            
-        Returns:
-            deformed_points: Deformed trajectory points
-            intensity: Generated intensity value
-        """
-        # Generate random intensity based on specified distribution
-        min_intensity, max_intensity = intensity_range
-        
-        if distribution == 'uniform':
-            # Uniform distribution between min and max
-            intensity = np.random.uniform(min_intensity, max_intensity)
-            
-        elif distribution == 'normal':
-            # Normal distribution centered around midpoint
-            midpoint = (min_intensity + max_intensity) / 2
-            scale = (max_intensity - min_intensity) / 4  # 4σ covers most of range
-            intensity = np.random.normal(midpoint, scale)
-            # Clip to range
-            intensity = np.clip(intensity, min_intensity, max_intensity)
-            
-        elif distribution == 'beta':
-            # Beta distribution for more control over shape
-            alpha, beta = 2.0, 2.0  # Symmetric bell shape
-            # Beta distribution is on [0,1], scale to our range
-            beta_sample = np.random.beta(alpha, beta)
-            intensity = min_intensity + beta_sample * (max_intensity - min_intensity)
-            
-        elif distribution == 'mixed':
-            # Mixture of distributions for more diversity
-            rand_choice = np.random.rand()
-            if rand_choice < 0.4:  # 40% low intensity
-                intensity = np.random.uniform(min_intensity, min_intensity + 0.3*(max_intensity - min_intensity))
-            elif rand_choice < 0.8:  # 40% medium intensity
-                intensity = np.random.uniform(min_intensity + 0.3*(max_intensity - min_intensity), 
-                                             min_intensity + 0.7*(max_intensity - min_intensity))
-            else:  # 20% high intensity
-                intensity = np.random.uniform(min_intensity + 0.7*(max_intensity - min_intensity), max_intensity)
-        
-        else:
-            # Default to uniform
-            intensity = np.random.uniform(min_intensity, max_intensity)
-        
-        # Apply deformation with the generated intensity
-        deformed_points = self.apply_deformation(
-            trajectory_points, 
-            fix_start=fix_start, 
-            fix_end=fix_end, 
-            intensity_scale=intensity
-        )
-        
-        return deformed_points, intensity
-    
-    def _apply_stretch(self, points, fix_start, fix_end, strength):
-        """Stretch deformation: Stretch or compress along trajectory direction"""
-        N = len(points)
-        stretch_strength = np.random.uniform(0.5, 1.5) * strength
-        
-        # Calculate main trajectory direction
-        if fix_start and fix_end:
-            start_to_end = points[-1] - points[0]
-            # Add small epsilon to avoid division by zero
-            norm_val = np.linalg.norm(start_to_end)
-            if norm_val < 1e-8:
-                return points
-            main_direction = start_to_end / norm_val
-            
-            # Apply non-uniform stretching along main direction
-            t = np.linspace(0, 1, N)
-            stretch_factor = 1.0 + stretch_strength * np.sin(2 * np.pi * t)
-            
-            # Apply stretching
-            for i in range(N):
-                if i == 0 and fix_start:
-                    continue
-                if i == N-1 and fix_end:
-                    continue
-                # Offset relative to start point
-                offset = points[i] - points[0]
-                # Rescale offset
-                offset_scaled = offset * stretch_factor[i]
-                points[i] = points[0] + offset_scaled
-        
-        return points
-    
-    def _apply_twist(self, points, fix_start, fix_end, strength):
-        """Twist deformation: Create spiral twisting of trajectory"""
-        N = len(points)
-        twist_strength = np.random.uniform(0.5, 2.0) * strength
-        
-        # Calculate center line (straight line from start to end)
-        if fix_start and fix_end:
-            center_line = np.linspace(points[0], points[-1], N)
-            
-            # Calculate offset of each point relative to center line
-            offsets = points - center_line
-            
-            # Apply rotational twisting
-            t = np.linspace(0, 1, N)
-            twist_angle = twist_strength * 2 * np.pi * t
-            
-            for i in range(N):
-                if i == 0 and fix_start:
-                    continue
-                if i == N-1 and fix_end:
-                    continue
-                
-                # Rotate offset vector
-                cos_a = np.cos(twist_angle[i])
-                sin_a = np.sin(twist_angle[i])
-                
-                # 2D rotation matrix (in plane perpendicular to forward direction)
-                R = np.array([
-                    [cos_a, -sin_a, 0],
-                    [sin_a, cos_a, 0],
-                    [0, 0, 1]
-                ])
-                
-                offsets[i] = R @ offsets[i]
-            
-            # Reconstruct points
-            points = center_line + offsets
-        
-        return points
-    
-    def _apply_wave(self, points, fix_start, fix_end, strength):
-        """Wave deformation: Add sinusoidal perturbations"""
-        N = len(points)
-        wave_strength = strength
-        
-        # Superposition of waves with different frequencies and directions
-        num_waves = np.random.randint(2, 5)
-        
-        for wave_idx in range(num_waves):
-            # Random wave parameters
-            amplitude = np.random.uniform(0.1, 0.5) * wave_strength
-            frequency = np.random.uniform(1.0, 5.0)
-            phase = np.random.uniform(0, 2 * np.pi)
-            
-            # Random wave direction
-            wave_direction = np.random.randn(3)
-            norm_val = np.linalg.norm(wave_direction)
-            if norm_val < 1e-8:
-                continue
-            wave_direction = wave_direction / norm_val
-            
-            # Apply wave
-            t = np.linspace(0, 1, N)
-            wave_value = amplitude * np.sin(2 * np.pi * frequency * t + phase)
-            
-            for i in range(N):
-                if (i == 0 and fix_start) or (i == N-1 and fix_end):
-                    continue
-                
-                points[i] += wave_value[i] * wave_direction
-        
-        return points
-    
-    def _apply_bend(self, points, fix_start, fix_end, strength):
-        """Bend deformation: Overall bending of trajectory"""
-        N = len(points)
-        bend_strength = np.random.uniform(0.5, 2.0) * strength
-        
-        if fix_start and fix_end:
-            # Calculate center point of trajectory
-            center = np.mean(points, axis=0)
-            
-            # Calculate direction from center to each point
-            directions = points - center
-            
-            # Bend transformation: rotate on a plane
-            bend_axis = np.random.randn(3)
-            norm_val = np.linalg.norm(bend_axis)
-            if norm_val < 1e-8:
-                return points
-            bend_axis = bend_axis / norm_val
-            
-            # Calculate rotation angle based on distance from start point
-            distances_from_start = np.linalg.norm(points - points[0], axis=1)
-            # Fix: Ensure total_distance is never zero
-            total_distance = max(distances_from_start[-1], 1e-8) if N > 0 else 1.0
-            normalized_distances = distances_from_start / total_distance
-            
-            for i in range(N):
-                if i == 0 and fix_start:
-                    continue
-                if i == N-1 and fix_end:
-                    continue
-                
-                # Rotation angle proportional to distance
-                angle = bend_strength * normalized_distances[i]
-                
-                # Check for NaN or infinite values
-                if np.isnan(angle) or np.isinf(angle):
-                    continue
-                
-                # Rodrigues rotation formula
-                k = bend_axis
-                v = directions[i]
-                
-                cos_a = np.cos(angle)
-                sin_a = np.sin(angle)
-                
-                # Check for invalid trigonometric values
-                if np.isnan(cos_a) or np.isnan(sin_a):
-                    continue
-                
-                # Rotated vector
-                v_rot = v * cos_a + np.cross(k, v) * sin_a + k * np.dot(k, v) * (1 - cos_a)
-                
-                points[i] = center + v_rot
-        
-        return points
-    
-    def _apply_random(self, points, fix_start, fix_end, strength):
-        """Random deformation: Combine multiple small deformations"""
-        N = len(points)
-        
-        # Randomly apply multiple small deformations
-        num_deformations = np.random.randint(2, 4)
-        
-        for _ in range(num_deformations):
-            # Randomly select small region for deformation
-            if N > 10:
-                start_idx = np.random.randint(0, N-5)
-                end_idx = np.random.randint(start_idx+2, min(start_idx+10, N))
-                
-                # Apply local deformation to selected region
-                sub_points = points[start_idx:end_idx].copy()
-                
-                # Small random offsets - scaled by strength
-                sub_strength = np.random.uniform(0.1, 0.3) * strength
-                random_offset = np.random.randn(len(sub_points), 3) * sub_strength
-                
-                # Keep start and end of local region unchanged
-                if start_idx == 0 and fix_start:
-                    random_offset[0] = 0
-                if end_idx == N-1 and fix_end:
-                    random_offset[-1] = 0
-                
-                points[start_idx:end_idx] += random_offset
-        
-        return points
-    
-    def _smooth_deformation(self, deformed_points, original_points, intensity_scale=1.0):
-        """
-        Smooth deformation to avoid abrupt changes
-        
-        Args:
-            deformed_points: Deformed points
-            original_points: Original points
-            intensity_scale: Intensity scaling factor (0.0-1.0) for smoothing
-            
-        Returns:
-            smoothed_points: Smoothed deformed points
-        """
-        N = len(deformed_points)
-        if N < 3:
-            return deformed_points
-        
-        # Use simple Gaussian filter for smoothing
-        smoothed = deformed_points.copy()
-        kernel_size = min(5, N)
-        
-        # Boundary handling
-        for i in range(N):
-            if i == 0 or i == N-1:
-                continue
-            
-            # Get neighbor points
-            start = max(0, i - kernel_size // 2)
-            end = min(N, i + kernel_size // 2 + 1)
-            
-            # Weighted average, higher weight for center point
-            weights = np.exp(-0.5 * ((np.arange(start, end) - i) ** 2))
-            weights = weights / weights.sum()
-            
-            smoothed[i] = np.average(deformed_points[start:end], axis=0, weights=weights)
-        
-        # Adjust smoothing based on intensity
-        # Higher intensity = less smoothing (more deformation preserved)
-        # Lower intensity = more smoothing (closer to original)
-        alpha = 0.7 * (1.0 - 0.3 * (1.0 - intensity_scale))  # Adaptive smoothing coefficient
-        
-        return alpha * smoothed + (1 - alpha) * original_points
-
-# Enhanced trajectory generation function with random intensity
-def generate_aerobatic_trajectories_deformation(num_trajectories, seq_len, height=10.0, radius=5.0, 
-                                                           enable_deformation=True, deformation_strength=0.2,
-                                                           intensity_range=(0.0, 2.0), distribution='uniform'):
-    """
-    Generate synthetic aerobatic trajectories with random intensity deformation
-    
-    Args:
-        num_trajectories: Number of trajectories
-        seq_len: Sequence length
-        height: Base height
-        radius: Base radius
-        enable_deformation: Whether to enable deformation
-        deformation_strength: Base deformation strength
-        intensity_range: Tuple (min_intensity, max_intensity) for random generation
-        distribution: Random distribution type - 'uniform', 'normal', 'beta', or 'mixed'
-        
-    Returns:
-        trajectories: Trajectory tensor
-        intensities: List of intensity values used for each trajectory
-    """
-    trajectories = []
-    intensities = []
-    
-    maneuver_styles = ['power_loop', 'barrel_roll', 'split_s', 'immelmann', 'wall_ride', 
-                      'eight_figure', 'star', 'half_moon', 'sphinx', 'clover', 
-                      'spiral_inward', 'spiral_outward', 'spiral_vertical_up', 'spiral_vertical_down']
-    
-    # Initialize deformer
-    deformer = TrajectoryDeformer(deformation_strength=deformation_strength) if enable_deformation else None
-    
-    for i in range(num_trajectories):
-        # Randomly select maneuver style
-        style = np.random.choice(maneuver_styles)
-        
-        style_to_index = {
-            'power_loop': 0, 'barrel_roll': 1, 'split_s': 2, 'immelmann': 3,
-            'wall_roll': 4, 'wall_ride': 4, 'eight_figure': 5, 'star': 6,
-            'half_moon': 7, 'sphinx': 8, 'clover': 9, 'spiral_inward': 10,
-            'spiral_outward': 11, 'spiral_vertical_up': 12, 'spiral_vertical_down': 13
-        }
-        
-        style_idx = style_to_index.get(style, 0)
-        
-        # Random centers and scales
-        center_x = np.random.uniform(-20, 20)
-        center_y = np.random.uniform(-20, 20)
-        center_z = height + np.random.uniform(-10, 10)
-        current_radius = radius * np.random.uniform(0.8, 1.2)
-        
-        # Generate base trajectory
-        base_trajectory = generate_single_style_trajectory(style, seq_len, center_z, current_radius)
-        
-        # Apply random translation
-        x = base_trajectory[:, 0] + center_x
-        y = base_trajectory[:, 1] + center_y
-        z = base_trajectory[:, 2]
-        
-        # Apply deformation with random intensity (if needed)
-        intensity = 0.0
-        if enable_deformation and deformer is not None and seq_len > 10:
-            # Combine points into (N, 3) format
-            points = np.column_stack([x, y, z])
-            
-            # Apply deformation with random intensity
-            deformed_points, intensity = deformer.apply_deformation_with_random_intensity(
-                points, 
-                fix_start=True, 
-                fix_end=True,
-                intensity_range=intensity_range,
-                distribution=distribution
-            )
-            
-            # Update coordinates
-            x = deformed_points[:, 0]
-            y = deformed_points[:, 1]
-            z = deformed_points[:, 2]
-        
-        intensities.append(intensity)
-        
-        # Calculate velocity and direction
-        dt = 0.10  # 0.1 second
-        vx = np.gradient(x, dt)
-        vy = np.gradient(y, dt)
-        vz = np.gradient(z, dt)
-        
-        # Calculate speed and direction
-        speed = np.sqrt(vx**2 + vy**2 + vz**2)
-        direction = np.stack([vx, vy, vz], axis=-1)
-        norms = np.linalg.norm(direction, axis=-1, keepdims=True)
-        direction = np.divide(direction, norms, where=norms>0, out=np.zeros_like(direction))
-        
-        # Attitude: direction + fixed components
-        attitude = np.concatenate([direction, np.full((seq_len, 3), 0.1)], axis=-1)
-        
-        # Full state: [speed, x, y, z, attitude(6), style_index]
-        state = np.column_stack([speed, x, y, z, attitude, np.full(seq_len, style_idx)])
-        trajectories.append(state)
-    
-    return torch.tensor(np.stack(trajectories), dtype=torch.float32) #, intensities
-
-# Visualization function for random intensity deformations
-def visualize_random_intensity_deformations():
-    """Visualize trajectory deformations with random intensity levels"""
-    print("Generating random intensity deformation examples...")
-    
-    styles = ['power_loop', 'barrel_roll', 'split_s', 'immelmann']
-    
-    # Generate base trajectories for each style
-    base_trajectories = {}
-    for style in styles:
-        base_traj = generate_single_style_trajectory(style, seq_len=60, height=10.0, radius=5.0)
-        base_trajectories[style] = base_traj
-    
-    # Create deformer
-    deformer = TrajectoryDeformer(deformation_strength=0.3)
-    
-    # Generate 4 random intensities for each style
-    np.random.seed(42)  # For reproducibility
-    
-    # Visualization
-    fig = plt.figure(figsize=(20, 12))
-    fig.suptitle('Trajectory Deformations with Random Intensity Levels', fontsize=16, fontweight='bold')
-    
-    # Create subplots: rows = styles, columns = random examples
-    num_examples = 5  # Original + 4 random deformations
-    
-    for row_idx, style in enumerate(styles):
-        base_traj = base_trajectories[style]
-        
-        for col_idx in range(num_examples):
-            ax = fig.add_subplot(len(styles), num_examples, 
-                                 row_idx * num_examples + col_idx + 1, 
-                                 projection='3d')
-            
-            if col_idx == 0:
-                # First column: original trajectory
-                points = base_traj
-                intensity = 0.0
-                color = 'b'
-                linestyle = '-'
-                label = 'Original'
-            else:
-                # Random deformations
-                # Generate random intensity using mixed distribution for diversity
-                deformed_points, intensity = deformer.apply_deformation_with_random_intensity(
-                    base_traj, 
-                    fix_start=True, 
-                    fix_end=True,
-                    intensity_range=(0.0, 2.0),
-                    distribution='mixed'
-                )
-                points = deformed_points
-                color = 'r'
-                linestyle = '-'
-                label = 'Deformed'
-            
-            # Plot trajectory
-            ax.plot(points[:, 0], points[:, 1], points[:, 2], 
-                   color=color, linewidth=2, alpha=0.8, label=label)
-            
-            # Plot original as reference for deformed trajectories
-            if col_idx > 0:
-                ax.plot(base_traj[:, 0], base_traj[:, 1], base_traj[:, 2], 
-                       'b--', linewidth=1, alpha=0.3, label='Original')
-            
-            # Mark start and end points
-            ax.scatter(points[0, 0], points[0, 1], points[0, 2], 
-                      c='green', s=80, marker='o', label='Start' if col_idx == 0 else '')
-            ax.scatter(points[-1, 0], points[-1, 1], points[-1, 2], 
-                      c='red', s=80, marker='s', label='End' if col_idx == 0 else '')
-            
-            # Calculate deformation distance for statistics
-            if col_idx > 0:
-                deformation_dist = np.mean(np.linalg.norm(points - base_traj, axis=1))
-            else:
-                deformation_dist = 0.0
-            
-            # Set title with intensity and statistics
-            if col_idx == 0:
-                title = f'{style[:10]}...\nOriginal'
-            else:
-                title = f'{style[:10]}...\nIntensity: {intensity:.2f}\nAvg Δ: {deformation_dist:.3f}'
-            ax.set_title(title, fontsize=9)
-            
-            ax.set_xlabel('X')
-            ax.set_ylabel('Y')
-            ax.set_zlabel('Z')
-            ax.grid(True, alpha=0.3)
-            
-            # Only show legend for first subplot
-            if row_idx == 0 and col_idx == 0:
-                ax.legend(fontsize=7)
-    
-    plt.tight_layout()
-    plt.show()
-    
-    # Generate and display intensity statistics
-    print("\n=== Random Intensity Statistics ===")
-    all_intensities = []
-    
-    for style in styles:
-        base_traj = base_trajectories[style]
-        style_intensities = []
-        
-        # Generate 100 random intensities for statistics
-        for _ in range(100):
-            _, intensity = deformer.apply_deformation_with_random_intensity(
-                base_traj, 
-                fix_start=True, 
-                fix_end=True,
-                intensity_range=(0.0, 2.0),
-                distribution='mixed'
-            )
-            style_intensities.append(intensity)
-        
-        all_intensities.extend(style_intensities)
-        
-        print(f"\n{style}:")
-        print(f"  Min intensity: {np.min(style_intensities):.3f}")
-        print(f"  Max intensity: {np.max(style_intensities):.3f}")
-        print(f"  Mean intensity: {np.mean(style_intensities):.3f}")
-        print(f"  Std intensity: {np.std(style_intensities):.3f}")
-    
-    # Overall statistics
-    print(f"\nOverall statistics (all styles):")
-    print(f"  Min intensity: {np.min(all_intensities):.3f}")
-    print(f"  Max intensity: {np.max(all_intensities):.3f}")
-    print(f"  Mean intensity: {np.mean(all_intensities):.3f}")
-    print(f"  Std intensity: {np.std(all_intensities):.3f}")
-    
-    # Plot intensity distribution
-    fig2, ax2 = plt.subplots(figsize=(10, 6))
-    ax2.hist(all_intensities, bins=20, alpha=0.7, color='skyblue', edgecolor='black')
-    ax2.axvline(np.mean(all_intensities), color='red', linestyle='--', 
-                label=f'Mean: {np.mean(all_intensities):.3f}')
-    ax2.set_xlabel('Intensity')
-    ax2.set_ylabel('Frequency')
-    ax2.set_title('Distribution of Randomly Generated Intensities')
-    ax2.legend()
-    ax2.grid(True, alpha=0.3)
-    plt.tight_layout()
-    plt.show()
-
-# Test function for random intensity
-def test_random_intensity_generation():
-    """Test random intensity generation functionality"""
-    print("\n=== Testing Random Intensity Generation ===")
-    
-    # Generate a simple trajectory
-    base_traj = generate_single_style_trajectory('power_loop', seq_len=40, height=10.0, radius=5.0)
-    
-    # Create deformer
-    deformer = TrajectoryDeformer(deformation_strength=0.25)
-    
-    # Test different distributions
-    distributions = ['uniform', 'normal', 'beta', 'mixed']
-    
-    results = {}
-    for dist in distributions:
-        print(f"\nTesting '{dist}' distribution:")
-        dist_intensities = []
-        dist_deformations = []
-        
-        # Generate 50 samples
-        for _ in range(50):
-            deformed_traj, intensity = deformer.apply_deformation_with_random_intensity(
-                base_traj, 
-                fix_start=True, 
-                fix_end=True,
-                intensity_range=(0.0, 2.0),
-                distribution=dist
-            )
-            
-            # Calculate deformation
-            deformation = np.mean(np.linalg.norm(deformed_traj - base_traj, axis=1))
-            
-            dist_intensities.append(intensity)
-            dist_deformations.append(deformation)
-        
-        # Calculate statistics
-        results[dist] = {
-            'intensities': dist_intensities,
-            'deformations': dist_deformations,
-            'mean_intensity': np.mean(dist_intensities),
-            'std_intensity': np.std(dist_intensities),
-            'mean_deformation': np.mean(dist_deformations),
-            'std_deformation': np.std(dist_deformations)
-        }
-        
-        print(f"  Intensity - Mean: {results[dist]['mean_intensity']:.3f}, Std: {results[dist]['std_intensity']:.3f}")
-        print(f"  Deformation - Mean: {results[dist]['mean_deformation']:.3f}, Std: {results[dist]['std_deformation']:.3f}")
-    
-    return results
-
-
 if __name__ == "__main__":
     # Run the random intensity visualization
-    visualize_random_intensity_deformations()
+    generate_aerobatic_trajectories_pvR(num_trajectories=5, seq_len=100)
