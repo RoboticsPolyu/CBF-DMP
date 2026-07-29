@@ -357,7 +357,7 @@ class ExponentialBarrierSafety:
         # Remove unused subplot
         axes[1, 2].remove()
         
-        plt.suptitle('Comparison of Exponential Barrier Function Formulations', 
+        plt.suptitle('expBarrierFunc/Comparison of Exponential Barrier Function Formulations', 
                     fontsize=14, fontweight='bold')
         plt.tight_layout()
         plt.show()
@@ -456,7 +456,7 @@ class ExponentialBarrierSafety:
         plt.ylim(-0.05, 1.05)
         
         plt.tight_layout()
-        plt.savefig('expBarrier_vs_NormalCDF_Comparison.pdf', dpi=300)
+        plt.savefig('expBarrierFunc/expBarrier_vs_NormalCDF_Comparison.pdf', dpi=300)
         plt.show()
         
         # Analyze properties
@@ -509,19 +509,16 @@ if __name__ == "__main__":
         obstacles=obstacles,
         robot_radius=0.2,
         epsilon=0.01,
-        scale_factor=2.0,  # 调整概率衰减速度
-        gamma=2.0          # 对于type 2的指数
+        scale_factor=2.0,  
+        gamma=2.0          
     )
-    
-    # 1. 可视化不同障碍函数的比较
+
     print("\n1. Visualizing different barrier function formulations...")
-    X, Y, P1, P2, P3, B1 = exp_safety.visualize_comparison()
+    # X, Y, P1, P2, P3, B1 = exp_safety.visualize_comparison()
     
-    # 2. 与正态CDF方法比较
     print("\n2. Comparing with Normal CDF approach...")
     distances, exp_probs, cdf_probs, hybrid_probs = exp_safety.compare_with_normal_cdf()
     
-    # 3. 测试特定点
     print("\n3. Testing specific positions:")
     print("-"*50)
     
@@ -533,15 +530,12 @@ if __name__ == "__main__":
     ]
     
     for desc, pos in test_positions:
-        # 计算距离
         dist = np.linalg.norm(pos)
         
-        # 指数障碍函数
         result_exp = exp_safety.total_safety_probability(
             pos, velocity=[0.5, 0], barrier_type=1
         )
         
-        # 正态CDF（手动计算对比）
         safety_radius = 1.0 + 0.2
         h_val = dist**2 - safety_radius**2
         sigma = 0.3
@@ -556,11 +550,9 @@ if __name__ == "__main__":
             barrier_val = result_exp['individual_results'][0]['barrier_value']
             print(f"  Barrier value b(x) = {barrier_val:.4f}")
     
-    # 4. 数值特性分析
     print("\n4. Numerical properties analysis:")
     print("-"*50)
     
-    # 测试极值情况
     extreme_positions = [
         ("Very close to center", [0.01, 0]),
         ("Very far", [100, 0])
@@ -577,15 +569,12 @@ if __name__ == "__main__":
         if p < 1e-100:
             print(f"  → Effectively 0 (underflow protection needed)")
     
-    # 5. 梯度计算示例（用于优化）
     print("\n5. Gradient calculation for optimization:")
     print("-"*50)
     
-    # 在(2,0)点计算梯度的数值近似
     test_point = np.array([2.0, 0.0])
     epsilon_grad = 1e-6
     
-    # 中心差分计算梯度
     grad_numerical = np.zeros(2)
     for i in range(2):
         # f(x + ε)
@@ -600,7 +589,6 @@ if __name__ == "__main__":
         result_minus = exp_safety.total_safety_probability(point_minus, barrier_type=1)
         f_minus = result_minus['total_probability']
         
-        # 中心差分
         grad_numerical[i] = (f_plus - f_minus) / (2 * epsilon_grad)
     
     print(f"At position {test_point}:")

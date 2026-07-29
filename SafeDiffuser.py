@@ -8,6 +8,8 @@ from mpl_toolkits.mplot3d import Axes3D
 import time
 from torch.utils.data import Dataset, DataLoader
 
+#　Xiao, W., et al. (2023) SafeDiffuser: Safe Planning with Diffusion Probabilistic Models. arXiv:2306.00148 DOI: 10.48550/arXiv.2306.00148
+
 class TrajectoryDataset(Dataset):
     """Trajectory dataset for training"""
     def __init__(self, num_samples=1000, trajectory_len=30, state_dim=6):

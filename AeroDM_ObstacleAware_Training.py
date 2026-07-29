@@ -26,7 +26,7 @@ class Config:
     # Training parameters
     num_epochs = 100
     batch_size = 32
-    _base_num_trajectories = 10000 # Base number of trajectories before augmentation (will be increased by concatenation)
+    _base_num_trajectories = 20000 # Base number of trajectories before augmentation (will be increased by concatenation)
     num_test_samples = 100
 
     # Model dimensions
@@ -1142,7 +1142,7 @@ class AeroDMLoss(nn.Module):
         Computes total loss and components.
         Always returns (total_loss, position_loss, vel_loss, obstacle_loss, continuity_loss).
         - position_loss: Weighted MSE on positions (Z higher, last point x10).
-        - vel_loss: MSE on velocity diffs (from position deltas, Z weighted).
+        - vel_loss: MSE on velocity diffs. 
         - obstacle_loss: 0 if disabled/no obs.
         - total: 2.0*position + 1.5*vel + other (speed + attitude) + obstacle_weight*obstacle.
         Handles seq_len <=1 for vel (returns 0).
@@ -1172,7 +1172,6 @@ class AeroDMLoss(nn.Module):
         last_z_loss = self.xyz_weight * self.mse_loss(pred_pos[:, -1, 2], gt_pos[:, -1, 2])
         
         last_xyz_loss = last_x_loss + last_y_loss + last_z_loss
-        # Combine: Base + 10x last point
         position_loss = x_loss + y_loss + z_loss
         
         if seq_len > 1:
@@ -1210,12 +1209,6 @@ class AeroDMLoss(nn.Module):
             last_history_pos = history[:, -1, 1:4]
             first_pred_pos = pred_trajectory[:, 0, 1:4]
             continuity_loss = self.mse_loss(first_pred_pos, last_history_pos)
-            
-            # Optional: Add velocity continuity (delta from last history to first pred)
-            # if history.size(1) > 1:
-            #     last_history_vel = history[:, -1, 1:4] - history[:, -2, 1:4]
-            #     first_pred_vel = pred_trajectory[:, 0, 1:4] - last_history_pos # Approx
-            #     continuity_loss += self.mse_loss(first_pred_vel, last_history_vel)
         
         # Total weighted loss
         total_loss = self.last_xyz_weight * last_xyz_loss + self.xyz_weight * position_loss + self.vel_weight * vel_loss + self.other_weight * other_loss + self.obstacle_weight * obstacle_loss + self.continuity_weight * continuity_loss + self.acc_weight * acc_smoothness
@@ -2985,11 +2978,11 @@ def plot_test_results(original, sampled_unguided_denorm, sampled_guided_denorm, 
     
     # Define consistent styling
     STYLES = {
-        'history': {'color': 'magenta', 'linewidth': 4, 'alpha': 0.8, 'marker': 'o', 'markersize': 4},
-        'original': {'color': 'blue', 'linewidth': 3, 'alpha': 0.9},
-        'reconstructed': {'color': 'red', 'linewidth': 2, 'alpha': 0.8, 'linestyle': '--', 'marker': '.'},
-        'sampled': {'color': 'green', 'linewidth': 2, 'alpha': 0.8, 'linestyle': '-.', 'marker': '.'},
-        'target': {'color': 'yellow', 's': 200, 'marker': '*', 'edgecolors': 'black', 'linewidth': 2}
+        'history': {'color': 'magenta', 'linewidth': 2, 'alpha': 0.8, 'marker': 'o', 'markersize': 3},
+        'original': {'color': 'blue', 'linewidth': 2, 'alpha': 0.9},
+        'reconstructed': {'color': 'red', 'linewidth': 1.5, 'alpha': 0.8, 'linestyle': '--', 'marker': '.'},
+        'sampled': {'color': 'green', 'linewidth': 1, 'alpha': 0.8, 'linestyle': '-.', 'marker': '.'},
+        'target': {'color': 'yellow', 's': 200, 'marker': '*', 'edgecolors': 'black', 'linewidth': 1}
     }
 
     # 1. 3D trajectory plot
