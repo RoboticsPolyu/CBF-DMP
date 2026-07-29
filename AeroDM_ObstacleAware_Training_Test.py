@@ -20,14 +20,13 @@ from Trajectory_Gen import augment_trajectories_with_smooth_concatenation
 from Test.circular_trajectories import generate_circular_end_trajectories
 from Test.distribute_trajectories import generate_distributed_trajectories
 
-
 # Configuration parameters based on the paper
 class Config:
     # Training parameters
     num_epochs = 100
     batch_size = 32
-    _base_num_trajectories = 20000 # Base number of trajectories before augmentation (will be increased by concatenation)
-    num_test_samples = 20
+    _base_num_trajectories = 10000 # Base number of trajectories before augmentation (will be increased by concatenation)
+    num_test_samples = 100
 
     # Model dimensions
     latent_dim = 128
@@ -37,7 +36,8 @@ class Config:
     dropout = 0.1
 
     # Diffusion parameters
-    diffusion_steps = 60
+    diffusion_steps = 60 # Number of diffusion steps for training (e.g., 50-100)
+    inference_diffusion_steps = 60  # Can be set lower for faster inference (e.g., 20-50)
     beta_start = 0.0001
     beta_end = 0.02
     
@@ -60,7 +60,8 @@ class Config:
     # enable_cbf_guidance = True  # Disabled by default; toggle for inference
     guidance_gamma = 4000.0  # Base gamma for barrier guidance
     safe_extra_factor=0.20 # Safety buffer as fraction of radius (e.g., 20%)
-    barrier_sigma = 0.5 # Smoothness parameter for logistic barrier function (tune for best results)
+    barrier_sigma = 0.7 # Smoothness parameter for logistic barrier function (tune for best results: )
+    guidance_scale = 2.0  # Classifier-free guidance scale for sampling (tune for best results)
 
     last_xyz_weight=50.0 # Extra weight for final timestep's position error
     xyz_weight=1.0 # Extra weight for Z-axis (height) in aviation
@@ -73,7 +74,6 @@ class Config:
 
     drop_style_prob = 0.1  # Probability of dropping style information during training for robustness
     drop_target_prob = 0.1  # Probability of dropping target waypoint information during training for robustness    
-    guidance_scale = 2.0  # Classifier-free guidance scale for sampling (tune for best results)
 
     # Plotting control
     show_flag = False  # Set to False to save plots as SVG instead of displaying
@@ -83,8 +83,13 @@ class Config:
     
     # Model save/load paths
     model_save_dir = "model"
-    model_filename = "aerodm_v2_test.pth"  # Base name (timestamp will be added when saving)
+    model_filename = "aerodm_v2_test_20260729_220027_20260730_005041.pth"  # Base name (timestamp will be added when saving)
 
+    # DDIM sampling parameters
+    # DDIM performance is bad
+    use_ddim = False        # Set to True to use DDIM during testing
+    ddim_num_steps = 60    # Number of DDIM steps (20-50 recommended)
+    ddim_eta = 0.0         # 0 = deterministic, 0.5 = balanced, 1 = DDPM-like
 
 # Transformer positional encoding
 class PositionalEncoding(nn.Module):
@@ -767,6 +772,8 @@ class ObstacleAwareDiffusionProcess:
                 # Compute barrier gradient ∇V with multiple obstacles
                 V, grad_V = compute_barrier_and_grad_logistic(pred_x0, mean, std, obstacles_data, safety_margin=config.safe_extra_factor, sigma=config.barrier_sigma)
 
+                # V, grad_V = compute_barrier_and_grad(pred_x0, mean, std, obstacles_data, safety_margin=config.safe_extra_factor);
+
                 barrier_info = {'V': V, 'grad_V': grad_V, 'gamma_t': gamma_t}
                 # print(barrier_info)
                 # Guided score: s_guided = s_theta - γ_t ∇V
@@ -815,6 +822,81 @@ class ObstacleAwareDiffusionProcess:
                 self._plot_diffusion_step(x_t, x_prev, t, step_idx, barrier_info, is_final=False, mean=mean, std=std, obstacles_data=obstacles_data)
                         
             return x_prev
+
+    # ========================================================================
+    # DDIM SAMPLER - Denoising Diffusion Implicit Models
+    # ========================================================================
+
+    def p_sample_ddim(self, model, x_t, t, target=None, action=None, history=None,
+                    enable_guidance=True, guidance_gamma=None, mean=None, std=None,
+                    obstacles_data=None, eta=0.0):
+        """
+        DDIM sampling step - supports faster inference with fewer steps.
+        
+        Args:
+            eta: DDIM parameter (0 = deterministic fastest, 1 = DDPM-like)
+        Returns:
+            x_prev: Sample at previous timestep
+        """
+        batch_size = x_t.size(0)
+        device = x_t.device
+        
+        # Move diffusion parameters to device
+        alphas = self.alphas.to(device)
+        alpha_bars = self.alpha_bars.to(device)
+        
+        # Get timestep index
+        t_idx = t[0].item() if torch.is_tensor(t) and t.numel() > 0 else t
+        
+        # Get current and previous alpha_bar values
+        alpha_bar_t = alpha_bars[t_idx].view(batch_size, 1, 1)
+        alpha_bar_prev = alpha_bars[t_idx - 1].view(batch_size, 1, 1) if t_idx > 0 else torch.ones_like(alpha_bar_t)
+        
+        # Step 1: Predict x_0
+        pred_x0 = model(x_t, t, target, action, history, obstacles_data)
+        
+        # Step 2: Apply CBF guidance (optional)
+        if enable_guidance and guidance_gamma is not None and mean is not None and std is not None:
+            gamma_t = torch.tensor(guidance_gamma * (1.0 - t_idx / self.config.diffusion_steps), device=device)
+
+            V, grad_V = compute_barrier_and_grad_logistic(
+                pred_x0, mean, std, obstacles_data,
+                safety_margin=self.config.safe_extra_factor,
+                sigma=self.config.barrier_sigma
+            )
+            # Apply guidance on pred_x0 space (more stable for DDIM)
+            ddim_guidance_scale = 0.001  # Small guidance scale for DDIM to avoid instability
+            pred_x0 = pred_x0 - gamma_t.view(batch_size, 1, 1) * grad_V * ddim_guidance_scale
+        
+        # Step 3: DDIM update formula
+        sqrt_alpha_bar_t = torch.sqrt(alpha_bar_t + 1e-8)
+        sqrt_one_minus_alpha_bar_t = torch.sqrt(1 - alpha_bar_t + 1e-8)
+        
+        # Predict noise
+        eps = (x_t - sqrt_alpha_bar_t * pred_x0) / sqrt_one_minus_alpha_bar_t
+        
+        # Compute sigma_t (DDIM variance)
+        if t_idx > 0:
+            sigma_t = eta * torch.sqrt((1 - alpha_bar_prev) / (1 - alpha_bar_t + 1e-8) + 1e-8) * \
+                    torch.sqrt(1 - alpha_bar_t / (alpha_bar_prev + 1e-8) + 1e-8)
+        else:
+            sigma_t = torch.zeros_like(alpha_bar_t)
+        
+        # DDIM update: x_{t-1} = sqrt(alpha_bar_prev) * pred_x0 + sqrt(1 - alpha_bar_prev - sigma_t^2) * eps + sigma_t * noise
+        sqrt_alpha_bar_prev = torch.sqrt(alpha_bar_prev + 1e-8)
+        sqrt_one_minus_alpha_bar_prev = torch.sqrt(1 - alpha_bar_prev - sigma_t**2 + 1e-8)
+        
+        x_prev = sqrt_alpha_bar_prev * pred_x0 + sqrt_one_minus_alpha_bar_prev * eps
+        
+        # Add stochastic noise if eta > 0
+        if eta > 0 and t_idx > 0:
+            x_prev = x_prev + sigma_t * torch.randn_like(x_t)
+        
+        # Final step: return pred_x0 directly
+        if t_idx == 0:
+            return pred_x0
+        
+        return x_prev
 
     def _plot_diffusion_step(self, x_t, x_prev, t, step_idx, barrier_info=None, is_final=False, mean=None, std=None, obstacles_data=None):
         """
@@ -1023,7 +1105,7 @@ class AeroDM(nn.Module):
         print(f"\n{'='*50}")
         print("STARTING OBSTACLE-AWARE REVERSE DIFFUSION PROCESS")
         print(f"Initial noise stats - Mean: {x_t.mean().item():.4f}, Std: {x_t.std().item():.4f}")
-        print(f"Total steps: {self.config.diffusion_steps}")
+        print(f"Total steps: {self.config.inference_diffusion_steps}")
         print(f"CBF Guidance: {enable_guidance}")
         if self.obstacles_data:
             print(f"Number of obstacles: {len(self.obstacles_data)}")
@@ -1032,12 +1114,12 @@ class AeroDM(nn.Module):
         
         # Reverse diffusion process
         step_counter = 0
-        for t_step in reversed(range(self.config.diffusion_steps)):
+        for t_step in reversed(range(self.config.inference_diffusion_steps)):
             t_batch = torch.full((batch_size,), t_step, device=device, dtype=torch.long)
             gamma = guidance_gamma if enable_guidance else None
             
             # Plot every step if requested, or key steps for overview
-            # plot_step = plot_all_steps or (t_step % max(1, self.config.diffusion_steps // 5) == 0) or t_step == 0
+            # plot_step = plot_all_steps or (t_step % max(1, self.config.inference_diffusion_steps // 5) == 0) or t_step == 0
             
             # debug: 
             plot_step = False
@@ -1053,6 +1135,56 @@ class AeroDM(nn.Module):
         print(f"Final trajectory stats - Mean: {x_t.mean().item():.4f}, Std: {x_t.std().item():.4f}")
         print(f"{'='*50}")
         
+        return x_t
+
+    @torch.no_grad()
+    def sample_ddim(self, target=None, action=None, history=None, batch_size=1,
+                    enable_guidance=True, guidance_gamma=None, num_steps=30, eta=0.0):
+        """
+        DDIM-based trajectory generation with fewer sampling steps.
+        
+        Args:
+            num_steps: Number of DDIM sampling steps (default: 30, vs 60 for DDPM)
+            eta: DDIM parameter (0 = deterministic, 1 = DDPM-like)
+        """
+        device = next(self.parameters()).device
+        
+        if target is None:
+            target = torch.ones(batch_size, self.config.target_dim).to(device) * 1e-6
+        if action is None:
+            action = torch.zeros(batch_size, self.config.action_dim).to(device)
+        
+        # Initialize from noise
+        x_t = torch.randn(batch_size, self.config.seq_len, self.config.state_dim).to(device)
+        
+        # Generate timestep schedule for DDIM (skip intermediate steps)
+        total_timesteps = self.config.ddim_num_steps
+        step_stride = max(1, total_timesteps // num_steps)
+        timesteps = list(range(total_timesteps - 1, -1, -step_stride))
+        if timesteps[-1] != 0:
+            timesteps.append(0)
+        
+        print(f"\n{'='*50}")
+        print(f"DDIM SAMPLING - {len(timesteps)-1} steps (stride: {step_stride})")
+        print(f"{'='*50}")
+        
+        # DDIM sampling loop
+        for step_idx in range(len(timesteps) - 1):
+            t_curr = timesteps[step_idx]
+            t_batch = torch.full((batch_size,), t_curr, device=device, dtype=torch.long)
+            gamma = guidance_gamma if enable_guidance else None
+            
+            x_t = self.diffusion_process.p_sample_ddim(
+                self.diffusion_model, x_t, t_batch, target, action, history,
+                enable_guidance, gamma, self.mean, self.std,
+                self.obstacles_data, eta=eta
+            )
+            
+            # Progress update
+            if (step_idx + 1) % max(1, len(timesteps) // 5) == 0:
+                print(f"  Step {step_idx+1}/{len(timesteps)-1} | t={t_curr}")
+        
+        print(f"{'='*50}\n")
         return x_t
 
 # Unified Loss Function for AeroDM with Obstacle Awareness
@@ -1702,14 +1834,27 @@ def test_model_performance_cb_eva(model, trajectories_norm, mean, std, num_test_
 
             # ============ NEW: Time unguided sampling ============
             start_time = time.time()
-            sampled_unguided_norm = model.sample(
-                target_norm, 
-                action, 
-                history, 
-                batch_size=1, 
-                enable_guidance=False, 
-                plot_all_steps=False
-            )
+
+            if model.config.use_ddim:
+                sampled_unguided_norm = model.sample_ddim(
+                    target_norm, 
+                    action, 
+                    history, 
+                    batch_size=1, 
+                    enable_guidance=False, 
+                    num_steps=config.ddim_num_steps,
+                    eta=config.ddim_eta
+                )
+            else:
+                sampled_unguided_norm = model.sample(
+                    target_norm, 
+                    action, 
+                    history, 
+                    batch_size=1, 
+                    enable_guidance=False, 
+                    plot_all_steps=False
+                )
+                
             end_time = time.time()
             inference_time_unguided = end_time - start_time
             inference_times_unguided.append(inference_time_unguided)
@@ -1718,15 +1863,28 @@ def test_model_performance_cb_eva(model, trajectories_norm, mean, std, num_test_
             
             # ============ NEW: Time guided sampling ============
             start_time = time.time()
-            sampled_guided_norm = model.sample(
-                target_norm, 
-                action, 
-                history, 
-                batch_size=1, 
-                enable_guidance=True, 
-                guidance_gamma=config.guidance_gamma, 
-                plot_all_steps=False
-            )
+            if model.config.use_ddim:
+                sampled_guided_norm = model.sample_ddim(
+                    target_norm, 
+                    action, 
+                    history, 
+                    batch_size=1, 
+                    enable_guidance=True, 
+                    guidance_gamma=config.guidance_gamma, 
+                    num_steps=config.ddim_num_steps,
+                    eta=config.ddim_eta
+                )  
+            else:
+                sampled_guided_norm = model.sample(
+                    target_norm, 
+                    action, 
+                    history, 
+                    batch_size=1, 
+                    enable_guidance=True, 
+                    guidance_gamma=config.guidance_gamma, 
+                    plot_all_steps=False
+                )
+                
             end_time = time.time()
             inference_time_guided = end_time - start_time
             inference_times_guided.append(inference_time_guided)
@@ -1889,7 +2047,10 @@ def print_inference_time_statistics(times_unguided, times_guided):
         print(f"  ⚡ Guided and unguided have similar speed")
     
     # Inference time per diffusion step
-    diffusion_steps = 60  # From config
+    if config.use_ddim:
+        diffusion_steps = config.ddim_num_steps  # From config
+    else:
+        diffusion_steps = config.inference_diffusion_steps  # From config
     time_per_step_unguided = stats_unguided['mean'] / diffusion_steps
     time_per_step_guided = stats_guided['mean'] / diffusion_steps
     
@@ -2382,122 +2543,7 @@ def compute_trajectory_errors(pred_trajectory, gt_trajectory):
         'max_error': np.max(timestep_errors),
         'percentile_95': np.percentile(timestep_errors, 95)
     }
-
-# Main Testing Function
-def test_model_performance(model, trajectories_norm, mean, std, num_test_samples=3, show_flag=True):
-    """testing with obstacle-aware transformer"""
-    print("\nTesting obstacle-aware model performance...")
-    config = model.config
-    device = next(model.parameters()).device
-    
-    # Define style names mapping
-    style_names = {
-        0: 'power_loop',
-        1: 'barrel_roll',
-        2: 'split_s',
-        3: 'immelmann',
-        4: 'wall_ride',
-        5: 'eight_figure',
-        6: 'star',
-        7: 'half_moon',
-        8: 'sphinx',
-        9: 'clover',
-        10: 'spiral_inward',
-        11: 'spiral_outward',
-        12: 'spiral_vertical_up',
-        13: 'spiral_vertical_down'
-    }
-    
-    mean_state = mean[..., :-1]  # Shape: (1, 1, 10)
-    std_state = std[..., :-1]    # Shape: (1, 1, 10)
-
-    # Set normalization parameters
-    model.set_normalization_params(mean, std)
-    
-    model.eval()
-    with torch.no_grad():
-        for i in range(min(num_test_samples, trajectories_norm.shape[0])):
-            # Prepare test sample
-            full_traj = trajectories_norm[i:i+1]
-            
-            style_info = full_traj[:, :, -1:]  # Shape: (B, T_full, 1)
-            state_without_style = full_traj[:, :, :-1]  # Shape: (B, T_full, state_dim-1)
-
-            # Split into history and sequence-to-predict
-            history = state_without_style[:, :config.history_len, :]
-            x_0 = state_without_style[:, config.history_len:config.history_len+config.seq_len, :]
-            target_norm = generate_target_waypoints(x_0)
-
-            # Denormalize for obstacle generation and plotting
-            x_0_denorm = denormalize_trajectories(x_0, mean_state, std_state)
-            target_denorm = denormalize_target(target_norm, mean_state, std_state)
-            
-            # Extract style information
-            history_style = style_info[:, 0, 0]  # Style from history segment (first timestep)
-            pred_style = style_info[:, -1, 0]  # Style from prediction segment
-            
-            style_indices = pred_style.long()
-            action = F.one_hot(style_indices, num_classes=config.action_dim).float()
-
-            # Generate random obstacles
-            obstacles = generate_random_obstacles(x_0_denorm[0], 
-                                                  num_obstacles_range=(3, 5), 
-                                                  radius_range=(0.5, 1.0), 
-                                                  check_collision=False, 
-                                                  device=device)
-            
-            # Set obstacles data for model input
-            model.set_obstacles_data([obstacles])
-            
-            # Get style names for display
-            hist_idx = history_style.item()
-            pred_idx = pred_style.item()
-            
-            print(f"\n{'='*60}")
-            print(f"TEST SAMPLE {i+1}")
-            print(f"History Style: {style_names.get(hist_idx, f'Style_{hist_idx}')} (idx={hist_idx})")
-            print(f"Prediction Style: {style_names.get(pred_idx, f'Style_{pred_idx}')} (idx={pred_idx})")
-            print(f"Generated {len(obstacles)} random obstacles")
-            print(f"{'='*60}")
-
-            # Sample un-guided trajectory
-            sampled_unguided_norm = model.sample(
-                target_norm, 
-                action, 
-                history, 
-                batch_size=1, 
-                enable_guidance=False, 
-                plot_all_steps=False
-            )
-            sampled_unguided_denorm = denormalize_trajectories(sampled_unguided_norm, mean_state, std_state)
-            
-            # Sample guided trajectory
-            sampled_guided_norm = model.sample(
-                target_norm, 
-                action, 
-                history, 
-                batch_size=1, 
-                enable_guidance=True, 
-                guidance_gamma=config.guidance_gamma, 
-                plot_all_steps=False
-            )
-            sampled_guided_denorm = denormalize_trajectories(sampled_guided_norm, mean_state, std_state)
-            
-            # Plot test results
-            plot_test_results(
-                x_0_denorm, 
-                sampled_unguided_denorm, 
-                sampled_guided_denorm, 
-                denormalize_trajectories(history, mean_state, std_state) if history is not None else None,
-                target_denorm,
-                obstacles,
-                show_flag,
-                step_idx=i+1,
-                history_style=history_style,
-                pred_style=pred_style,
-                style_names=style_names
-            )
-    
+   
 # Add this new function after plot_test_results function
 def plot_combined_trajectories(combined_cases, show_flag=True):
     """
@@ -3624,7 +3670,8 @@ if __name__ == "__main__":
         
         # Generate timestamp for filename
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        model_name = config.model_filename.replace('.pth', f'_{timestamp}.pth')
+        base_name = config.model_filename.split('_')[0]
+        model_name = f"{base_name}_{timestamp}.pth"
         model_path = os.path.join(config.model_save_dir, model_name)
         
         checkpoint = {
@@ -3660,7 +3707,7 @@ if __name__ == "__main__":
         
         if os.path.exists(model_path):
             print(f"Loading model from: {model_path}")
-            checkpoint = torch.load(model_path, map_location=device)
+            checkpoint = torch.load(model_path, map_location=device, weights_only=False)
             
             # Load model state
             model.load_state_dict(checkpoint['model_state_dict'])
@@ -3681,6 +3728,23 @@ if __name__ == "__main__":
             # Update config if needed
             if 'use_obstacle_loss' in checkpoint:
                 config.use_obstacle_loss = checkpoint['use_obstacle_loss']
+
+            # Key parameters for testing guidance (if not set in config, use the loaded model's values)
+            if config.guidance_gamma is None:
+                model.config.guidance_gamma = config.guidance_gamma # test gamma
+            if config.barrier_sigma is None:
+                model.config.barrier_sigma = config.barrier_sigma # test sigma
+            if config.guidance_scale is None:
+                model.config.guidance_scale = config.guidance_scale # test scale
+            if config.safe_extra_factor is None:
+                model.config.safe_extra_factor = config.safe_extra_factor # test safe factor
+            model.config.diffusion_steps = config.diffusion_steps # test diffusion steps
+
+            if config.use_ddim is not None:
+                model.config.use_ddim = config.use_ddim # test DDIM flag
+                model.config.ddim_eta = config.ddim_eta # test DDIM eta
+                model.config.ddim_num_steps = config.ddim_num_steps # test DDIM steps
+
         else:
             print(f"ERROR: Model file not found at {model_path}")
             print("Please train the model first by setting train_model = True")
