@@ -10,6 +10,9 @@ import matplotlib.pyplot as plt
 import sys
 import time
 
+MANEUVER_STYLES = ('power_loop', 'barrel_roll', 'split_s', 'immelmann', 'wall_ride', 'eight_figure', 'half_moon', 'sphinx', 'clover', 'spiral_inward', 'spiral_outward', 'spiral_vertical_up', 'spiral_vertical_down', 'circle', 'ellipse', 's_curve', 'sine_wave', 'arch', 'vertical_eight', 'helix_up', 'helix_down', 'conical_helix', 'lissajous_3d')
+STYLE_NAMES = dict(enumerate(MANEUVER_STYLES))
+
 def smooth_connection_with_spline(history_segment, future_segment, num_blend=10):
     """
     Smoothly connect two trajectory segments using cubic spline interpolation.
@@ -448,6 +451,42 @@ def generate_single_style_trajectory(style, seq_len=60, height=10.0, radius=5.0)
         y = center_y + current_radius * np.cos(2 * np.pi * beta * norm_t)
         z = center_z + current_radius * 0. * np.sin(2 * np.pi * (alpha + beta) * norm_t)
         
+    elif style in ('circle', 'ellipse'):
+        theta = 2 * np.pi * norm_t
+        x = radius * np.cos(theta)
+        y = radius * (0.5 if style == 'ellipse' else 1.0) * np.sin(theta)
+        z = np.full(seq_len, height)
+
+    elif style in ('s_curve', 'sine_wave'):
+        x = 4 * radius * (norm_t - 0.5)
+        cycles = 1 if style == 's_curve' else 2
+        y = radius * np.sin(2 * np.pi * cycles * norm_t)
+        z = np.full(seq_len, height)
+
+    elif style == 'arch':
+        x = 4 * radius * (norm_t - 0.5)
+        y = np.zeros(seq_len)
+        z = height + 4 * radius * norm_t * (1 - norm_t)
+
+    elif style == 'vertical_eight':
+        theta = 2 * np.pi * norm_t
+        x = radius * np.sin(theta)
+        y = np.zeros(seq_len)
+        z = height + 0.5 * radius * np.sin(2 * theta)
+
+    elif style in ('helix_up', 'helix_down', 'conical_helix'):
+        theta = 4 * np.pi * norm_t
+        radius_t = radius * (0.3 + 0.7 * norm_t) if style == 'conical_helix' else radius
+        x = radius_t * np.cos(theta)
+        y = radius_t * np.sin(theta)
+        z = height + (-1 if style == 'helix_down' else 1) * 3 * radius * norm_t
+
+    elif style == 'lissajous_3d':
+        theta = 2 * np.pi * norm_t
+        x = radius * np.sin(2 * theta)
+        y = radius * np.sin(3 * theta + np.pi / 2)
+        z = height + 0.5 * radius * np.sin(theta)
+
     elif style == 'half_moon':
         theta = np.pi * norm_t
         x = center_x + current_radius * np.cos(theta)
@@ -645,28 +684,13 @@ def generate_aerobatic_trajectories_pvR(num_trajectories, seq_len, height=10.0, 
     """Generates synthetic aerobatic trajectories with correct attitude angles."""
     trajectories = []
 
-    maneuver_styles = ['power_loop', 'barrel_roll', 'split_s', 'immelmann', 'wall_ride', 'eight_figure', 'star', 'half_moon', 'sphinx', 'clover', 'spiral_inward', 'spiral_outward', 'spiral_vertical_up', 'spiral_vertical_down']
+    maneuver_styles = MANEUVER_STYLES
     
     for i in range(num_trajectories):
         # Randomly select a maneuver style
         style = np.random.choice(maneuver_styles)
         
-        style_to_index = {
-            'power_loop': 0,
-            'barrel_roll': 1,
-            'split_s': 2,
-            'immelmann': 3,
-            'wall_ride': 4,
-            'eight_figure': 5,
-            'star': 6,
-            'half_moon': 7,
-            'sphinx': 8,
-            'clover': 9,
-            'spiral_inward': 10,
-            'spiral_outward': 11,
-            'spiral_vertical_up': 12,
-            'spiral_vertical_down': 13
-        }
+        style_to_index = {name: index for index, name in STYLE_NAMES.items()}
         
         style_idx = style_to_index.get(style, 0)
 

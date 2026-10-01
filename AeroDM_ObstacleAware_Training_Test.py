@@ -10,12 +10,17 @@ import torch.nn.functional as F
 import math
 import numpy as np
 import matplotlib.pyplot as plt
+from matplotlib.backends.backend_pdf import PdfPages
+from matplotlib.lines import Line2D
+from matplotlib.patches import Circle, Patch
+from matplotlib.ticker import MaxNLocator
+from contextlib import contextmanager
 import sys
 import time
 from datetime import datetime
 
 from Trajectory_Gen import generate_aerobatic_trajectories
-from Trajectory_Gen import generate_aerobatic_trajectories_pvR
+from Trajectory_Gen import generate_aerobatic_trajectories_pvR, MANEUVER_STYLES, STYLE_NAMES
 from Trajectory_Gen import augment_trajectories_with_smooth_concatenation
 from Test.circular_trajectories import generate_circular_end_trajectories
 from Test.distribute_trajectories import generate_distributed_trajectories
@@ -26,8 +31,9 @@ class Config:
     # Training parameters
     num_epochs = 100
     batch_size = 32
-    _base_num_trajectories = 20000 # Base number of trajectories before augmentation (will be increased by concatenation)
-    num_test_samples = 20
+    _base_num_trajectories = 25000 # Base number of trajectories before augmentation (will be increased by concatenation)
+    test_batch_size = 8  # Evaluation batch size; 1 restores serial sampling
+    num_test_samples = 200
 
     # Model dimensions
     latent_dim = 128
@@ -48,7 +54,7 @@ class Config:
 
     # Condition dimensions
     target_dim = 4  # p_t ∈ R^3 + valid flag (1)
-    action_dim = 14   # 14 maneuver styles
+    action_dim = len(MANEUVER_STYLES)  # 23 maneuver styles
 
     # Obstacle parameters
     max_obstacles = 10  # Maximum number of obstacles to process
@@ -58,9 +64,9 @@ class Config:
 
     # CBF Guidance parameters (from CoDiG paper)
     # enable_cbf_guidance = True  # Disabled by default; toggle for inference
-    guidance_gamma = 4000.0  # Base gamma for barrier guidance
+    guidance_gamma = 1.0  # Barrier guidance strength (0 to 1); internally scaled by 4000
     safe_extra_factor=0.20 # Safety buffer as fraction of radius (e.g., 20%)
-    barrier_sigma = 0.5 # Smoothness parameter for logistic barrier function (tune for best results)
+    barrier_sigma = 0.4 # Smoothness parameter for logistic barrier function (tune for best results)
 
     last_xyz_weight=50.0 # Extra weight for final timestep's position error
     xyz_weight=1.0 # Extra weight for Z-axis (height) in aviation
@@ -76,15 +82,18 @@ class Config:
     guidance_scale = 2.0  # Classifier-free guidance scale for sampling (tune for best results)
 
     # Plotting control
-    show_flag = False  # Set to False to save plots as SVG instead of displaying
+    plot_guidance_steps = False  # Plot physical barrier correction at every guided diffusion step
+    enable_test_plots = True  # Disable evaluation plots and image saving for benchmarking
+    show_flag = False  # Display sample figures as well as saving the PDF when True
+    test_results_pdf = "output/pdf/test_samples_results.pdf"
 
     # Training control flag
     train_model = False  # Set to True to train, False to load existing model
     
     # Model save/load paths
     model_save_dir = "model"
-    model_filename = "aerodm_v2_test.pth"  # Base name (timestamp will be added when saving)
-
+    model_filename = "aerodm_v2_test_2026_oct_01.pth"  # Base name (timestamp will be added when saving)
+    # model_filename = "aerodm_v2_test_23styles.pth"  # Base name (timestamp will be added when saving) 2026-Jul-30 good model
 
 # Transformer positional encoding
 class PositionalEncoding(nn.Module):
@@ -724,18 +733,14 @@ class ObstacleAwareDiffusionProcess:
         device = x_t.device
         # print("p_sample - enable_cbf_guidance: ", enable_guidance, "mean:", mean, "std: ", std, "gamma: ", guidance_gamma, "obstacles_data size: ", len(obstacles_data))
         with torch.no_grad():
-            # Model prediction with obstacle information
-            pred_x0 = model(x_t, t, target, action, history, obstacles_data)
-
             # Conditional prediction (with action) for guidance
             pred_x0_cond = model(x_t, t, target, action, history, obstacles_data)
             
-            #  non-conditional prediction (zero out action) for guidance
-            zero_action = torch.zeros_like(action)
-            pred_x0_uncond = model(x_t, t, target, zero_action, history, obstacles_data)
-            
             # Classifier-free guidance: pred_x0 = pred_x0_uncond + guidance_scale * (pred_x0_cond - pred_x0_uncond)
             if enable_guidance and self.config.guidance_scale != 1.0:
+                # Only compute the unconditional prediction when CFG is active.
+                zero_action = torch.zeros_like(action)
+                pred_x0_uncond = model(x_t, t, target, zero_action, history, obstacles_data)
                 pred_x0 = pred_x0_uncond + self.config.guidance_scale * (pred_x0_cond - pred_x0_uncond)
             else:
                 pred_x0 = pred_x0_cond
@@ -762,7 +767,7 @@ class ObstacleAwareDiffusionProcess:
             barrier_info = None
             if enable_guidance and guidance_gamma is not None and mean is not None and std is not None:
                 # Compute γ_t (scheduled: strongest at t=0 for final safety enforcement)
-                gamma_t = guidance_gamma * (1.0 - t_exp.squeeze(1).float() / self.config.diffusion_steps)
+                gamma_t = (4000.0 * guidance_gamma) * (1.0 - t_exp.squeeze(1).float() / self.config.diffusion_steps)
                 
                 # Compute barrier gradient ∇V with multiple obstacles
                 V, grad_V = compute_barrier_and_grad_logistic(pred_x0, mean, std, obstacles_data, safety_margin=config.safe_extra_factor, sigma=config.barrier_sigma)
@@ -772,7 +777,7 @@ class ObstacleAwareDiffusionProcess:
                 # Guided score: s_guided = s_theta - γ_t ∇V
                 sigma_t = sqrt_one_minus_alpha_bar_t
                 # ε_guided = mu_pred - gamma_t.view(batch_size, 1, 1) * grad_V
-                # norm(grad_V) << norm(mu_pred), sigma_t: 1->0, gamma_t: 0->guidance_gamma
+                # norm(grad_V) << norm(mu_pred), sigma_t: 1->0, gamma_t: 0->4000*guidance_gamma
                 ε_guided = ε_pred + gamma_t.view(batch_size, 1, 1) * grad_V * sqrt_one_minus_alpha_bar_t
                 # ε_pred = score_function * - sqrt_one_minus_alpha_bar_t
                 # norm(score_function) = norm(ε_pred) / sigma_t; norm(ε_pred)^2 ~ χ2(D) 
@@ -791,6 +796,18 @@ class ObstacleAwareDiffusionProcess:
             
             # For t=0, return pred_x0 (or guided equivalent)
             is_t_zero = (t_exp.squeeze(1) == 0).all()
+            if plot_step and barrier_info is not None:
+                # Isolate the barrier correction with the same prediction and noise.
+                # The final step uses the x0 reconstruction rather than the DDPM mean.
+                correction_coeff = (
+                    one_minus_alpha_bar_t / sqrt_alpha_bar_t
+                    if is_t_zero else (1 - alpha_t) / torch.sqrt(alpha_t)
+                )
+                correction_real = (
+                    -correction_coeff * gamma_t.view(batch_size, 1, 1)
+                    * grad_V[:, :, 1:4] * std[0, 0, 1:4]
+                )
+                barrier_info['correction_distance'] = correction_real.norm(dim=-1)
             if is_t_zero:
                 # Compute guided pred_x0 for consistency
                 pred_x0_guided = (x_t - sqrt_one_minus_alpha_bar_t * ε_guided) / sqrt_alpha_bar_t
@@ -822,7 +839,8 @@ class ObstacleAwareDiffusionProcess:
         Denormalizes positions for visualization if mean/std provided; otherwise plots raw normalized values.
         Supports 3D trajectories, projections, stats, CBF info, and step details.
         """
-        fig = plt.figure(figsize=(20, 10))
+        fig = plt.figure(figsize=(20, 12))
+        layout = fig.add_gridspec(4, 2, width_ratios=[2.2, 1])
         fig.suptitle(f'Reverse Diffusion Process - Step {step_idx} (t={t[0].item()})', fontsize=16)
         
         # Extract position coordinates with conditional denormalization
@@ -842,7 +860,7 @@ class ObstacleAwareDiffusionProcess:
         # fixed_max = np.array([20.0, 20.0, 20.0])
 
         # 1. 3D trajectory evolution with obstacles
-        ax1 = fig.add_subplot(241, projection='3d')
+        ax1 = fig.add_subplot(layout[:, 0], projection='3d')
         ax1.plot(x_t_pos[:, 0], x_t_pos[:, 1], x_t_pos[:, 2], 'r-', label='x_t (current)', linewidth=2, alpha=0.7)
         ax1.plot(x_prev_pos[:, 0], x_prev_pos[:, 1], x_prev_pos[:, 2], 'b-', label='x_prev (denoised)', linewidth=2, alpha=0.7)
         
@@ -873,37 +891,10 @@ class ObstacleAwareDiffusionProcess:
         ax1.set_title('3D Trajectory Evolution with Obstacles')
         ax1.grid(True)
         
-        # 2. Position components over time
         time_steps = np.arange(len(x_t_pos))
-        ax2 = fig.add_subplot(242)
-        ax2.plot(time_steps, x_t_pos[:, 0], 'r-', label='x_t X', linewidth=2, alpha=0.7)
-        ax2.plot(time_steps, x_prev_pos[:, 0], 'b-', label='x_prev X', linewidth=2, alpha=0.7)
-        ax2.set_xlabel('Time Step')
-        ax2.set_ylabel('X Position')
-        ax2.legend()
-        ax2.set_title('X Position Over Time')
-        ax2.grid(True)
-        
-        ax3 = fig.add_subplot(243)
-        ax3.plot(time_steps, x_t_pos[:, 1], 'r-', label='x_t Y', linewidth=2, alpha=0.7)
-        ax3.plot(time_steps, x_prev_pos[:, 1], 'b-', label='x_prev Y', linewidth=2, alpha=0.7)
-        ax3.set_xlabel('Time Step')
-        ax3.set_ylabel('Y Position')
-        ax3.legend()
-        ax3.set_title('Y Position Over Time')
-        ax3.grid(True)
-        
-        ax4 = fig.add_subplot(244)
-        ax4.plot(time_steps, x_t_pos[:, 2], 'r-', label='x_t Z', linewidth=2, alpha=0.7)
-        ax4.plot(time_steps, x_prev_pos[:, 2], 'b-', label='x_prev Z', linewidth=2, alpha=0.7)
-        ax4.set_xlabel('Time Step')
-        ax4.set_ylabel('Z Position')
-        ax4.legend()
-        ax4.set_title('Z Position Over Time')
-        ax4.grid(True)
-        
+
         # 3. Noise and prediction statistics (on full normalized states)
-        ax5 = fig.add_subplot(245)
+        ax5 = fig.add_subplot(layout[1, 1])
         stats_labels = ['x_t Mean', 'x_t Std', 'x_prev Mean', 'x_prev Std']
         stats_values = [
             x_t.mean().item(), x_t.std().item(),
@@ -917,17 +908,29 @@ class ObstacleAwareDiffusionProcess:
                     ha='center', va='bottom')
         
         # 4. Position differences (using denormalized positions)
-        ax6 = fig.add_subplot(246)
+        ax6 = fig.add_subplot(layout[0, 1])
         pos_diff = np.linalg.norm(x_prev_pos - x_t_pos, axis=1)
         ax6.plot(time_steps, pos_diff, 'g-', linewidth=2)
         ax6.set_xlabel('Time Step')
         ax6.set_ylabel('Position Difference')
         ax6.set_title('Position Change Magnitude')
         ax6.grid(True)
+        if barrier_info is not None and 'correction_distance' in barrier_info:
+            # Match the first trajectory displayed in the other panels.
+            correction = barrier_info['correction_distance'][0].detach().cpu().numpy()
+            ax6.clear()
+            ax6.plot(time_steps, correction, color='darkorange', linewidth=2,
+                     label='Barrier correction')
+            ax6.axhline(correction.mean(), color='gray', linestyle='--', label='Mean')
+            ax6.set_xlabel('Trajectory Time Step')
+            ax6.set_ylabel('Correction Distance (physical position units)')
+            ax6.set_title(f'Barrier Correction (sample 0)\nMean={correction.mean():.4g}, Max={correction.max():.4g}')
+            ax6.legend()
+            ax6.grid(True)
         
         # 5. CBF Barrier information (if available)
         if barrier_info is not None:
-            ax7 = fig.add_subplot(247)
+            ax7 = fig.add_subplot(layout[2, 1])
             V = barrier_info['V'].item()
             gamma_t = barrier_info['gamma_t'][0].item() if barrier_info['gamma_t'].numel() == 1 else barrier_info['gamma_t'].mean().item()
             grad_norm = barrier_info['grad_V'].norm().item()
@@ -942,7 +945,7 @@ class ObstacleAwareDiffusionProcess:
                         ha='center', va='bottom')
         
         # 6. Step information
-        ax8 = fig.add_subplot(248)
+        ax8 = fig.add_subplot(layout[3, 1])
         step_info = {
             'Step': step_idx,
             'Timestep': t[0].item(),
@@ -962,7 +965,8 @@ class ObstacleAwareDiffusionProcess:
             plt.show()
         else:
             # Save as SVG with descriptive filename
-            filename = f"Figs/diffusion_step_{step_idx:03d}_t_{t[0].item():03d}.svg"
+            os.makedirs('Figs', exist_ok=True)
+            filename = f"Figs/diffusion_{getattr(self, '_plot_run_id', time.time_ns())}_step_{step_idx:03d}_t_{t[0].item():03d}.svg"
             plt.savefig(filename, format='svg', bbox_inches='tight')
             plt.close()  # Close the figure to free memory
         
@@ -1031,6 +1035,7 @@ class AeroDM(nn.Module):
         print(f"{'='*50}")
         
         # Reverse diffusion process
+        self.diffusion_process._plot_run_id = time.time_ns()
         step_counter = 0
         for t_step in reversed(range(self.config.diffusion_steps)):
             t_batch = torch.full((batch_size,), t_step, device=device, dtype=torch.long)
@@ -1040,7 +1045,7 @@ class AeroDM(nn.Module):
             # plot_step = plot_all_steps or (t_step % max(1, self.config.diffusion_steps // 5) == 0) or t_step == 0
             
             # debug: 
-            plot_step = False
+            plot_step = plot_all_steps and getattr(self.config, 'enable_test_plots', True)
             x_t = self.diffusion_process.p_sample(
                 self.diffusion_model, x_t, t_batch, target, action, history, enable_guidance,
                 gamma, self.mean, self.std, plot_step=plot_step, step_idx=step_counter,
@@ -1210,13 +1215,14 @@ class AeroDMLoss(nn.Module):
         if self.enable_obstacle_term and obstacles_data is not None and mean is not None and std is not None:
             obstacle_loss = self.compute_obstacle_distance_loss(pred_trajectory, obstacles_data, mean, std)
         
-        # New: Continuity loss (MSE between last history and first pred timestep)
-        continuity_loss = torch.tensor(0.0, device=device, requires_grad=True)
-        if history is not None and pred_trajectory.size(1) > 0:
-            # Focus on position components (indices 1:4) for smoothness
+        # Match boundary displacement to the last history displacement.
+        # Assumes equal sampling intervals for history and prediction.
+        continuity_loss = pred_trajectory.new_zeros(())
+        if history is not None and history.size(1) >= 2 and pred_trajectory.size(1) > 0:
             last_history_pos = history[:, -1, 1:4]
-            first_pred_pos = pred_trajectory[:, 0, 1:4]
-            continuity_loss = self.mse_loss(first_pred_pos, last_history_pos)
+            history_displacement = last_history_pos - history[:, -2, 1:4]
+            predicted_displacement = pred_trajectory[:, 0, 1:4] - last_history_pos
+            continuity_loss = self.mse_loss(predicted_displacement, history_displacement)
         
         # Total weighted loss
         total_loss = self.last_xyz_weight * last_xyz_loss + self.xyz_weight * position_loss + self.vel_weight * vel_loss + self.other_weight * other_loss + self.obstacle_weight * obstacle_loss + self.continuity_weight * continuity_loss + self.acc_weight * acc_smoothness
@@ -1604,29 +1610,30 @@ def plot_error_analysis(ax, time_steps, original_pos, reconstructed_pos, sampled
     ax.grid(True, alpha=0.3)
 
 # Main evaluation function for testing model performance with obstacle-aware transformer
-def test_model_performance_cb_eva(model, trajectories_norm, mean, std, num_test_samples=100, show_flag=True, plot_combined=True):
+def test_model_performance_cb_eva(model, trajectories_norm, mean, std, num_test_samples=100, show_flag=True, plot_combined=True, test_batch_size=None, enable_plots=None):
     """Testing with obstacle-aware transformer and compute collision rates, trajectory errors & success rates"""
     print("\nTesting obstacle-aware model performance...")
     config = model.config
     device = next(model.parameters()).device
     
+    # Independent of show_flag: sample figures are always saved when plotting is enabled.
+    enable_plots = getattr(config, 'enable_test_plots', True) if enable_plots is None else enable_plots
+    batch_size = getattr(config, 'test_batch_size', 1) if test_batch_size is None else test_batch_size
+    if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size < 1:
+        raise ValueError("test_batch_size must be a positive integer")
+    sample_count = min(num_test_samples, trajectories_norm.shape[0])
+    if sample_count <= 0:
+        print("No test samples to evaluate.")
+        return
+
+    def synchronize():
+        if device.type == 'cuda':
+            torch.cuda.synchronize(device)
+        elif device.type == 'mps':
+            torch.mps.synchronize()
+
     # Define style names mapping
-    style_names = {
-        0: 'power_loop',
-        1: 'barrel_roll',
-        2: 'split_s',
-        3: 'immelmann',
-        4: 'wall_ride',
-        5: 'eight_figure',
-        6: 'star',
-        7: 'half_moon',
-        8: 'sphinx',
-        9: 'clover',
-        10: 'spiral_inward',
-        11: 'spiral_outward',
-        12: 'spiral_vertical_up',
-        13: 'spiral_vertical_down'
-    }
+    style_names = STYLE_NAMES
     
     mean_state = mean[..., :-1]  # Shape: (1, 1, 10)
     std_state = std[..., :-1]    # Shape: (1, 1, 10)
@@ -1649,147 +1656,90 @@ def test_model_performance_cb_eva(model, trajectories_norm, mean, std, num_test_
     inference_times_guided = []
     
     model.eval()
-    with torch.no_grad():
-        for i in range(min(num_test_samples, trajectories_norm.shape[0])):
-            # Progress indicator
-            if (i + 1) % 10 == 0:
-                print(f"Processing test sample {i+1}/{min(num_test_samples, trajectories_norm.shape[0])}")
-            
-            # Prepare test sample
-            full_traj = trajectories_norm[i:i+1]
-            
-            style_info = full_traj[:, :, -1:]  # Shape: (B, T_full, 1)
-            state_without_style = full_traj[:, :, :-1]  # Shape: (B, T_full, state_dim-1)
+    with test_sample_pdf_report(config, enabled=enable_plots) as pdf, torch.no_grad():
+        for start in range(0, sample_count, batch_size):
+            stop = min(start + batch_size, sample_count)
+            current_size = stop - start
+            print(f"Processing samples {start + 1}-{stop}/{sample_count}")
+            full_traj = trajectories_norm[start:stop]
+            states = full_traj[:, :, :-1]
+            histories = states[:, :config.history_len]
+            originals_norm = states[:, config.history_len:config.history_len + config.seq_len]
+            originals = denormalize_trajectories(originals_norm, mean_state, std_state)
+            targets = denormalize_target(generate_target_waypoints(originals_norm), mean_state, std_state)
+            targets = add_target_noise(targets, bound=1.0)
+            targets_norm = normalize_target(targets, mean_state, std_state)
+            actions = F.one_hot(full_traj[:, -1, -1].long(), num_classes=config.action_dim).float()
+            obstacles_batch = [generate_random_obstacles(
+                originals[j], num_obstacles_range=(3, 5), radius_range=(0.5, 1.0),
+                check_collision=False, device=device) for j in range(current_size)]
+            model.set_obstacles_data(obstacles_batch)
+            outputs, elapsed = [], []
+            for guided in (False, True):
+                synchronize()
+                started = time.perf_counter()
+                sampled = model.sample(
+                    targets_norm, actions, histories, batch_size=current_size,
+                    enable_guidance=guided,
+                    guidance_gamma=config.guidance_gamma if guided else None,
+                    plot_all_steps=enable_plots and guided and getattr(config, 'plot_guidance_steps', False))
+                synchronize()
+                elapsed.append(time.perf_counter() - started)
+                outputs.append(denormalize_trajectories(sampled, mean_state, std_state))
+            inference_times_unguided.extend([elapsed[0] / current_size] * current_size)
+            inference_times_guided.extend([elapsed[1] / current_size] * current_size)
+            print(f"Batch time: unguided={elapsed[0]:.4f}s, guided={elapsed[1]:.4f}s")
+            for j in range(current_size):
+                i = start + j
+                x_0_denorm = originals[j:j+1]
+                history = histories[j:j+1]
+                target_denorm = targets[j:j+1]
+                obstacles = obstacles_batch[j]
+                history_style = full_traj[j:j+1, 0, -1]
+                pred_style = full_traj[j:j+1, -1, -1]
+                sampled_unguided_denorm = outputs[0][j:j+1]
+                sampled_guided_denorm = outputs[1][j:j+1]
+                if enable_plots:
+                    # Plot individual test results
+                    plot_test_results(
+                        x_0_denorm,
+                        sampled_unguided_denorm,
+                        sampled_guided_denorm,
+                        denormalize_trajectories(history, mean_state, std_state) if history is not None else None,
+                        target_denorm,
+                        obstacles,
+                        show_flag,
+                        step_idx=i+1,
+                        history_style=history_style,
+                        pred_style=pred_style,
+                        style_names=style_names,
+                        pdf=pdf
+                    )
+                # Store positions for metrics computation (only x,y,z)
+                all_unguided_positions.append(sampled_unguided_denorm[0, :, 1:4].cpu().numpy())
+                all_guided_positions.append(sampled_guided_denorm[0, :, 1:4].cpu().numpy())
+                all_ground_truth_positions.append(x_0_denorm[0, :, 1:4].cpu().numpy())
+                all_target_positions.append(target_denorm[0, :3].cpu().numpy())
+                all_obstacles_data.append(obstacles)
 
-            # Split into history and sequence-to-predict
-            history = state_without_style[:, :config.history_len, :]
-            x_0 = state_without_style[:, config.history_len:config.history_len+config.seq_len, :]
-            target_norm = generate_target_waypoints(x_0)
+                # Store first 9 cases for combined visualization
+                if enable_plots and i < 9 and plot_combined:
+                    hist_idx, pred_idx = history_style.item(), pred_style.item()
+                    combined_cases.append({
+                        'idx': i + 1,
+                        'original': x_0_denorm[0, :, 1:4].detach().cpu().numpy(),
+                        'guided': sampled_guided_denorm[0, :, 1:4].detach().cpu().numpy(),
+                        'unguided': sampled_unguided_denorm[0, :, 1:4].detach().cpu().numpy(),
+                        'history': denormalize_trajectories(history, mean_state, std_state)[0, :, 1:4].detach().cpu().numpy() if history is not None else None,
+                        'target': target_denorm[0, :3].detach().cpu().numpy() if target_denorm is not None else None,
+                        'obstacles': obstacles,
+                        'hist_style': style_names.get(hist_idx, f'Style_{hist_idx}'),
+                        'pred_style': style_names.get(pred_idx, f'Style_{pred_idx}')
+                    })
 
-            # Denormalize for obstacle generation and plotting
-            x_0_denorm = denormalize_trajectories(x_0, mean_state, std_state)
-            target_denorm = denormalize_target(target_norm, mean_state, std_state)
-            target_denorm = add_target_noise(target_denorm, bound=1.0)
-            target_norm = normalize_target(target_denorm, mean_state, std_state)  # Re-normalize after adding noise
-
-            # Extract style information
-            history_style = style_info[:, 0, 0]
-            pred_style = style_info[:, -1, 0]
-            
-            style_indices = pred_style.long()
-            action = F.one_hot(style_indices, num_classes=config.action_dim).float()
-
-            # Generate random obstacles (consistent for both unguided and guided)
-            obstacles = generate_random_obstacles(x_0_denorm[0], 
-                                                  num_obstacles_range=(3, 5), 
-                                                  radius_range=(0.5, 1.0), 
-                                                  check_collision=False, 
-                                                  device=device)
-            
-            # Set obstacles data for model input
-            model.set_obstacles_data([obstacles])
-            
-            # Get style names for display
-            hist_idx = history_style.item()
-            pred_idx = pred_style.item()
-            
-            print(f"\n{'='*60}")
-            print(f"TEST SAMPLE {i+1}")
-            print(f"History Style: {style_names.get(hist_idx, f'Style_{hist_idx}')} (idx={hist_idx})")
-            print(f"Prediction Style: {style_names.get(pred_idx, f'Style_{pred_idx}')} (idx={pred_idx})")
-            print(f"Generated {len(obstacles)} random obstacles")
-            print(f"{'='*60}")
-
-            # ============ NEW: Time unguided sampling ============
-            start_time = time.time()
-            sampled_unguided_norm = model.sample(
-                target_norm, 
-                action, 
-                history, 
-                batch_size=1, 
-                enable_guidance=False, 
-                plot_all_steps=False
-            )
-            end_time = time.time()
-            inference_time_unguided = end_time - start_time
-            inference_times_unguided.append(inference_time_unguided)
-            
-            sampled_unguided_denorm = denormalize_trajectories(sampled_unguided_norm, mean_state, std_state)
-            
-            # ============ NEW: Time guided sampling ============
-            start_time = time.time()
-            sampled_guided_norm = model.sample(
-                target_norm, 
-                action, 
-                history, 
-                batch_size=1, 
-                enable_guidance=True, 
-                guidance_gamma=config.guidance_gamma, 
-                plot_all_steps=False
-            )
-            end_time = time.time()
-            inference_time_guided = end_time - start_time
-            inference_times_guided.append(inference_time_guided)
-            
-            sampled_guided_denorm = denormalize_trajectories(sampled_guided_norm, mean_state, std_state)
-            
-            # Print timing information
-            print(f"  ⏱️ Unguided inference time: {inference_time_unguided:.4f}s")
-            print(f"  ⏱️ Guided inference time:   {inference_time_guided:.4f}s")
-            print(f"  📊 Speedup (guided vs unguided): {inference_time_unguided/inference_time_guided:.2f}x")
-            
-            # Plot individual test results
-            plot_test_results(
-                x_0_denorm, 
-                sampled_unguided_denorm, 
-                sampled_guided_denorm, 
-                denormalize_trajectories(history, mean_state, std_state) if history is not None else None,
-                target_denorm,
-                obstacles,
-                show_flag,
-                step_idx=i+1,
-                history_style=history_style,
-                pred_style=pred_style,
-                style_names=style_names
-            )
-            # Store positions for metrics computation (only x,y,z)
-            all_unguided_positions.append(sampled_unguided_denorm[0, :, 1:4].cpu().numpy())
-            all_guided_positions.append(sampled_guided_denorm[0, :, 1:4].cpu().numpy())
-            all_ground_truth_positions.append(x_0_denorm[0, :, 1:4].cpu().numpy())
-            all_target_positions.append(target_denorm[0, :3].cpu().numpy())
-            all_obstacles_data.append(obstacles)
-            
-            # Store first 9 cases for combined visualization
-            if i < 9 and plot_combined:
-                combined_cases.append({
-                    'idx': i + 1,
-                    'original': x_0_denorm[0, :, 1:4].detach().cpu().numpy(),
-                    'guided': sampled_guided_denorm[0, :, 1:4].detach().cpu().numpy(),
-                    'unguided': sampled_unguided_denorm[0, :, 1:4].detach().cpu().numpy(),
-                    'history': denormalize_trajectories(history, mean_state, std_state)[0, :, 1:4].detach().cpu().numpy() if history is not None else None,
-                    'target': target_denorm[0, :3].detach().cpu().numpy() if target_denorm is not None else None,
-                    'obstacles': obstacles,
-                    'hist_style': style_names.get(hist_idx, f'Style_{hist_idx}'),
-                    'pred_style': style_names.get(pred_idx, f'Style_{pred_idx}')
-                })
-            
-            # Plot individual test results (only for first 9 to avoid excessive plots)
-            if i < 9:
-                plot_test_results(
-                    x_0_denorm, 
-                    sampled_unguided_denorm, 
-                    sampled_guided_denorm, 
-                    denormalize_trajectories(history, mean_state, std_state) if history is not None else None,
-                    target_denorm,
-                    obstacles,
-                    show_flag,
-                    step_idx=i+1,
-                    history_style=history_style,
-                    pred_style=pred_style,
-                    style_names=style_names
-                )
-    
     # ============ NEW: Print inference time statistics ============
+    if batch_size > 1:
+        print("Timing below is amortized batch time per trajectory, not single-request latency.")
     print_inference_time_statistics(inference_times_unguided, inference_times_guided)
     
     # Convert to numpy arrays for metrics computation
@@ -1808,7 +1758,7 @@ def test_model_performance_cb_eva(model, trajectories_norm, mean, std, num_test_
     )
     
     # Plot combined trajectories for first 9 cases
-    if plot_combined and len(combined_cases) > 0:
+    if enable_plots and plot_combined and len(combined_cases) > 0:
         plot_combined_trajectories(combined_cases, show_flag)
 
 # ============ NEW: Function to print inference time statistics ============
@@ -2391,22 +2341,7 @@ def test_model_performance(model, trajectories_norm, mean, std, num_test_samples
     device = next(model.parameters()).device
     
     # Define style names mapping
-    style_names = {
-        0: 'power_loop',
-        1: 'barrel_roll',
-        2: 'split_s',
-        3: 'immelmann',
-        4: 'wall_ride',
-        5: 'eight_figure',
-        6: 'star',
-        7: 'half_moon',
-        8: 'sphinx',
-        9: 'clover',
-        10: 'spiral_inward',
-        11: 'spiral_outward',
-        12: 'spiral_vertical_up',
-        13: 'spiral_vertical_down'
-    }
+    style_names = STYLE_NAMES
     
     mean_state = mean[..., :-1]  # Shape: (1, 1, 10)
     std_state = std[..., :-1]    # Shape: (1, 1, 10)
@@ -2415,7 +2350,7 @@ def test_model_performance(model, trajectories_norm, mean, std, num_test_samples
     model.set_normalization_params(mean, std)
     
     model.eval()
-    with torch.no_grad():
+    with test_sample_pdf_report(config, enabled=num_test_samples > 0 and trajectories_norm.shape[0] > 0) as pdf, torch.no_grad():
         for i in range(min(num_test_samples, trajectories_norm.shape[0])):
             # Prepare test sample
             full_traj = trajectories_norm[i:i+1]
@@ -2495,7 +2430,8 @@ def test_model_performance(model, trajectories_norm, mean, std, num_test_samples
                 step_idx=i+1,
                 history_style=history_style,
                 pred_style=pred_style,
-                style_names=style_names
+                style_names=style_names,
+                        pdf=pdf
             )
     
 # Add this new function after plot_test_results function
@@ -2651,29 +2587,14 @@ def format_progress(epoch, num_epochs, start_time, avg_total, avg_position, avg_
 def generate_trj_demos():
     # Generate example enhanced circular trajectories for demonstration
     print("Generating example enhanced circular trajectories...")
-    demo_trajectories = generate_aerobatic_trajectories(num_trajectories=18, seq_len=60)
+    demo_trajectories = generate_aerobatic_trajectories_pvR(num_trajectories=18, seq_len=60)
     
     # Extract style indices from the trajectories (last dimension)
     # Style index is stored as the last element in the state vector
     style_indices = demo_trajectories[:, 0, -1].long().numpy()
     
     # Define style names mapping (same as in generate_aerobatic_trajectories)
-    style_names = {
-        0: 'power_loop',
-        1: 'barrel_roll',
-        2: 'split_s',
-        3: 'immelmann',
-        4: 'wall_ride',
-        5: 'eight_figure',
-        6: 'star',
-        7: 'half_moon',
-        8: 'sphinx',
-        9: 'clover',
-        10: 'spiral_inward',
-        11: 'spiral_outward',
-        12: 'spiral_vertical_up',
-        13: 'spiral_vertical_down'
-    }
+    style_names = STYLE_NAMES
     
     # Get style names for each trajectory
     trajectory_styles = [style_names.get(idx, 'unknown') for idx in style_indices]
@@ -2789,22 +2710,7 @@ def test_action_effect(model, trajectories_norm, mean, std, num_test_samples=5, 
     model.set_normalization_params(mean, std)
     
     # Define style names for display
-    style_names = {
-        0: 'power_loop',
-        1: 'barrel_roll',
-        2: 'split_s',
-        3: 'immelmann',
-        4: 'wall_ride',
-        5: 'eight_figure',
-        6: 'star',
-        7: 'half_moon',
-        8: 'sphinx',
-        9: 'clover',
-        10: 'spiral_inward',
-        11: 'spiral_outward',
-        12: 'spiral_vertical_up',
-        13: 'spiral_vertical_down'
-    }
+    style_names = STYLE_NAMES
     
     # Select a subset of styles to test
     test_styles = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]  # All styles
@@ -3083,126 +2989,138 @@ def normalize_target(target_denorm, mean, std):
     # Concatenate with original valid flag
     return torch.cat([target_pos_norm, target_valid], dim=-1)
 
-def plot_test_results(original, sampled_unguided_denorm, sampled_guided_denorm, history, target, 
-                      obstacles=None, show_flag=True, step_idx=0, 
-                      history_style=None, pred_style=None, style_names=None):
+@contextmanager
+def test_sample_pdf_report(config, enabled=True):
+    """One writer per evaluation; the context closes the PDF even on failure."""
+    if not enabled:
+        yield None
+        return
+    path = os.fspath(getattr(config, 'test_results_pdf', 'output/pdf/test_samples_results.pdf'))
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    print(f"Saving all test samples to: {path}")
+    # Keep font embedding active until PdfPages finalizes its shared font resources.
+    with plt.rc_context({'pdf.fonttype': 42}), PdfPages(
+            path, metadata={'Title': 'AeroDM test sample trajectories',
+                            'Creator': 'AeroDM'}) as pdf:
+        yield pdf
+
+
+@plt.rc_context({'font.family': 'serif', 'font.serif': ['DejaVu Serif'],
+                 'font.size': 9, 'axes.titlesize': 10, 'axes.labelsize': 9,
+                 'xtick.labelsize': 8, 'ytick.labelsize': 8,
+                 'axes.linewidth': 0.6, 'pdf.fonttype': 42,
+                 'mathtext.fontset': 'dejavuserif'})
+def plot_test_results(original, sampled_unguided_denorm, sampled_guided_denorm, history, target,
+                      obstacles=None, show_flag=True, step_idx=0,
+                      history_style=None, pred_style=None, style_names=None, pdf=None):
+    """Draw one publication-style page; append to the evaluation's shared PDF.
+
+    Direct calls without a writer save an individual PDF in output/pdf.
+    show_flag controls interactive display only; every page is saved.
     """
-    Plot test results including original, reconstructed (unguided), and guided samples.
-    Supports 3D, 2D projections, time-series plots, and style information display.
-    
-    Args:
-        original: Original trajectory (1, seq_len, state_dim)
-        sampled_unguided_denorm: Unguided sampled trajectory (1, seq_len, state_dim)
-        sampled_guided_denorm: Guided sampled trajectory (1, seq_len, state_dim)
-        history: History segment (1, history_len, state_dim)
-        target: Target waypoint (1, 3)
-        obstacles: List of obstacle dictionaries
-        show_flag: Whether to display plot or save to file
-        step_idx: Sample index for filename
-        history_style: Style index of history segment (int or tensor)
-        pred_style: Style index of prediction segment (int or tensor)
-        style_names: Dictionary mapping style indices to names
-    """
-    # Precompute all data at once to avoid repeated operations
-    original_pos = original[0, :, 1:4].detach().cpu().numpy()
-    reconstructed_pos = sampled_unguided_denorm[0, :, 1:4].detach().cpu().numpy()
-    sampled_pos = sampled_guided_denorm[0, :, 1:4].detach().cpu().numpy()
-    
-    # Extract speeds
-    original_speed = original[0, :, 0].detach().cpu().numpy()
-    reconstructed_speed = sampled_unguided_denorm[0, :, 0].detach().cpu().numpy()
-    sampled_speed = sampled_guided_denorm[0, :, 0].detach().cpu().numpy()
-    
-    time_steps = np.arange(len(original_pos))
-    history_pos = history[0, :, 1:4].detach().cpu().numpy() if history is not None else None
-    target_pos = target[0, :].detach().cpu().numpy() if target is not None else None
-    
-    # Process style information
-    history_style_name = "Unknown"
-    pred_style_name = "Unknown"
-    if style_names is not None:
+    def array(value):
+        return value.detach().cpu().numpy() if hasattr(value, 'detach') else np.asarray(value)
+
+    curves = [
+        (array(original)[0, :, 1:4], 'Reference', '#343A40', '--', 1.5),
+        (array(sampled_unguided_denorm)[0, :, 1:4], 'Unguided', '#C47735', '-.', 1.5),
+        (array(sampled_guided_denorm)[0, :, 1:4], 'Guided', '#187D95', '-', 1.9),
+    ]
+    if history is not None:
+        curves.insert(0, (array(history)[0, :, 1:4], 'History', '#827398', '-', 1.6))
+    target_pos = array(target)[0, :3] if target is not None else None
+    obstacle_color = '#C96F78'  # Muted rose, distinct from the trajectory colors
+    obstacle_edge = '#A34F5C'
+    spheres = [(array(o['center']), float(o['radius'])) for o in (obstacles or [])]
+    points = [c[0] for c in curves]
+    if target_pos is not None:
+        points.append(target_pos[None, :])
+    for center, radius in spheres:
+        points.extend([(center - radius)[None, :], (center + radius)[None, :]])
+    points = np.concatenate(points)
+    low, high = points.min(axis=0), points.max(axis=0)
+    center = (low + high) / 2
+    half = max(float(np.max(high - low)), 1.0) * 0.58
+    limits = [(c - half, c + half) for c in center]
+
+    fig = plt.figure(figsize=(11.7, 8.3), facecolor='white')
+    try:
+        fig.text(0.07, 0.95, f'Trajectory comparison | Sample {step_idx:03d}', fontsize=15)
+        def style_name(value):
+            idx = int(value.item()) if hasattr(value, 'item') else value
+            return str((style_names or {}).get(idx, f'Style {idx}')).replace('_', ' ')
+        subtitle = []
         if history_style is not None:
-            hist_idx = history_style.item() if hasattr(history_style, 'item') else history_style
-            history_style_name = style_names.get(hist_idx, f"Style_{hist_idx}")
+            subtitle.append('History: ' + style_name(history_style))
         if pred_style is not None:
-            pred_idx = pred_style.item() if hasattr(pred_style, 'item') else pred_style
-            pred_style_name = style_names.get(pred_idx, f"Style_{pred_idx}")
+            subtitle.append('Prediction: ' + style_name(pred_style))
+        fig.text(0.07, 0.915, '  |  '.join(subtitle), fontsize=9, color='#555555')
+        grid = fig.add_gridspec(2, 3, left=0.07, right=0.94, bottom=0.12,
+                               top=0.85, wspace=0.48, hspace=0.5)
+        ax3 = fig.add_subplot(grid[:, :2], projection='3d')
+        ax3.set_position([0.035, 0.22, 0.52, 0.59])
+        ax3.set_title('(a) Spatial trajectory', loc='left', pad=12)
+        ax3.set_proj_type('ortho')
+        ax3.view_init(elev=24, azim=-58)
+        for pos, label, color, ls, lw in curves:
+            ax3.plot(*pos.T, color=color, ls=ls, lw=lw)
+        u, v = np.mgrid[0:2*np.pi:24j, 0:np.pi:16j]
+        for c, r in spheres:
+            ax3.plot_surface(c[0]+r*np.cos(u)*np.sin(v), c[1]+r*np.sin(u)*np.sin(v),
+                             c[2]+r*np.cos(v), color=obstacle_color, alpha=0.26,
+                             linewidth=0, shade=False)
+        if target_pos is not None:
+            ax3.scatter(*target_pos, marker='*', s=100, color='#D6A42C',
+                        edgecolor='#51462E', linewidth=0.6, depthshade=False)
+        for axis, lim, label in zip((ax3.xaxis, ax3.yaxis, ax3.zaxis), limits, 'XYZ'):
+            axis.set_major_locator(MaxNLocator(4))
+            axis.pane.fill = False
+            axis._axinfo['grid'].update(color=(0.85, 0.87, 0.89, 0.6), linewidth=0.4)
+        ax3.set(xlim=limits[0], ylim=limits[1], zlim=limits[2],
+                xlabel='X (m)', ylabel='Y (m)', zlabel='Z (m)')
+        ax3.set_box_aspect((1, 1, 1))
+        # Three equal-sized projections in a dedicated right-hand column.
+        for k, (a, b, title) in enumerate([(0, 1, '(b) XY plane'),
+                                          (0, 2, '(c) XZ plane'),
+                                          (1, 2, '(d) YZ plane')]):
+            ax = fig.add_axes([0.66, 0.68 - k * 0.26, 0.25, 0.175])
+            for pos, label, color, ls, lw in curves:
+                ax.plot(pos[:, a], pos[:, b], color=color, ls=ls, lw=lw)
+            for c, r in spheres:
+                ax.add_patch(Circle((c[a], c[b]), r, facecolor=obstacle_color,
+                                    edgecolor=obstacle_edge, alpha=0.32, lw=0.6))
+            if target_pos is not None:
+                ax.scatter(target_pos[a], target_pos[b], marker='*', s=75,
+                           color='#D6A42C', edgecolor='#51462E', linewidth=0.6, zorder=5)
+            ax.set(xlim=limits[a], ylim=limits[b], xlabel='XYZ'[a]+' (m)',
+                   ylabel='XYZ'[b]+' (m)')
+            ax.set_aspect('equal', adjustable='box')
+            ax.set_title(title, loc='left', pad=5)
+            ax.spines[['top', 'right']].set_visible(False)
+            ax.grid(color='#DEE2E6', lw=0.5, alpha=0.7)
+            ax.set_axisbelow(True)
+            ax.xaxis.set_major_locator(MaxNLocator(4))
+            ax.yaxis.set_major_locator(MaxNLocator(4))
+        handles = [Line2D([], [], color=c, ls=ls, lw=lw, label=label)
+                   for _, label, c, ls, lw in curves]
+        if target_pos is not None:
+            handles.append(Line2D([], [], marker='*', color='#D6A42C', ls='',
+                                  markersize=10, markeredgecolor='#51462E', label='Target'))
+        if spheres:
+            handles.append(Patch(facecolor=obstacle_color, edgecolor=obstacle_edge,
+                                 alpha=0.32, label='Obstacle'))
+        fig.legend(handles=handles, loc='lower center', bbox_to_anchor=(0.5, 0.035),
+                   ncol=len(handles), frameon=False, handlelength=2.7, columnspacing=1.7)
+        if pdf is not None:
+            pdf.savefig(fig, facecolor='white')
+        else:
+            os.makedirs('output/pdf', exist_ok=True)
+            fig.savefig(f'output/pdf/test_sample_{step_idx:03d}_results.pdf', facecolor='white')
+        if show_flag:
+            plt.show()
+    finally:
+        plt.close(fig)
 
-    # Create figure with optimized layout (added one more subplot for style info)
-    fig = plt.figure(figsize=(24, 18))
-    
-    # Main title with style information
-    title_text = f'AeroTrajGen Trajectory Generation Results (Test Sample {step_idx})'
-    if history_style is not None or pred_style is not None:
-        title_text += f'\nHistory Style: {history_style_name} | Prediction Style: {pred_style_name}'
-    fig.suptitle(title_text, fontsize=16, fontweight='bold', y=0.98)
-    
-    # Define consistent styling
-    STYLES = {
-        'history': {'color': 'magenta', 'linewidth': 2, 'alpha': 0.8, 'marker': 'o', 'markersize': 3},
-        'original': {'color': 'blue', 'linewidth': 2, 'alpha': 0.9},
-        'reconstructed': {'color': 'red', 'linewidth': 1.5, 'alpha': 0.8, 'linestyle': '-.', 'marker': '.'},
-        'sampled': {'color': 'green', 'linewidth': 1.5, 'alpha': 0.8, 'linestyle': '-.', 'marker': '.'},
-        'target': {'color': 'yellow', 's': 200, 'marker': '*', 'edgecolors': 'black', 'linewidth': 1}
-    }
-
-    # 1. 3D trajectory plot
-    ax1 = fig.add_subplot(241, projection='3d')
-    plot_3d_trajectory(ax1, original_pos, reconstructed_pos, sampled_pos, history_pos, target_pos, obstacles, STYLES)
-    
-    # 2-4. 2D Projections
-    projections = [
-        (242, 'X-Y Projection', 0, 1, 'X', 'Y'),
-        (243, 'X-Z Projection', 0, 2, 'X', 'Z'), 
-        (244, 'Y-Z Projection', 1, 2, 'Y', 'Z')
-    ]
-    
-    for subplot_idx, title, dim1, dim2, xlabel, ylabel in projections:
-        ax = fig.add_subplot(subplot_idx)
-        plot_2d_projection(ax, original_pos, reconstructed_pos, sampled_pos, history_pos, 
-                          target_pos, obstacles, STYLES, dim1, dim2, title, xlabel, ylabel)
-
-    # 5-7. Position over time
-    positions = [
-        (245, 'X Position Over Time', 0, 'X Position'),
-        (246, 'Y Position Over Time', 1, 'Y Position'), 
-        (247, 'Z Position Over Time', 2, 'Z Position')
-    ]
-    
-    for subplot_idx, title, dim, ylabel in positions:
-        ax = fig.add_subplot(subplot_idx)
-        plot_position_time(ax, time_steps, original_pos, reconstructed_pos, sampled_pos, 
-                          history_pos, dim, title, ylabel, STYLES)
-
-    # 8. Speed comparison
-    ax8 = fig.add_subplot(248)
-    plot_speed_comparison(ax8, time_steps, original_speed, reconstructed_speed, sampled_speed, STYLES)
-
-    # # 9. Error analysis
-    # ax9 = fig.add_subplot(349)
-    # plot_error_analysis(ax9, time_steps, original_pos, reconstructed_pos, sampled_pos)
-    
-    # # 10. Style information display
-    # ax10 = fig.add_subplot(3, 4, 10)
-    # plot_style_information(ax10, history_style_name, pred_style_name, style_names, 
-    #                        history_pos, original_pos, history_style, pred_style)
-    
-    # # 11. Trajectory statistics
-    # ax11 = fig.add_subplot(3, 4, 11)
-    # plot_trajectory_statistics(ax11, original_pos, reconstructed_pos, sampled_pos)
-    
-    # # 12. Style distribution or additional info
-    # ax12 = fig.add_subplot(3, 4, 12)
-    # plot_connection_info(ax12, history_pos, original_pos, history_len=history_pos.shape[0] if history_pos is not None else 0)
-
-    plt.tight_layout(rect=[0, 0.02, 1, 0.94])
-    
-    if show_flag:
-        plt.show()
-    else:
-        filename = f"Figs/test_sample_{step_idx:03d}_results.svg"
-        plt.savefig(filename, format='svg', bbox_inches='tight', dpi=300)
-        plt.close()
 
 def plot_style_information(ax, history_style_name, pred_style_name, style_names, 
                            history_pos, original_pos, history_style, pred_style):
@@ -3660,7 +3578,7 @@ if __name__ == "__main__":
         
         if os.path.exists(model_path):
             print(f"Loading model from: {model_path}")
-            checkpoint = torch.load(model_path, map_location=device)
+            checkpoint = torch.load(model_path, map_location=device, weights_only=False)
             
             # Load model state
             model.load_state_dict(checkpoint['model_state_dict'])
