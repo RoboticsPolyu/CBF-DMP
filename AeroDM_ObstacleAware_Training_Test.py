@@ -70,11 +70,12 @@ class Config:
 
     last_xyz_weight=50.0 # Extra weight for final timestep's position error
     xyz_weight=1.0 # Extra weight for Z-axis (height) in aviation
-    vel_weight=1.0 # Weight for velocity term
+    vel_weight=0.0 # Weight for velocity term
     other_weight=1.0 # Weight for other losses
     obstacle_weight=1.0 # Weight for obstacle term
     continuity_weight=5.0 # Weight for continuity term
     acc_weight=1.0 # Weight for acceleration term
+    kinematics_weight=10.0 # Weight for kinematic position consistency
     delta_T = 0.1 # Time step duration (0.1s for 10Hz control frequency)
 
     drop_style_prob = 0.1  # Probability of dropping style information during training for robustness
@@ -92,7 +93,7 @@ class Config:
     
     # Model save/load paths
     model_save_dir = "model"
-    model_filename = "aerodm_v2_test_2026_oct_01.pth"  # Base name (timestamp will be added when saving)
+    model_filename = "aerodm_v2_test_2026_oct_04.pth"  # Base name (timestamp will be added when saving)
     # model_filename = "aerodm_v2_test_23styles.pth"  # Base name (timestamp will be added when saving) 2026-Jul-30 good model
 
 # Transformer positional encoding
@@ -1065,10 +1066,10 @@ class AeroDMLoss(nn.Module):
     """
     Unified loss function for AeroDM training.
     Combines position, velocity, speed, attitude, and optional obstacle avoidance losses.
-    Supports switching obstacle term via flag; always returns 4 values for consistency.
+    Supports switching obstacle term via flag; always returns 5 values for consistency.
     Fixes: Proper safety margin for obstacles, Z-weighting, normalization by avg obstacles.
     """
-    def __init__(self, config, enable_obstacle_term=False, safe_extra_factor=0.2, last_xyz_weight=1.5, xyz_weight=1.5, vel_weight=1.0, other_weight=1.0, obstacle_weight=10.0, continuity_weight=15.0, acc_weight=1.0):
+    def __init__(self, config, enable_obstacle_term=False, safe_extra_factor=0.2, last_xyz_weight=1.5, xyz_weight=1.5, vel_weight=1.0, other_weight=1.0, obstacle_weight=10.0, continuity_weight=15.0, acc_weight=1.0, kinematics_weight=1.0):
         super().__init__()
         self.config = config
         # Flag to enable/disable obstacle distance penalty in total loss
@@ -1089,6 +1090,9 @@ class AeroDMLoss(nn.Module):
         self.continuity_weight = continuity_weight
         # Weight for acceleration loss
         self.acc_weight = acc_weight
+        self.kinematics_weight = kinematics_weight
+        if config.delta_T <= 0:
+            raise ValueError("delta_T must be positive")
         # Base MSE loss for all components
         self.mse_loss = nn.MSELoss()
     
@@ -1157,7 +1161,7 @@ class AeroDMLoss(nn.Module):
         - position_loss: Weighted MSE on positions (Z higher, last point x10).
         - vel_loss: MSE on velocity diffs. 
         - obstacle_loss: 0 if disabled/no obs.
-        - total: 2.0*position + 1.5*vel + other (speed + attitude) + obstacle_weight*obstacle.
+        - total: Weighted sum including acceleration smoothness and kinematic consistency.
         Handles seq_len <=1 for vel (returns 0).
         """
         batch_size, seq_len, state_dim = pred_trajectory.shape
@@ -1197,6 +1201,7 @@ class AeroDMLoss(nn.Module):
             # No velocity if single timestep
             vel_loss = torch.tensor(0.0, device=device)
         
+        acc_smoothness = pred_trajectory.new_zeros(())
         if seq_len >= 3:
             # vel = (B, T-1, 3)
             vel = pred_pos[:, 1:, :] - pred_pos[:, :-1, :]
@@ -1224,8 +1229,34 @@ class AeroDMLoss(nn.Module):
             predicted_displacement = pred_trajectory[:, 0, 1:4] - last_history_pos
             continuity_loss = self.mse_loss(predicted_displacement, history_displacement)
         
+        # p_t = p_{t-1} + v_{t-1}*dt + 0.5*a*dt^2,
+        # where interval acceleration a = (v_t - v_{t-1}) / dt.
+        states = pred_trajectory
+        if history is not None and history.size(1) > 0:
+            states = torch.cat((history[:, -1:, :], states), dim=1)
+        kinematics_loss = pred_trajectory.new_zeros(())
+        if states.size(1) > 1:
+            if (mean is None) != (std is None):
+                raise ValueError("mean and std must be supplied together")
+            physical_states = states
+            position_scale = 1.0
+            if mean is not None:
+                state_mean = torch.as_tensor(mean, device=device, dtype=states.dtype)[..., :state_dim]
+                state_std = torch.as_tensor(std, device=device, dtype=states.dtype)[..., :state_dim]
+                physical_states = states * state_std + state_mean
+                position_scale = state_std[..., 1:4].clamp_min(1e-8)
+            positions = physical_states[..., 1:4]
+            velocities = physical_states[..., 4:7]
+            dt = self.config.delta_T
+            acceleration = (velocities[:, 1:] - velocities[:, :-1]) / dt
+            expected_positions = (positions[:, :-1] + velocities[:, :-1] * dt
+                                  + 0.5 * acceleration * dt ** 2)
+            # Normalize physical residuals to match the position loss scale.
+            residual = (positions[:, 1:] - expected_positions) / position_scale
+            kinematics_loss = residual.square().mean()
+
         # Total weighted loss
-        total_loss = self.last_xyz_weight * last_xyz_loss + self.xyz_weight * position_loss + self.vel_weight * vel_loss + self.other_weight * other_loss + self.obstacle_weight * obstacle_loss + self.continuity_weight * continuity_loss + self.acc_weight * acc_smoothness
+        total_loss = self.last_xyz_weight * last_xyz_loss + self.xyz_weight * position_loss + self.vel_weight * vel_loss + self.other_weight * other_loss + self.obstacle_weight * obstacle_loss + self.continuity_weight * continuity_loss + self.acc_weight * acc_smoothness + self.kinematics_weight * kinematics_loss
         
         return total_loss, position_loss, vel_loss, obstacle_loss, continuity_loss
 
@@ -1423,6 +1454,41 @@ def plot_trajectories_demo(demo_trajectories, rows=3, cols=6):
     plt.show()
 
 # Helper functions for modular plotting
+def prediction_collision_mask(positions, obstacles):
+    """Point collisions in physical 3D coordinates, matching evaluation metrics."""
+    positions = np.asarray(positions)
+    mask = np.zeros(len(positions), dtype=bool)
+    for obstacle in obstacles or []:
+        center = obstacle['center']
+        if hasattr(center, 'detach'):
+            center = center.detach().cpu().numpy()
+        radius = float(obstacle['radius'])
+        mask |= np.linalg.norm(positions - np.asarray(center), axis=-1) < radius
+    return mask
+
+
+def plot_prediction_points(ax, positions, obstacles, color, dims=(0, 1, 2), trajectory_label='Unguided'):
+    """Overlay prediction samples and highlight actual 3D collisions in any view."""
+    positions = np.asarray(positions)
+    is_3d = len(dims) == 3
+    extra = {'depthshade': False} if is_3d else {}
+    if is_3d:
+        # Keep collision markers visible through translucent obstacle surfaces.
+        ax.computed_zorder = False
+    ax.scatter(*(positions[:, d] for d in dims), s=9, color=color,
+               marker='o', zorder=6, **extra)
+    mask = prediction_collision_mask(positions, obstacles)
+    if mask.any():
+        label = f'{trajectory_label} collision'
+        if label in ax.get_legend_handles_labels()[1]:
+            label = '_nolegend_'
+        collision_style = ({'marker': 'D', 'facecolors': 'none', 'edgecolors': '#8E44AD'}
+                           if trajectory_label == 'Guided'
+                           else {'marker': 'x', 'color': '#D62728'})
+        ax.scatter(*(positions[mask, d] for d in dims), s=42,
+                   linewidths=1.5, label=label, zorder=10, **collision_style, **extra)
+
+
 def plot_3d_trajectory(ax, original_pos, reconstructed_pos, sampled_pos, history_pos, target_pos, obstacles, styles, bounds=None):
     """Plot 3D trajectory with obstacles"""
         # Plot trajectories
@@ -1436,6 +1502,9 @@ def plot_3d_trajectory(ax, original_pos, reconstructed_pos, sampled_pos, history
     ax.plot(sampled_pos[:, 0], sampled_pos[:, 1], sampled_pos[:, 2], 
             label='Guided', **styles['sampled'])
     
+    plot_prediction_points(ax, reconstructed_pos, obstacles, styles['reconstructed'].get('color', 'C1'), (0, 1, 2))
+    plot_prediction_points(ax, sampled_pos, obstacles, styles['sampled'].get('color', 'C2'), (0, 1, 2), trajectory_label='Guided')
+
     # Plot target
     if target_pos is not None:
         ax.scatter(target_pos[0], target_pos[1], target_pos[2], 
@@ -1524,6 +1593,9 @@ def plot_2d_projection(ax, original_pos, reconstructed_pos, sampled_pos, history
     ax.plot(sampled_pos[:, dim1], sampled_pos[:, dim2], 
             label='Sampled Guided', **styles['sampled'])
     
+    plot_prediction_points(ax, reconstructed_pos, obstacles, styles['reconstructed'].get('color', 'C1'), (dim1, dim2))
+    plot_prediction_points(ax, sampled_pos, obstacles, styles['sampled'].get('color', 'C2'), (dim1, dim2), trajectory_label='Guided')
+
     # Plot target
     if target_pos is not None:
         ax.scatter(target_pos[dim1], target_pos[dim2], 
@@ -2112,6 +2184,7 @@ def config_to_string(config):
     lines.append(f"  obstacle_weight: {config.obstacle_weight}")
     lines.append(f"  continuity_weight: {config.continuity_weight}")
     lines.append(f"  acc_weight: {config.acc_weight}")
+    lines.append(f"  kinematics_weight: {config.kinematics_weight}")
     lines.append("")
     lines.append(f"Other Parameters:")
     lines.append(f"  delta_T: {config.delta_T}")
@@ -2499,6 +2572,9 @@ def plot_combined_trajectories(combined_cases, show_flag=True):
         ax.plot(case['guided'][:, 0], case['guided'][:, 1], case['guided'][:, 2],
                color=GUIDED_COLOR, linewidth=1.5, alpha=0.8, linestyle='-', marker='o', markersize=2, label='CBF Guided')
         
+        plot_prediction_points(ax, case['unguided'], case['obstacles'], UNGUIDED_COLOR)
+        plot_prediction_points(ax, case['guided'], case['obstacles'], GUIDED_COLOR, trajectory_label='Guided')
+
         # # Mark start and end points of guided trajectory
         # ax.scatter(case['guided'][0, 0], case['guided'][0, 1], case['guided'][0, 2],
         #           color=GUIDED_COLOR, s=60, marker='^', edgecolors='black', alpha=0.9, label='Start')
@@ -2542,7 +2618,7 @@ def plot_combined_trajectories(combined_cases, show_flag=True):
         
         # Set equal aspect ratio for better visualization (approximate)
         # Get bounds from all trajectories in this subplot
-        all_points = np.vstack([case['original'], case['guided']])
+        all_points = np.vstack([case['original'], case['unguided'], case['guided']])
         if case['history'] is not None:
             all_points = np.vstack([all_points, case['history']])
         
@@ -3064,6 +3140,8 @@ def plot_test_results(original, sampled_unguided_denorm, sampled_guided_denorm, 
         ax3.view_init(elev=24, azim=-58)
         for pos, label, color, ls, lw in curves:
             ax3.plot(*pos.T, color=color, ls=ls, lw=lw)
+            if label in ('Unguided', 'Guided'):
+                plot_prediction_points(ax3, pos, obstacles, color, trajectory_label=label)
         u, v = np.mgrid[0:2*np.pi:24j, 0:np.pi:16j]
         for c, r in spheres:
             ax3.plot_surface(c[0]+r*np.cos(u)*np.sin(v), c[1]+r*np.sin(u)*np.sin(v),
@@ -3086,6 +3164,8 @@ def plot_test_results(original, sampled_unguided_denorm, sampled_guided_denorm, 
             ax = fig.add_axes([0.66, 0.68 - k * 0.26, 0.25, 0.175])
             for pos, label, color, ls, lw in curves:
                 ax.plot(pos[:, a], pos[:, b], color=color, ls=ls, lw=lw)
+                if label in ('Unguided', 'Guided'):
+                    plot_prediction_points(ax, pos, obstacles, color, (a, b), trajectory_label=label)
             for c, r in spheres:
                 ax.add_patch(Circle((c[a], c[b]), r, facecolor=obstacle_color,
                                     edgecolor=obstacle_edge, alpha=0.32, lw=0.6))
@@ -3101,7 +3181,8 @@ def plot_test_results(original, sampled_unguided_denorm, sampled_guided_denorm, 
             ax.set_axisbelow(True)
             ax.xaxis.set_major_locator(MaxNLocator(4))
             ax.yaxis.set_major_locator(MaxNLocator(4))
-        handles = [Line2D([], [], color=c, ls=ls, lw=lw, label=label)
+        handles = [Line2D([], [], color=c, ls=ls, lw=lw, label=label,
+                          marker='o' if label in ('Unguided', 'Guided') else None, markersize=3)
                    for _, label, c, ls, lw in curves]
         if target_pos is not None:
             handles.append(Line2D([], [], marker='*', color='#D6A42C', ls='',
@@ -3109,8 +3190,15 @@ def plot_test_results(original, sampled_unguided_denorm, sampled_guided_denorm, 
         if spheres:
             handles.append(Patch(facecolor=obstacle_color, edgecolor=obstacle_edge,
                                  alpha=0.32, label='Obstacle'))
+        for pos, label, *_ in curves:
+            if label in ('Unguided', 'Guided') and prediction_collision_mask(pos, obstacles).any():
+                guided = label == 'Guided'
+                handles.append(Line2D([], [], marker='D' if guided else 'x',
+                                      color='#8E44AD' if guided else '#D62728',
+                                      markerfacecolor='none', ls='', markersize=7,
+                                      label=f'{label} collision'))
         fig.legend(handles=handles, loc='lower center', bbox_to_anchor=(0.5, 0.035),
-                   ncol=len(handles), frameon=False, handlelength=2.7, columnspacing=1.7)
+                   ncol=min(4, len(handles)), frameon=False, handlelength=2.7, columnspacing=1.7)
         if pdf is not None:
             pdf.savefig(fig, facecolor='white')
         else:
@@ -3363,7 +3451,8 @@ if __name__ == "__main__":
         other_weight=config.other_weight,
         obstacle_weight=config.obstacle_weight,
         continuity_weight=config.continuity_weight,
-        acc_weight=config.acc_weight
+        acc_weight=config.acc_weight,
+        kinematics_weight=config.kinematics_weight
     )
 
     print(f"Using AeroDMLoss (obstacle term: {config.use_obstacle_loss})")
