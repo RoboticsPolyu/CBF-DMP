@@ -1,9 +1,19 @@
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.stats import norm
+from scipy.special import expit
+from pathlib import Path
 
-plt.rcParams['font.family'] = 'Times New Roman'
-plt.rcParams['font.size'] = 9
+# Portable publication style; individual figures use a local rc_context.
+PLOT_STYLE = {
+    'font.family': 'DejaVu Sans', 'font.size': 10,
+    'axes.labelsize': 11, 'axes.titlesize': 12,
+    'axes.spines.top': False, 'axes.spines.right': False,
+    'axes.edgecolor': '#98A2B3', 'axes.labelcolor': '#344054',
+    'xtick.color': '#475467', 'ytick.color': '#475467',
+    'grid.color': '#D0D5DD', 'grid.alpha': 0.45,
+    'pdf.fonttype': 42, 'ps.fonttype': 42,
+}
 
 class ExponentialBarrierSafety:
     """
@@ -364,138 +374,57 @@ class ExponentialBarrierSafety:
         
         return X, Y, P1, P2, P3, B1
     
-    def compare_with_normal_cdf(self):
-        """Compare exp(-b(x)) with normal CDF Φ(z) approach"""
-        
-        # Parameters for comparison
-        safety_radius = 1.0 + self.robot_radius
-        
-        # Distance values
-        distances = np.linspace(0, 2* safety_radius, 500)
-        
-        sigma = 0.5  # Uncertainty parameter
-        # 1. Exponential barrier function (type 1)
-        exp_probs = []
-        for d in distances:
-            # Simplified: b = (safety_radius)² / (d² + ε)
-            b = (safety_radius**2) / (d**2 + self.epsilon)
-            exp_probs.append(np.exp(- b/sigma))
-        
-        # 2. Normal CDF approach
-        # Assume: z = (d² - safety_radius²) / σ
-        
-        cdf_probs = []
-        for d in distances:
-            h = d**2 - safety_radius**2  # CBF function h(x)
-            z = h / sigma
-            cdf_probs.append(norm.cdf(z))
-        
-        # 3. Hybrid approach: exp of something else
-        hybrid_probs = []
-        for d in distances:
-            h = d**2 - safety_radius**2
-            # Softplus-like: exp(-log(1 + exp(-h/σ)))
-            hybrid_probs.append(1.0 / (1.0 + np.exp(-h/sigma)))
-        
-        exp_probs_max = []
-        for d in distances:
-            # Simplified: b = (safety_radius)² / (d² + ε)
-            b = - (d**2) + (safety_radius**2)
-            if b < 0:
-                 b = 0
-            exp_probs_max.append(np.exp(- b/sigma))
-        exp_probs_inv = []
-        for d in distances:
-            # Simplified: b = (safety_radius)² / (d² + ε)
-            b = 1/d - 1/safety_radius
-            # if b < 0:
-            #     b = 0
-            exp_probs_inv.append(np.exp(- b/sigma))
+    def compare_with_normal_cdf(self, show=True, output_dir=None):
+        """Plot the original three curves in a compact paper-ready panel.
 
-        # Plot comparison
-        plt.figure(figsize=(4.3, 3.1))
-        
-        # plt.plot(distances, exp_probs, 'b-', linewidth=2, 
-        #         label=f'exp(-b(x)/σ), b=(R+r)²/(d²+ε)')
-        # plt.plot(distances, exp_probs_max, 'r:', linewidth=1.5, 
-        #         label=f'exp(-b(x)/σ), b=(R+r)² - d²')
-        # plt.plot(distances, exp_probs_inv, color='black', linestyle='--', linewidth=1.5, 
-        #         label=f'exp(-b(x)/σ), b=1/d - 1/(R+r)')
-        # plt.plot(distances, cdf_probs, 'b-,', linewidth=1.5, 
-        #         label=f'Φ(z), z=(d²-(R+r)²)/σ')
-        # plt.plot(distances, hybrid_probs, 'g-.', linewidth=1.5, 
-        #         label=f'1/(1+exp(-h/σ)), h=d²-(R+r)²')
-        
-        plt.plot(distances, exp_probs_max, 'r-', linewidth=1.5, 
-                label=r'P1')
-        # plt.plot(distances, exp_probs_inv, color='black', linestyle='--', linewidth=1.5, 
-        #         label=r'$P_2(d)$')
-        plt.plot(distances, cdf_probs, 'b-,', linewidth=1.5, 
-                label=r'CDF')
-        plt.plot(distances, hybrid_probs, 'g-.', linewidth=1.5, 
-                label=r'logistic')
-        # plt.plot(distances, exp_probs, 'b-', linewidth=2)
-        # plt.plot(distances, exp_probs_max, 'r-', linewidth=2)
-        # plt.plot(distances, exp_probs_inv, color='black', linestyle='--', linewidth=2)
-        # plt.plot(distances, cdf_probs, 'r--', linewidth=2)
-        # plt.plot(distances, hybrid_probs, 'g-.', linewidth=2)
-        
-        # Mark safety boundary
-        plt.axvline(x=safety_radius, color='k', linestyle='--', alpha=0.7,
-                   label=f'Safety boundary')
-        plt.axhline(y=0.5, color='k', linestyle=':', alpha=0.5)
-        
-        # Fill obstacle region
-        plt.axvspan(0, safety_radius, alpha=0.1, color='red', label='Obstacle region')
-        
-        plt.xlabel('Distance to obstacle center (m)')
-        plt.ylabel('Safety Probability')
-        plt.title('Comparison: exp(-b(x)) vs Normal CDF vs Logistic Approaches')
-        plt.legend()
-        plt.grid(True, alpha=0.3)
-        plt.ylim(-0.05, 1.05)
-        
-        plt.tight_layout()
-        plt.savefig('expBarrierFunc/expBarrier_vs_NormalCDF_Comparison.pdf', dpi=300)
-        plt.show()
-        
-        # Analyze properties
-        print("\n" + "="*70)
-        print("PROPERTY COMPARISON AT BOUNDARY (d = R+r):")
-        print("="*70)
-        
-        d_boundary = safety_radius
-        
-        # Exponential barrier at boundary
-        b_boundary = (safety_radius**2) / (d_boundary**2 + self.epsilon)
-        p_exp_boundary = np.exp(-self.scale * b_boundary)
-        
-        # Normal CDF at boundary
-        h_boundary = d_boundary**2 - safety_radius**2
-        z_boundary = h_boundary / sigma
-        p_cdf_boundary = norm.cdf(z_boundary)
-        
-        # Hybrid at boundary
-        p_hybrid_boundary = 1.0 / (1.0 + np.exp(-h_boundary/sigma))
-        
-        print(f"\nExponential barrier:")
-        print(f"  b(d=R+r) = {b_boundary:.4f}")
-        print(f"  P(d=R+r) = exp(-{self.scale}×{b_boundary:.4f}) = {p_exp_boundary:.4f}")
-        
-        print(f"\nNormal CDF:")
-        print(f"  h(d=R+r) = {h_boundary:.4f}")
-        print(f"  z = {h_boundary:.4f}/{sigma:.4f} = {z_boundary:.4f}")
-        print(f"  P(d=R+r) = Φ({z_boundary:.4f}) = {p_cdf_boundary:.4f}")
-        
-        print(f"\nLogistic (hybrid):")
-        print(f"  P(d=R+r) = 1/(1+exp(-{h_boundary:.4f}/{sigma:.4f})) = {p_hybrid_boundary:.4f}")
-        
-        print("\nKey insights:")
-        print("1. exp(-b(x)): Boundary probability ≠ 0.5 (depends on parameters)")
-        print("2. Φ(z): Boundary probability = 0.5 (by construction when h=0)")
-        print("3. Logistic: Similar to Φ but computationally simpler")
-        
-        return distances, exp_probs, cdf_probs, hybrid_probs
+        Save vector PDF and 300-dpi PNG next to this script by default.
+        The return tuple retains the original reciprocal-exponential values.
+        """
+        safety_radius = 1.0 + self.robot_radius
+        sigma = 0.5
+        distances = np.linspace(0, 2 * safety_radius, 500)
+        h = distances**2 - safety_radius**2
+        exp_probs = np.exp(-safety_radius**2 / (distances**2 + self.epsilon) / sigma)
+        exp_probs_max = np.exp(-np.maximum(-h, 0) / sigma)
+        cdf_probs = norm.cdf(h / sigma)
+        hybrid_probs = expit(h / sigma)
+        colors = ['#C46732', '#3467A1', '#228575']
+        curves = [exp_probs_max, cdf_probs, hybrid_probs]
+        labels = ['Exponential', 'Normal CDF', 'Logistic']
+        linestyles = ['-', '--', '-.']
+        output_dir = Path(output_dir) if output_dir is not None else Path(__file__).resolve().parent
+        output_dir.mkdir(parents=True, exist_ok=True)
+        stem = output_dir / 'expBarrier_vs_NormalCDF_Comparison'
+
+        paper_style = dict(PLOT_STYLE, **{
+            'font.family': 'DejaVu Serif', 'mathtext.fontset': 'dejavuserif',
+            'font.size': 8, 'axes.labelsize': 9,
+            'xtick.labelsize': 8, 'ytick.labelsize': 8,
+            'axes.labelcolor': 'black', 'xtick.color': 'black', 'ytick.color': 'black',
+            'axes.edgecolor': '#555555',
+        })
+        with plt.rc_context(paper_style):
+            fig, ax = plt.subplots(figsize=(3.5, 2.6), layout='constrained')
+            ax.set_axisbelow(True)
+            ax.grid(True, linewidth=0.4, alpha=0.3)
+            ax.axvline(safety_radius, color='#777777', ls=':', lw=1)
+            ax.text(safety_radius + 0.035, 0.12, r'$R_s$', color='#555555', fontsize=8)
+            for values, color, style, label in zip(curves, colors, linestyles, labels):
+                ax.plot(distances, values, color=color, ls=style, lw=1.6, label=label)
+            ax.set(xlim=(0, 2 * safety_radius), ylim=(-0.02, 1.04),
+                   xlabel=r'Distance $d$ (m)', ylabel='Safety probability')
+            ax.set_yticks(np.linspace(0, 1, 5))
+            ax.tick_params(direction='out', length=3, width=0.6)
+            ax.legend(loc='upper left', frameon=False, fontsize=8, handlelength=2.5)
+            fig.savefig(stem.with_suffix('.pdf'), facecolor='white')
+            fig.savefig(stem.with_suffix('.png'), dpi=300, facecolor='white')
+            if show:
+                plt.show()
+            plt.close(fig)
+
+        print(f"Saved comparison: {stem.with_suffix('.pdf')}")
+        print('At d = R_s: clipped exponential = 1.0; Normal CDF = logistic = 0.5')
+        return distances, exp_probs.tolist(), cdf_probs.tolist(), hybrid_probs.tolist()
 
 if __name__ == "__main__":
     print("="*70)

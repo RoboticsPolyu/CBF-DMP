@@ -29,10 +29,11 @@ from Test.distribute_trajectories import generate_distributed_trajectories
 # Configuration parameters based on the paper
 class Config:
     # Training parameters
+    seed = 42  # NumPy data generation and PyTorch initialization / sampling
     num_epochs = 100
-    batch_size = 32
+    batch_size = 16
     _base_num_trajectories = 25000 # Base number of trajectories before augmentation (will be increased by concatenation)
-    test_batch_size = 8  # Evaluation batch size; 1 restores serial sampling
+    test_batch_size = 16  # Evaluation batch size; 1 restores serial sampling
     num_test_samples = 200
 
     # Model dimensions
@@ -51,24 +52,28 @@ class Config:
     seq_len = 60  # N_a = 60 time steps; 6s-long future trajectory sequence
     state_dim = 10  # x_i ∈ R^10: p(3) + v(3) + r(4) + style(1) = 11, but we will use 10 by excluding style from the state vector and handling it as a condition
     history_len = 20  # 20-frame historical observations
+    trajectory_length_multiplier = 1.2 # 2.0  # Generate longer source trajectories
+    train_window_stride = 5  # Fixed sliding-window step in frames
 
     # Condition dimensions
     target_dim = 4  # p_t ∈ R^3 + valid flag (1)
-    action_dim = len(MANEUVER_STYLES)  # 23 maneuver styles
+    action_dim = len(MANEUVER_STYLES)  # Includes straight_line for completed maneuver tails
 
     # Obstacle parameters
     max_obstacles = 10  # Maximum number of obstacles to process
+    num_obstacles_range = (3, 5)  # Inclusive minimum/maximum obstacle count
+    obstacle_radius_range = (0.5, 1.0)  # Sphere radius range in meters
     obstacle_feat_dim = 4  # [x, y, z, radius]
     enable_obstacle_encoding = False  # Toggle obstacle encoding in the model
     use_obstacle_loss = enable_obstacle_encoding  # Toggle obstacle loss term in training
 
     # CBF Guidance parameters (from CoDiG paper)
     # enable_cbf_guidance = True  # Disabled by default; toggle for inference
-    guidance_gamma = 1.0  # Barrier guidance strength (0 to 1); internally scaled by 4000
-    safe_extra_factor=0.20 # Safety buffer as fraction of radius (e.g., 20%)
-    barrier_sigma = 0.4 # Smoothness parameter for logistic barrier function (tune for best results)
+    guidance_gamma = 1.2  # Barrier guidance strength (0 to 1); internally scaled by 4000
+    safety_margin = 0.0  # Absolute buffer in meters; shared by guidance, loss and collision checks
+    barrier_sigma = 0.35 # Smoothness parameter for logistic barrier function (tune for best results)
 
-    last_xyz_weight=50.0 # Extra weight for final timestep's position error
+    last_xyz_weight=100.0 # Extra weight for final timestep's position error
     xyz_weight=1.0 # Extra weight for Z-axis (height) in aviation
     vel_weight=0.0 # Weight for velocity term
     other_weight=1.0 # Weight for other losses
@@ -82,19 +87,28 @@ class Config:
     drop_target_prob = 0.1  # Probability of dropping target waypoint information during training for robustness    
     guidance_scale = 2.0  # Classifier-free guidance scale for sampling (tune for best results)
 
+    # Test
+    target_random_offset_bound = 1.0
+    maneuver_duration = 16.0  # Duration of the maneuver in seconds (for generating test trajectories)
     # Plotting control
     plot_guidance_steps = False  # Plot physical barrier correction at every guided diffusion step
     enable_test_plots = True  # Disable evaluation plots and image saving for benchmarking
     show_flag = False  # Display sample figures as well as saving the PDF when True
-    test_results_pdf = "output/pdf/test_samples_results.pdf"
-
+    test_results_pdf = "output/pdf/test_samples_results_aerodm_v2_test_2026_oct_12_decoder.pdf"
+    
     # Training control flag
     train_model = False  # Set to True to train, False to load existing model
     
     # Model save/load paths
     model_save_dir = "model"
-    model_filename = "aerodm_v2_test_2026_oct_04.pth"  # Base name (timestamp will be added when saving)
-    # model_filename = "aerodm_v2_test_23styles.pth"  # Base name (timestamp will be added when saving) 2026-Jul-30 good model
+    model_filename = "aerodm_v2_test_2026_oct_12_decoder.pth"  # Base name (timestamp will be added when saving)
+    # model_filename = "aerodm_v2_test_23styles.pth"  # Base name (timestamp will be added when saving) 2026-Jul-30 good model 
+
+def set_random_seed(seed):
+    """Seed NumPy and PyTorch before generating data or constructing the model."""
+    np.random.seed(seed)
+    torch.manual_seed(seed)  # Seeds CPU and accelerator generators.
+
 
 # Transformer positional encoding
 class PositionalEncoding(nn.Module):
@@ -438,12 +452,12 @@ class ObstacleAwareDiffusionTransformer(nn.Module):
             nhead=config.num_heads,
             dim_feedforward=config.latent_dim * 4,
             dropout=config.dropout,
-            batch_first=True
+            batch_first=True,
         )
         self.transformer = nn.TransformerDecoder(
             transformer_layer, num_layers=config.num_layers
         )
-        
+
         # Output projection
         self.output_proj = nn.Linear(config.latent_dim, config.state_dim)
 
@@ -505,9 +519,9 @@ class ObstacleAwareDiffusionTransformer(nn.Module):
             tgt=transformer_input,
             memory=transformer_input,
             tgt_mask=memory_mask,
-            memory_mask=memory_mask
+            memory_mask=memory_mask,
         )
-        
+
         # Extract current sequence part (exclude history data)
         if history is not None:
             current_output = transformer_output[:, -seq_len:, :]
@@ -525,11 +539,12 @@ class ObstacleAwareDiffusionTransformer(nn.Module):
         return mask
 
 # Barrier Function Computation for Multiple Obstacles
-def compute_barrier_and_grad(x, mean, std, obstacles_data=None, safety_margin = 0.20):
+def compute_barrier_and_grad(x, mean, std, obstacles_data=None, safety_margin=None):
     """
     Compute barrier V and its gradient ∇V for the trajectory x.
     Fixed version with proper gradient computation.
     """
+    safety_margin = Config.safety_margin if safety_margin is None else safety_margin
     # Denormalize positions for barrier computation
     pos_denorm = x[:, :, 1:4] * std[0, 0, 1:4] + mean[0, 0, 1:4]
     batch_size, seq_len, _ = pos_denorm.shape
@@ -588,7 +603,7 @@ def compute_barrier_and_grad(x, mean, std, obstacles_data=None, safety_margin = 
     return V_avg, grad_x
 
 # Barrier Function Computation for Multiple Obstacles using Logistic (Sigmoid) Approach
-def compute_barrier_and_grad_logistic(x, mean, std, obstacles_data=None, safety_margin=0.20, sigma=0.5):
+def compute_barrier_and_grad_logistic(x, mean, std, obstacles_data=None, safety_margin=None, sigma=0.5):
     """
     Compute barrier V and its gradient ∇V for the trajectory x using Logistic (Sigmoid) approach.
     
@@ -612,6 +627,7 @@ def compute_barrier_and_grad_logistic(x, mean, std, obstacles_data=None, safety_
         V_avg: Average barrier violation value (scalar tensor)
         grad_x: Gradient of barrier w.r.t normalized trajectory (same shape as x)
     """
+    safety_margin = Config.safety_margin if safety_margin is None else safety_margin
     # Denormalize positions for barrier computation
     pos_denorm = x[:, :, 1:4] * std[0, 0, 1:4] + mean[0, 0, 1:4]
     batch_size, seq_len, _ = pos_denorm.shape
@@ -771,7 +787,7 @@ class ObstacleAwareDiffusionProcess:
                 gamma_t = (4000.0 * guidance_gamma) * (1.0 - t_exp.squeeze(1).float() / self.config.diffusion_steps)
                 
                 # Compute barrier gradient ∇V with multiple obstacles
-                V, grad_V = compute_barrier_and_grad_logistic(pred_x0, mean, std, obstacles_data, safety_margin=config.safe_extra_factor, sigma=config.barrier_sigma)
+                V, grad_V = compute_barrier_and_grad_logistic(pred_x0, mean, std, obstacles_data, safety_margin=self.config.safety_margin, sigma=self.config.barrier_sigma)
 
                 barrier_info = {'V': V, 'grad_V': grad_V, 'gamma_t': gamma_t}
                 # print(barrier_info)
@@ -1069,13 +1085,13 @@ class AeroDMLoss(nn.Module):
     Supports switching obstacle term via flag; always returns 5 values for consistency.
     Fixes: Proper safety margin for obstacles, Z-weighting, normalization by avg obstacles.
     """
-    def __init__(self, config, enable_obstacle_term=False, safe_extra_factor=0.2, last_xyz_weight=1.5, xyz_weight=1.5, vel_weight=1.0, other_weight=1.0, obstacle_weight=10.0, continuity_weight=15.0, acc_weight=1.0, kinematics_weight=1.0):
+    def __init__(self, config, enable_obstacle_term=False, safety_margin=None, last_xyz_weight=1.5, xyz_weight=1.5, vel_weight=1.0, other_weight=1.0, obstacle_weight=10.0, continuity_weight=15.0, acc_weight=1.0, kinematics_weight=1.0):
         super().__init__()
         self.config = config
         # Flag to enable/disable obstacle distance penalty in total loss
         self.enable_obstacle_term = enable_obstacle_term
         # Safety buffer beyond obstacle surface (as fraction of radius, e.g., 0.2 = 20%)
-        self.safe_extra_factor = safe_extra_factor
+        self.safety_margin = config.safety_margin if safety_margin is None else safety_margin
         # Extra weight for the last point's position loss (critical for trajectory endpoint accuracy)
         self.last_xyz_weight = last_xyz_weight
         # Extra weight for Z-axis losses (height is critical in aviation trajectories)
@@ -1100,7 +1116,7 @@ class AeroDMLoss(nn.Module):
         """
         Computes obstacle avoidance loss.
         Penalizes trajectories that enter a safety buffer around obstacles.
-        Formula: sum_over_obs_and_time [max(0, safe_extra - (dist_to_surface))^2] / (batch * seq * avg_num_obs)
+        Formula: sum_over_obs_and_time [max(0, safety_margin - (dist_to_surface))^2] / (batch * seq * avg_num_obs)
         Where dist_to_surface = dist_to_center - radius.
         Returns 0 if disabled or no obstacles.
         """
@@ -1131,8 +1147,7 @@ class AeroDMLoss(nn.Module):
                 # Obstacle center (3D tensor) and radius (scalar)
                 center = obstacle['center'].to(device)  # Shape: (3,)
                 radius = obstacle['radius']  # Scalar float
-                # Compute safety extra distance (proportional to radius)
-                safe_extra = self.safe_extra_factor * radius
+                # Absolute safety buffer in meters, matching CBF and evaluation.
                 
                 # Euclidean distances from trajectory points to center
                 # Shape: (seq_len,)
@@ -1140,9 +1155,9 @@ class AeroDMLoss(nn.Module):
                 
                 # Distance to obstacle surface (positive outside, negative inside)
                 surface_dist = distances - radius
-                # Penalty only if inside safety buffer: clamp(safe_extra - surface_dist, 0)
-                # E.g., if surface_dist < safe_extra, penalize the violation squared
-                closeness_penalty = torch.clamp(safe_extra - surface_dist, min=0.0)
+                # Penalty only if inside safety buffer: clamp(safety_margin - surface_dist, 0)
+                # E.g., if surface_dist < safety_margin, penalize the violation squared
+                closeness_penalty = torch.clamp(self.safety_margin - surface_dist, min=0.0)
                 # Accumulate squared penalties over time steps
                 obstacle_loss = obstacle_loss + torch.sum(closeness_penalty ** 2)
         
@@ -1312,6 +1327,33 @@ def denormalize_obstacle(obstacle_center_norm, mean, std):
     obstacle_denorm = obstacle_center_norm * pos_std + pos_mean
     return obstacle_denorm
 
+def sample_trajectory_windows(trajectories, history_len, seq_len, stride=None):
+    """Return history + future windows, preserving all features and style labels.
+
+    stride=None: one uniformly random window per source trajectory (evaluation).
+    stride>0: all windows at starts 0, stride, ... <= T-window_len (training),
+    flattened in source-trajectory order to (B * windows_per_source, window_len, D).
+    A trailing start off the stride grid is intentionally not appended.
+    """
+    window_len = history_len + seq_len
+    if history_len < 0 or seq_len <= 0:
+        raise ValueError("history_len must be nonnegative and seq_len must be positive")
+    if trajectories.ndim != 3 or trajectories.shape[1] < window_len:
+        raise ValueError("Expected (batch, time, features) trajectories long enough for a window")
+    batch_size, total_len, feature_dim = trajectories.shape
+    if stride is not None:
+        if isinstance(stride, bool) or not isinstance(stride, int) or stride <= 0:
+            raise ValueError("stride must be a positive integer or None")
+        # unfold is a view; materialize the expanded dataset only once on CPU.
+        windows = trajectories.unfold(1, window_len, stride).permute(0, 1, 3, 2)
+        return windows.reshape(batch_size * windows.shape[1], window_len, feature_dim)
+    starts = torch.randint(
+        total_len - window_len + 1, (batch_size,), device=trajectories.device
+    )
+    times = starts[:, None] + torch.arange(window_len, device=trajectories.device)
+    batches = torch.arange(batch_size, device=trajectories.device)[:, None]
+    return trajectories[batches, times]
+
 def generate_target_waypoints(trajectory):
     # Target is the final position (indices 1:4 for x, y, z)
     target_pos = trajectory[:, -1, 1:4]  # (batch, 3)
@@ -1454,20 +1496,21 @@ def plot_trajectories_demo(demo_trajectories, rows=3, cols=6):
     plt.show()
 
 # Helper functions for modular plotting
-def prediction_collision_mask(positions, obstacles):
+def prediction_collision_mask(positions, obstacles, safety_margin=None):
     """Point collisions in physical 3D coordinates, matching evaluation metrics."""
+    safety_margin = Config.safety_margin if safety_margin is None else safety_margin
     positions = np.asarray(positions)
     mask = np.zeros(len(positions), dtype=bool)
     for obstacle in obstacles or []:
         center = obstacle['center']
         if hasattr(center, 'detach'):
             center = center.detach().cpu().numpy()
-        radius = float(obstacle['radius'])
+        radius = float(obstacle['radius']) + safety_margin
         mask |= np.linalg.norm(positions - np.asarray(center), axis=-1) < radius
     return mask
 
 
-def plot_prediction_points(ax, positions, obstacles, color, dims=(0, 1, 2), trajectory_label='Unguided'):
+def plot_prediction_points(ax, positions, obstacles, color, dims=(0, 1, 2), trajectory_label='Unguided', safety_margin=None):
     """Overlay prediction samples and highlight actual 3D collisions in any view."""
     positions = np.asarray(positions)
     is_3d = len(dims) == 3
@@ -1477,7 +1520,7 @@ def plot_prediction_points(ax, positions, obstacles, color, dims=(0, 1, 2), traj
         ax.computed_zorder = False
     ax.scatter(*(positions[:, d] for d in dims), s=9, color=color,
                marker='o', zorder=6, **extra)
-    mask = prediction_collision_mask(positions, obstacles)
+    mask = prediction_collision_mask(positions, obstacles, safety_margin=safety_margin)
     if mask.any():
         label = f'{trajectory_label} collision'
         if label in ax.get_legend_handles_labels()[1]:
@@ -1682,7 +1725,7 @@ def plot_error_analysis(ax, time_steps, original_pos, reconstructed_pos, sampled
     ax.grid(True, alpha=0.3)
 
 # Main evaluation function for testing model performance with obstacle-aware transformer
-def test_model_performance_cb_eva(model, trajectories_norm, mean, std, num_test_samples=100, show_flag=True, plot_combined=True, test_batch_size=None, enable_plots=None):
+def test_model_performance_cb_eva(model, trajectories_norm, mean, std, num_test_samples=100, target_random_offset_bound=1.0, show_flag=True, plot_combined=True, test_batch_size=None, enable_plots=None):
     """Testing with obstacle-aware transformer and compute collision rates, trajectory errors & success rates"""
     print("\nTesting obstacle-aware model performance...")
     config = model.config
@@ -1735,17 +1778,23 @@ def test_model_performance_cb_eva(model, trajectories_norm, mean, std, num_test_
             print(f"Processing samples {start + 1}-{stop}/{sample_count}")
             full_traj = trajectories_norm[start:stop]
             states = full_traj[:, :, :-1]
+            
             histories = states[:, :config.history_len]
+            
             originals_norm = states[:, config.history_len:config.history_len + config.seq_len]
             originals = denormalize_trajectories(originals_norm, mean_state, std_state)
+            
             targets = denormalize_target(generate_target_waypoints(originals_norm), mean_state, std_state)
-            targets = add_target_noise(targets, bound=1.0)
+            targets = add_target_noise(targets, bound=target_random_offset_bound) # random target
             targets_norm = normalize_target(targets, mean_state, std_state)
-            actions = F.one_hot(full_traj[:, -1, -1].long(), num_classes=config.action_dim).float()
+            
+            actions = F.one_hot(full_traj[:, config.history_len, -1].long(), num_classes=config.action_dim).float()
+
             obstacles_batch = [generate_random_obstacles(
-                originals[j], num_obstacles_range=(3, 5), radius_range=(0.5, 1.0),
+                originals[j], num_obstacles_range=config.num_obstacles_range, radius_range=config.obstacle_radius_range,
                 check_collision=False, device=device) for j in range(current_size)]
             model.set_obstacles_data(obstacles_batch)
+            
             outputs, elapsed = [], []
             for guided in (False, True):
                 synchronize()
@@ -1768,7 +1817,7 @@ def test_model_performance_cb_eva(model, trajectories_norm, mean, std, num_test_
                 target_denorm = targets[j:j+1]
                 obstacles = obstacles_batch[j]
                 history_style = full_traj[j:j+1, 0, -1]
-                pred_style = full_traj[j:j+1, -1, -1]
+                pred_style = full_traj[j:j+1, config.history_len, -1]
                 sampled_unguided_denorm = outputs[0][j:j+1]
                 sampled_guided_denorm = outputs[1][j:j+1]
                 if enable_plots:
@@ -1964,8 +2013,9 @@ def print_inference_time_statistics(times_unguided, times_guided):
         'speedup': speedup
     }
 
-def compute_collision_rate(trajectories_pos, obstacles_data, safety_margin=0.0):
+def compute_collision_rate(trajectories_pos, obstacles_data, safety_margin=None):
     """Compute collision rate for a batch of trajectories."""
+    safety_margin = Config.safety_margin if safety_margin is None else safety_margin
     batch_size = trajectories_pos.shape[0]
     
     if hasattr(trajectories_pos, 'cpu'):
@@ -2008,7 +2058,7 @@ def compute_collision_rate(trajectories_pos, obstacles_data, safety_margin=0.0):
         'total_trajectories': batch_size
     }
 
-def compute_success_rates(trajectories_pos, ground_truth_positions, target_positions, obstacles_data):
+def compute_success_rates(trajectories_pos, ground_truth_positions, target_positions, obstacles_data, safety_margin=None):
     """
     Compute comprehensive success rates based on multiple criteria.
     
@@ -2019,6 +2069,7 @@ def compute_success_rates(trajectories_pos, ground_truth_positions, target_posit
     4. Target reach: Distance to target < 2.0 at final step
     5. Overall success: Meets all criteria
     """
+    safety_margin = Config.safety_margin if safety_margin is None else safety_margin
     batch_size = trajectories_pos.shape[0]
     
     if hasattr(trajectories_pos, 'cpu'):
@@ -2033,7 +2084,7 @@ def compute_success_rates(trajectories_pos, ground_truth_positions, target_posit
         'max_position_error': 2.0,      # Max allowed position error
         'max_final_error': 1.0,          # Max allowed final position error
         'target_reach_radius': 2.0,      # Distance to target considered "reached"
-        'min_safety_distance': 0.3       # Min distance to obstacle surface
+        'min_safety_distance': 0.0       # Min distance to the margin-expanded obstacle surface
     }
     
     # Initialize success flags
@@ -2067,7 +2118,7 @@ def compute_success_rates(trajectories_pos, ground_truth_positions, target_posit
                 center = obstacle['center']
                 if hasattr(center, 'cpu'):
                     center = center.cpu().numpy()
-                radius = obstacle['radius']
+                radius = obstacle['radius'] + safety_margin
                 
                 dist_to_center = np.linalg.norm(point - center)
                 surface_dist = dist_to_center - radius
@@ -2147,6 +2198,7 @@ def config_to_string(config):
     lines.append(f"Model Dimensions:")
     lines.append(f"  latent_dim: {config.latent_dim}")
     lines.append(f"  obs_latent_dim: {config.obs_latent_dim}")
+    lines.append(f"  seed: {config.seed}")
     lines.append(f"  num_layers: {config.num_layers}")
     lines.append(f"  num_heads: {config.num_heads}")
     lines.append(f"  dropout: {config.dropout}")
@@ -2160,6 +2212,7 @@ def config_to_string(config):
     lines.append(f"  seq_len: {config.seq_len}")
     lines.append(f"  state_dim: {config.state_dim}")
     lines.append(f"  history_len: {config.history_len}")
+    lines.append(f"  train_window_stride: {config.train_window_stride}")
     lines.append("")
     lines.append(f"Condition Dimensions:")
     lines.append(f"  target_dim: {config.target_dim}")
@@ -2167,13 +2220,15 @@ def config_to_string(config):
     lines.append("")
     lines.append(f"Obstacle Parameters:")
     lines.append(f"  max_obstacles: {config.max_obstacles}")
+    lines.append(f"  num_obstacles_range: {config.num_obstacles_range}")
+    lines.append(f"  obstacle_radius_range: {config.obstacle_radius_range}")
     lines.append(f"  obstacle_feat_dim: {config.obstacle_feat_dim}")
     lines.append(f"  enable_obstacle_encoding: {config.enable_obstacle_encoding}")
     lines.append(f"  use_obstacle_loss: {config.use_obstacle_loss}")
     lines.append("")
     lines.append(f"CBF Guidance Parameters:")
     lines.append(f"  guidance_gamma: {config.guidance_gamma}")
-    lines.append(f"  safe_extra_factor: {config.safe_extra_factor}")
+    lines.append(f"  safety_margin: {config.safety_margin}")
     lines.append(f"  barrier_sigma: {config.barrier_sigma}")
     lines.append("")
     lines.append(f"Loss Weights:")
@@ -2226,8 +2281,8 @@ def print_metrics_with_success_rates(unguided_positions, guided_positions,
     write_and_print("COLLISION RATE ANALYSIS")
     write_and_print("-"*60)
     
-    unguided_collision = compute_collision_rate(unguided_positions, obstacles_data, safety_margin=0.0)
-    guided_collision = compute_collision_rate(guided_positions, obstacles_data, safety_margin=0.0)
+    unguided_collision = compute_collision_rate(unguided_positions, obstacles_data)
+    guided_collision = compute_collision_rate(guided_positions, obstacles_data)
     
     write_and_print(f"\nUNGuided Trajectories (without CBF):")
     write_and_print(f"  - Collision Rate: {unguided_collision['collision_rate']*100:.2f}%")
@@ -2442,15 +2497,15 @@ def test_model_performance(model, trajectories_norm, mean, std, num_test_samples
             
             # Extract style information
             history_style = style_info[:, 0, 0]  # Style from history segment (first timestep)
-            pred_style = style_info[:, -1, 0]  # Style from prediction segment
+            pred_style = style_info[:, config.history_len, 0]  # Style at prediction start
             
             style_indices = pred_style.long()
             action = F.one_hot(style_indices, num_classes=config.action_dim).float()
 
             # Generate random obstacles
             obstacles = generate_random_obstacles(x_0_denorm[0], 
-                                                  num_obstacles_range=(3, 5), 
-                                                  radius_range=(0.5, 1.0), 
+                                                  num_obstacles_range=config.num_obstacles_range,
+                                                  radius_range=config.obstacle_radius_range,
                                                   check_collision=False, 
                                                   device=device)
             
@@ -2810,8 +2865,8 @@ def test_action_effect(model, trajectories_norm, mean, std, num_test_samples=5, 
             x_0_denorm = denormalize_trajectories(x_0, mean_state, std_state)
             obstacles = generate_random_obstacles(
                 x_0_denorm[0], 
-                num_obstacles_range=(3, 5), 
-                radius_range=(0.5, 1.0), 
+                num_obstacles_range=config.num_obstacles_range,
+                radius_range=config.obstacle_radius_range,
                 check_collision=False, 
                 device=device
             )
@@ -3439,12 +3494,14 @@ if __name__ == "__main__":
     
     # Configuration
     config = Config()
+    set_random_seed(config.seed)
+    print(f"Random seed: {config.seed}")
     
     # Loss function based on flag
     criterion = AeroDMLoss(
         config, 
         enable_obstacle_term = config.use_obstacle_loss,
-        safe_extra_factor=config.safe_extra_factor,
+        safety_margin=config.safety_margin,
         last_xyz_weight=config.last_xyz_weight,
         xyz_weight=config.xyz_weight,
         vel_weight=config.vel_weight,
@@ -3463,29 +3520,47 @@ if __name__ == "__main__":
     _base_num_trajectories = config._base_num_trajectories
     
     print("Generating training data with obstacle-aware transformer...")
+    if config.trajectory_length_multiplier < 1:
+        raise ValueError("trajectory_length_multiplier must be at least 1")
+    generated_seq_len = int(
+        (config.history_len + config.seq_len) * config.trajectory_length_multiplier
+    )
+    # trajectories = generate_aerobatic_trajectories_pvR(
+    #     num_trajectories=_base_num_trajectories, 
+    #     seq_len=generated_seq_len,
+    #     delta_T=config.delta_T,
+    #     maneuver_duration=generated_seq_len * config.delta_T
+    # )
+    
     trajectories = generate_aerobatic_trajectories_pvR(
         num_trajectories=_base_num_trajectories, 
-        seq_len=config.seq_len + config.history_len,
+        seq_len=generated_seq_len,
         delta_T=config.delta_T
     )
-    
+
     num_trajectories = trajectories.shape[0]
-    # Split trajectories into train and test sets (80/20 split)
-    torch.manual_seed(42) # For reproducibility
+    # Split full trajectories before sampling windows to avoid train/test leakage (90/10).
     indices = torch.randperm(num_trajectories)
     train_size = int(0.9 * num_trajectories)
     train_indices = indices[:train_size]
     test_indices = indices[train_size:]
     
-    train_trajectories = trajectories[train_indices]
-    test_trajectories = trajectories[test_indices]
+    train_trajectories = sample_trajectory_windows(
+        trajectories[train_indices], config.history_len, config.seq_len,
+        stride=config.train_window_stride,
+    )
+    print(f"Training windows: {len(train_indices)} source trajectories -> "
+          f"{len(train_trajectories)} windows (stride={config.train_window_stride})")
+    # Fix evaluation windows once so all evaluation paths use the same samples.
+    test_trajectories = sample_trajectory_windows(
+        trajectories[test_indices], config.history_len, config.seq_len
+    )
     
     # Normalize on train set and apply to test
     train_norm, mean, std = normalize_trajectories(train_trajectories)
     test_norm, _, _ = normalize_trajectories(test_trajectories, mean=mean, std=std)
     
-    # Move data to device
-    train_norm = train_norm.to(device)
+    # Keep the expanded training set on CPU; transfer only the current batch.
     test_norm = test_norm.to(device)
     mean = mean.to(device)
     std = std.to(device)
@@ -3529,7 +3604,7 @@ if __name__ == "__main__":
                     actual_batch_size = batch_size
                 
                 batch_indices = indices[i:i+actual_batch_size]
-                full_traj = train_norm[batch_indices] # (B, T_full, D)
+                full_traj = train_norm[batch_indices].to(device)  # Already fixed-length windows
                 
                 # Extract style index (last dimension)
                 style_info = full_traj[:, :, -1:]  # Shape: (B, T_full, 1)
@@ -3542,7 +3617,7 @@ if __name__ == "__main__":
                 # Generate condition inputs
                 target = generate_target_waypoints(x_0)
                 
-                style_index = style_info[:, -1, 0]  # Take the last timestep's style index
+                style_index = style_info[:, config.history_len, 0]  # Preserve maneuver labels for transition windows
                 style_indices = style_index.long()
                 action = F.one_hot(style_indices, num_classes=config.action_dim).float()
 
@@ -3561,8 +3636,8 @@ if __name__ == "__main__":
                         traj_denorm = denormalize_trajectories(full_traj[b:b+1, config.history_len:, :], mean, std)
                         obstacles = generate_random_obstacles(
                             traj_denorm[0], 
-                            num_obstacles_range=(3, 5), 
-                            radius_range=(0.5, 1.0), 
+                            num_obstacles_range=config.num_obstacles_range,
+                            radius_range=config.obstacle_radius_range,
                             check_collision=False, 
                             device=device
                         )
@@ -3678,6 +3753,10 @@ if __name__ == "__main__":
             # Load normalization parameters
             mean = checkpoint['mean'].to(device)
             std = checkpoint['std'].to(device)
+            # Evaluation inputs must use the loaded model's normalization statistics.
+            test_norm, _, _ = normalize_trajectories(
+                test_trajectories.to(device), mean=mean, std=std
+            )
             model.set_normalization_params(mean, std)
             
             print(f"Model loaded successfully!")
@@ -3705,6 +3784,7 @@ if __name__ == "__main__":
         mean, 
         std, 
         num_test_samples=config.num_test_samples, 
+        target_random_offset_bound=config.target_random_offset_bound,
         show_flag=config.show_flag
     )
 

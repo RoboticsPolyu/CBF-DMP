@@ -10,8 +10,37 @@ import matplotlib.pyplot as plt
 import sys
 import time
 
-MANEUVER_STYLES = ('power_loop', 'barrel_roll', 'split_s', 'immelmann', 'wall_ride', 'eight_figure', 'half_moon', 'sphinx', 'clover', 'spiral_inward', 'spiral_outward', 'spiral_vertical_up', 'spiral_vertical_down', 'circle', 'ellipse', 's_curve', 'sine_wave', 'arch', 'vertical_eight', 'helix_up', 'helix_down', 'conical_helix', 'lissajous_3d')
+from mpl_toolkits.mplot3d.art3d import Line3DCollection
+
+MANEUVER_STYLES = ('power_loop', 'barrel_roll', 'split_s', 'immelmann', 'wall_ride', 'eight_figure', 'half_moon', 'sphinx', 'clover', 'spiral_inward', 'spiral_outward', 'spiral_vertical_up', 'spiral_vertical_down', 'circle', 'ellipse', 's_curve', 'sine_wave', 'arch', 'vertical_eight', 'helix_up', 'helix_down', 'conical_helix', 'lissajous_3d', 'straight_line')
 STYLE_NAMES = dict(enumerate(MANEUVER_STYLES))
+
+def sample_trajectory_windows(trajectories, history_len, seq_len, stride=None):
+    """Return history + future windows, preserving all features and style labels.
+
+    stride=None: one uniformly random window per source trajectory (evaluation).
+    stride>0: all windows at starts 0, stride, ... <= T-window_len (training),
+    flattened in source-trajectory order to (B * windows_per_source, window_len, D).
+    A trailing start off the stride grid is intentionally not appended.
+    """
+    window_len = history_len + seq_len
+    if history_len < 0 or seq_len <= 0:
+        raise ValueError("history_len must be nonnegative and seq_len must be positive")
+    if trajectories.ndim != 3 or trajectories.shape[1] < window_len:
+        raise ValueError("Expected (batch, time, features) trajectories long enough for a window")
+    batch_size, total_len, feature_dim = trajectories.shape
+    if stride is not None:
+        if isinstance(stride, bool) or not isinstance(stride, int) or stride <= 0:
+            raise ValueError("stride must be a positive integer or None")
+        # unfold is a view; materialize the expanded dataset only once on CPU.
+        windows = trajectories.unfold(1, window_len, stride).permute(0, 1, 3, 2)
+        return windows.reshape(batch_size * windows.shape[1], window_len, feature_dim)
+    starts = torch.randint(
+        total_len - window_len + 1, (batch_size,), device=trajectories.device
+    )
+    times = starts[:, None] + torch.arange(window_len, device=trajectories.device)
+    batches = torch.arange(batch_size, device=trajectories.device)[:, None]
+    return trajectories[batches, times]
 
 def smooth_connection_with_spline(history_segment, future_segment, num_blend=10):
     """
@@ -355,7 +384,13 @@ def validate_connection_continuity(concatenated_trajectories, history_len):
     else:
         print(f"  ⚠ Position continuity may need improvement")
 
-def generate_single_style_trajectory(style, seq_len=60, height=10.0, radius=5.0):
+def _bounded_maneuver_phase(phase):
+    """Smooth finite radius transition with zero rate at both endpoints."""
+    u = np.clip(phase, 0.0, 1.0)
+    return u * u * (3.0 - 2.0 * u)
+
+def generate_single_style_trajectory(style, seq_len=60, height=10.0, radius=5.0,
+                                     delta_T=0.10, maneuver_duration=6.0):
     """Generate trajectory data for a single style"""
     
     # Fixed parameters for consistency
@@ -363,8 +398,10 @@ def generate_single_style_trajectory(style, seq_len=60, height=10.0, radius=5.0)
     current_radius = radius
     angular_velocity = 1.0
     
-    # Normalized time steps
-    norm_t = np.linspace(0, 1, seq_len)
+    # Physical time: longer sequences extend the same motion instead of slowing it down.
+    if seq_len < 2 or delta_T <= 0 or maneuver_duration <= 0:
+        raise ValueError("Need seq_len >= 2 and positive time step / maneuver duration")
+    norm_t = np.arange(seq_len, dtype=float) * delta_T / maneuver_duration
     
     x = np.zeros(seq_len)
     y = np.zeros(seq_len)
@@ -389,45 +426,27 @@ def generate_single_style_trajectory(style, seq_len=60, height=10.0, radius=5.0)
         y = radius * np.sin(theta)
         z = height + pitch * norm_t
 
-    elif style == 'split_s':
-        # Real Split-S: half negative-g loop + 180° roll to upright
-        loop_frac = 0.55
-        roll_frac = 1.0 - loop_frac
+    elif style in ('split_s', 'immelmann'):
+        # One finite maneuver, followed by forward level flight. Use analytic
+        # junction states: indices based on seq_len are invalid for extended time.
+        loop_frac = 0.55 if style == 'split_s' else 0.6
+        phase = np.minimum(norm_t, 1.0)
+        first = phase <= loop_frac
+        theta = np.pi * phase[first] / loop_frac
+        x[first] = radius * np.sin(theta)
+        z[first] = height + radius * (1 - np.cos(theta))
 
-        # Phase 1: half loop downward (negative g)
-        theta_loop = np.pi * (norm_t / loop_frac)   # 0 → π
-        mask1 = norm_t <= loop_frac
-        x[mask1] = radius * np.sin(theta_loop[mask1])
-        z[mask1] = height + radius * (1 - np.cos(theta_loop[mask1]))  # start high → go down
-
-        # Phase 2: 180° roll while pulling level
-        roll_t = (norm_t - loop_frac) / roll_frac
-        mask2 = norm_t > loop_frac
-        roll_angle = np.pi * roll_t
-        lateral = radius * 0.4 * np.sin(roll_angle)  # slight lateral offset during roll
-        x[mask2] = x[int(loop_frac*seq_len)] + lateral[mask2]
-        z[mask2] = z[int(loop_frac*seq_len)-1] - 2.0 * (norm_t[mask2] - loop_frac) * height
-        y[mask2] = radius * 0.6 * np.sin(roll_angle[mask2])  # visible roll in Y
-        x += fwd
-
-    elif style == 'immelmann':
-        # Classic Immelmann: half positive-g loop + 180° roll on top
-        loop_frac = 0.6
-        roll_frac = 1.0 - loop_frac
-
-        # Phase 1: half loop upward
-        theta_loop = np.pi * (norm_t / loop_frac)
-        mask1 = norm_t <= loop_frac
-        x[mask1] = radius * np.sin(theta_loop[mask1])
-        z[mask1] = height + radius * (1 - np.cos(theta_loop[mask1]))
-
-        # Phase 2: half roll at the top
-        roll_t = (norm_t - loop_frac) / roll_frac
-        mask2 = norm_t > loop_frac
-        roll_angle = np.pi * roll_t
-        x[mask2] = x[int(loop_frac*seq_len)] + radius * 0.3 * np.sin(roll_angle[mask2])
-        z[mask2] = z[int(loop_frac*seq_len)-1]
-        y[mask2] = radius * 0.7 * np.sin(roll_angle[mask2])  # roll visible
+        # Cubic Hermite transition preserves position and velocity at both ends.
+        second = ~first
+        duration = 1.0 - loop_frac
+        u = (phase[second] - loop_frac) / duration
+        h10 = u**3 - 2*u**2 + u
+        h01 = -2*u**3 + 3*u**2
+        x[second] = h10 * duration * (-radius * np.pi / loop_frac)
+        drop = -2.0 * duration * height if style == 'split_s' else 0.0
+        z[second] = height + 2*radius + h01 * drop
+        # Zero lateral velocity at the junctions and after the maneuver.
+        y[second] = radius * (0.6 if style == 'split_s' else 0.7) * np.sin(np.pi*u)**2
         x += fwd
 
     elif style == 'wall_ride':
@@ -466,7 +485,12 @@ def generate_single_style_trajectory(style, seq_len=60, height=10.0, radius=5.0)
     elif style == 'arch':
         x = 4 * radius * (norm_t - 0.5)
         y = np.zeros(seq_len)
-        z = height + 4 * radius * norm_t * (1 - norm_t)
+        phase = np.minimum(norm_t, 1.0)
+        z = height + 4 * radius * phase * (1 - phase)
+        # Continue the terminal tangent, smoothly reducing descent to zero.
+        # The bounded tail avoids quadratic extrapolation to large negative heights.
+        extra = np.maximum(norm_t - 1.0, 0.0)
+        z -= 4 * radius * 0.2 * (1 - np.exp(-extra / 0.2))
 
     elif style == 'vertical_eight':
         theta = 2 * np.pi * norm_t
@@ -476,7 +500,7 @@ def generate_single_style_trajectory(style, seq_len=60, height=10.0, radius=5.0)
 
     elif style in ('helix_up', 'helix_down', 'conical_helix'):
         theta = 4 * np.pi * norm_t
-        radius_t = radius * (0.3 + 0.7 * norm_t) if style == 'conical_helix' else radius
+        radius_t = radius * (0.3 + 0.7 * _bounded_maneuver_phase(norm_t)) if style == 'conical_helix' else radius
         x = radius_t * np.cos(theta)
         y = radius_t * np.sin(theta)
         z = height + (-1 if style == 'helix_down' else 1) * 3 * radius * norm_t
@@ -488,10 +512,12 @@ def generate_single_style_trajectory(style, seq_len=60, height=10.0, radius=5.0)
         z = height + 0.5 * radius * np.sin(theta)
 
     elif style == 'half_moon':
-        theta = np.pi * norm_t
+        # A finite half-circle over the entire requested sequence, irrespective
+        # of duration. Longer sequences intentionally traverse it more slowly.
+        theta = np.linspace(0.0, np.pi, seq_len)
         x = center_x + current_radius * np.cos(theta)
         y = center_y + current_radius * np.sin(theta)
-        z = center_z + 0.1 * current_radius * np.sin(theta)
+        z = center_z + 0.8 * current_radius * np.sin(theta)
         
     elif style == 'sphinx':
         # Rising helix with sinusoidal pitch oscillation
@@ -514,7 +540,7 @@ def generate_single_style_trajectory(style, seq_len=60, height=10.0, radius=5.0)
         start_radius = current_radius * 2.0
         end_radius = current_radius * 0.2
         theta = 2 * np.pi * turns * norm_t * angular_velocity
-        radius_t = start_radius + (end_radius - start_radius) * norm_t
+        radius_t = start_radius + (end_radius - start_radius) * _bounded_maneuver_phase(norm_t)
         x = center_x + radius_t * np.cos(theta)
         y = center_y + radius_t * np.sin(theta)
         z = np.full(seq_len, center_z)
@@ -524,7 +550,7 @@ def generate_single_style_trajectory(style, seq_len=60, height=10.0, radius=5.0)
         start_radius = current_radius * 0.2
         end_radius = current_radius * 2.0
         theta = 2 * np.pi * turns * norm_t * angular_velocity
-        radius_t = start_radius + (end_radius - start_radius) * norm_t
+        radius_t = start_radius + (end_radius - start_radius) * _bounded_maneuver_phase(norm_t)
         x = center_x + radius_t * np.cos(theta)
         y = center_y + radius_t * np.sin(theta)
         z = np.full(seq_len, center_z)
@@ -545,6 +571,11 @@ def generate_single_style_trajectory(style, seq_len=60, height=10.0, radius=5.0)
         y = np.full(seq_len, center_y)
         z = center_z - descent_height * norm_t
         
+    elif style == 'straight_line':
+        x = center_x + fwd
+        y = np.full(seq_len, center_y)
+        z = np.full(seq_len, center_z)
+
     else:
         # Default straight line trajectory
         x = center_x + norm_t * 10
@@ -555,7 +586,8 @@ def generate_single_style_trajectory(style, seq_len=60, height=10.0, radius=5.0)
     state = np.column_stack([x, y, z])
     return state
 
-def generate_aerobatic_trajectories(num_trajectories, seq_len, height=10.0, radius=5.0):
+def generate_aerobatic_trajectories(num_trajectories, seq_len, height=10.0, radius=5.0,
+                                    delta_T=0.10, maneuver_duration=6.0):
     """Generates synthetic aerobatic trajectories with correct attitude angles."""
     trajectories = []
 
@@ -591,7 +623,9 @@ def generate_aerobatic_trajectories(num_trajectories, seq_len, height=10.0, radi
         current_radius = radius * np.random.uniform(0.3, 1.2)
         
         # Generate the base trajectory using generate_single_style_trajectory
-        base_trajectory = generate_single_style_trajectory(style, seq_len, center_z, current_radius)
+        base_trajectory = generate_single_style_trajectory(
+            style, seq_len, center_z, current_radius, delta_T, maneuver_duration
+        )
         
         # Extract positions and apply random translation
         x = base_trajectory[:, 0] + center_x
@@ -599,7 +633,7 @@ def generate_aerobatic_trajectories(num_trajectories, seq_len, height=10.0, radi
         z = base_trajectory[:, 2]
         
         # Calculate velocities using gradient
-        dt = 0.10  # 0.1 second
+        dt = delta_T  # Same physical time step as position generation
         vx = np.gradient(x, dt)
         vy = np.gradient(y, dt)
         vz = np.gradient(z, dt)
@@ -623,7 +657,7 @@ def generate_aerobatic_trajectories(num_trajectories, seq_len, height=10.0, radi
         # Simplified: roll indicates how much the aircraft is banking into turns
         
         # Calculate heading angle (ψ) in horizontal plane
-        heading = np.arctan2(vy, vx)  # ψ = atan2(vy, vx)
+        heading = np.unwrap(np.arctan2(vy, vx))  # ψ = atan2(vy, vx)
         
         # Calculate change in heading (turn rate)
         heading_rate = np.gradient(heading, dt)
@@ -644,14 +678,14 @@ def generate_aerobatic_trajectories(num_trajectories, seq_len, height=10.0, radi
         # Add maneuver-specific roll effects
         if style in ['barrel_roll']:
             # Full roll rotation over the trajectory
-            t = np.linspace(0, 2*np.pi, seq_len)
+            t = 2 * np.pi * np.arange(seq_len) * delta_T / maneuver_duration
             roll_maneuver = 2 * np.pi * (t / (2*np.pi))  # One full rotation
         elif style in ['power_loop', 'split_s', 'immelmann']:
             # Loops involve pitch changes, minimal roll
             roll_maneuver = np.zeros_like(roll_turn)
         elif style in ['spiral_inward', 'spiral_outward']:
             # Spirals have continuous roll
-            t = np.linspace(0, 2*np.pi, seq_len)
+            t = 2 * np.pi * np.arange(seq_len) * delta_T / maneuver_duration
             roll_maneuver = np.pi * np.sin(t)  # Oscillating roll
         
         # Combine turn-based roll and maneuver-specific roll
@@ -680,7 +714,7 @@ def generate_aerobatic_trajectories(num_trajectories, seq_len, height=10.0, radi
         
     return torch.tensor(np.stack(trajectories), dtype=torch.float32)
 
-def generate_aerobatic_trajectories_pvR(num_trajectories, seq_len, height=10.0, radius=5.0, delta_T=0.10):
+def generate_aerobatic_trajectories_pvR(num_trajectories, seq_len, height=10.0, radius=5.0, delta_T=0.10, maneuver_duration=6.0):
     """Generates synthetic aerobatic trajectories with correct attitude angles."""
     trajectories = []
 
@@ -701,7 +735,9 @@ def generate_aerobatic_trajectories_pvR(num_trajectories, seq_len, height=10.0, 
         current_radius = radius * np.random.uniform(0.3, 1.2)
         
         # Generate the base trajectory using generate_single_style_trajectory
-        base_trajectory = generate_single_style_trajectory(style, seq_len, center_z, current_radius)
+        base_trajectory = generate_single_style_trajectory(
+            style, seq_len, center_z, current_radius, delta_T, maneuver_duration
+        )
         
         # Extract positions and apply random translation
         x = base_trajectory[:, 0] + center_x
@@ -709,7 +745,7 @@ def generate_aerobatic_trajectories_pvR(num_trajectories, seq_len, height=10.0, 
         z = base_trajectory[:, 2]
         
         # Calculate velocities using gradient
-        dt = 0.10  # 0.1 second
+        dt = delta_T  # Same physical time step as position generation
         vx = np.gradient(x, dt)
         vy = np.gradient(y, dt)
         vz = np.gradient(z, dt)
@@ -733,7 +769,7 @@ def generate_aerobatic_trajectories_pvR(num_trajectories, seq_len, height=10.0, 
         # Simplified: roll indicates how much the aircraft is banking into turns
         
         # Calculate heading angle (ψ) in horizontal plane
-        heading = np.arctan2(vy, vx)  # ψ = atan2(vy, vx)
+        heading = np.unwrap(np.arctan2(vy, vx))  # ψ = atan2(vy, vx)
         
         # Calculate change in heading (turn rate)
         heading_rate = np.gradient(heading, dt)
@@ -754,14 +790,14 @@ def generate_aerobatic_trajectories_pvR(num_trajectories, seq_len, height=10.0, 
         # Add maneuver-specific roll effects
         if style in ['barrel_roll']:
             # Full roll rotation over the trajectory
-            t = np.linspace(0, 2*np.pi, seq_len)
+            t = 2 * np.pi * np.arange(seq_len) * delta_T / maneuver_duration
             roll_maneuver = 2 * np.pi * (t / (2*np.pi))  # One full rotation
         elif style in ['power_loop', 'split_s', 'immelmann']:
             # Loops involve pitch changes, minimal roll
             roll_maneuver = np.zeros_like(roll_turn)
         elif style in ['spiral_inward', 'spiral_outward']:
             # Spirals have continuous roll
-            t = np.linspace(0, 2*np.pi, seq_len)
+            t = 2 * np.pi * np.arange(seq_len) * delta_T / maneuver_duration
             roll_maneuver = np.pi * np.sin(t)  # Oscillating roll
         
         # Combine turn-based roll and maneuver-specific roll
@@ -784,7 +820,20 @@ def generate_aerobatic_trajectories_pvR(num_trajectories, seq_len, height=10.0, 
         # Full state: [vx, x, y, z, vy, vz, roll, pitch, yaw, style_idx]
         attitude_3d = np.column_stack([roll, pitch, yaw])
         
-        state = np.column_stack([speed, x, y, z, vx, vy, vz, attitude_3d, np.full(seq_len, style_idx)])
+        frame_styles = np.full(seq_len, style_idx, dtype=np.int64)
+        if style in ('split_s', 'immelmann'):
+            # The analytic maneuver is complete at this physical time.
+            straight = np.arange(seq_len) * delta_T >= maneuver_duration
+            frame_styles[straight] = style_to_index['straight_line']
+        elif style in ('spiral_inward', 'spiral_outward'):
+            # Radius has reached its endpoint; the remaining path is circular.
+            circular = np.arange(seq_len) * delta_T >= maneuver_duration
+            frame_styles[circular] = style_to_index['circle']
+        elif style == 'conical_helix':
+            # Once the radius stops expanding, this is a constant-radius upward helix.
+            helical = np.arange(seq_len) * delta_T >= maneuver_duration
+            frame_styles[helical] = style_to_index['helix_up']
+        state = np.column_stack([speed, x, y, z, vx, vy, vz, attitude_3d, frame_styles])
         
         trajectories.append(state)
         
@@ -792,4 +841,96 @@ def generate_aerobatic_trajectories_pvR(num_trajectories, seq_len, height=10.0, 
 
 if __name__ == "__main__":
     # Run the random intensity visualization
-    generate_aerobatic_trajectories_pvR(num_trajectories=5, seq_len=100)
+    trajectories = sample_trajectory_windows(generate_aerobatic_trajectories_pvR(num_trajectories=50, seq_len=120, radius=5.0, delta_T=0.10, maneuver_duration= seq_len * delta_T), 20, 100)
+
+    # ===== Visualize each trajectory on its own page in a PDF =====
+    from matplotlib.backends.backend_pdf import PdfPages
+
+    num_traj = trajectories.shape[0]
+    seq_len = trajectories.shape[1]
+
+    # Use a clean style
+    plt.rcParams.update({
+        'font.size': 11,
+        'axes.titlesize': 14,
+        'axes.labelsize': 12,
+        'axes.titleweight': 'bold',
+        'figure.facecolor': 'white',
+        'axes.facecolor': '#fafafa',
+    })
+
+    # Distinct, aesthetically pleasing colors
+    colors = plt.cm.viridis(np.linspace(0.1, 0.9, num_traj))
+
+    pdf_path = 'generated_trajectories_3d.pdf'
+
+    with PdfPages(pdf_path) as pdf:
+        for i in range(num_traj):
+            traj = trajectories[i].cpu().numpy()
+            x, y, z = traj[:, 1], traj[:, 2], traj[:, 3]
+            speed = traj[:, 0]
+            style_idx = int(traj[0, -1])
+            style_name = STYLE_NAMES.get(style_idx, f'style_{style_idx}')
+
+            fig = plt.figure(figsize=(8.5, 8.5))
+            ax = fig.add_subplot(111, projection='3d')
+
+            # Color the trajectory by speed using a line collection
+            points = np.array([x, y, z]).T.reshape(-1, 1, 3)
+            segments = np.concatenate([points[:-1], points[1:]], axis=1)
+            norm = plt.Normalize(speed.min(), speed.max())
+            lc = Line3DCollection(segments, cmap='plasma', norm=norm,
+                                  linewidth=2.5, alpha=0.95)
+            lc.set_array(speed[:-1])
+            ax.add_collection3d(lc)
+
+            # Start / end markers
+            ax.scatter(x[0], y[0], z[0], color='#2ecc71', s=90,
+                       marker='o', edgecolor='black', linewidth=0.8,
+                       label='Start', zorder=5)
+            ax.scatter(x[-1], y[-1], z[-1], color='#e74c3c', s=90,
+                       marker='X', edgecolor='black', linewidth=0.8,
+                       label='End', zorder=5)
+
+            # Equal aspect ratio for a faithful 3D shape
+            max_range = np.array([x.max() - x.min(),
+                                  y.max() - y.min(),
+                                  z.max() - z.min()]).max() / 2.0
+            mid_x = (x.max() + x.min()) * 0.5
+            mid_y = (y.max() + y.min()) * 0.5
+            mid_z = (z.max() + z.min()) * 0.5
+            ax.set_xlim(mid_x - max_range, mid_x + max_range)
+            ax.set_ylim(mid_y - max_range, mid_y + max_range)
+            ax.set_zlim(mid_z - max_range, mid_z + max_range)
+
+            # Labels and title
+            ax.set_xlabel('X', labelpad=10)
+            ax.set_ylabel('Y', labelpad=10)
+            ax.set_zlabel('Z', labelpad=10)
+            ax.set_title(f'Trajectory {i} — {style_name}', pad=20)
+
+            # Nicer view angle
+            ax.view_init(elev=25, azim=-60)
+            ax.grid(True, alpha=0.3)
+            ax.xaxis.pane.set_alpha(0.1)
+            ax.yaxis.pane.set_alpha(0.1)
+            ax.zaxis.pane.set_alpha(0.1)
+
+            # Colorbar for speed
+            cbar = fig.colorbar(lc, ax=ax, shrink=0.6, pad=0.1)
+            cbar.set_label('Speed', rotation=270, labelpad=15)
+
+            # Legend
+            ax.legend(loc='upper left', fontsize=9, framealpha=0.9)
+
+            plt.tight_layout()
+            pdf.savefig(fig, bbox_inches='tight')
+            plt.close(fig)
+
+    print(f"\nSaved {num_traj} pages to '{pdf_path}'")
+
+    # ===== Print style info for each trajectory =====
+    print("\nGenerated trajectories summary:")
+    for i in range(num_traj):
+        style_idx = int(trajectories[i, 0, -1].item())
+        print(f"  Trajectory {i}: style = {STYLE_NAMES.get(style_idx, style_idx)}")

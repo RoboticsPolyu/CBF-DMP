@@ -45,6 +45,7 @@ class Config:
     seq_len = 60  # N_a = 60 time steps; 6s-long future trajectory sequence
     state_dim = 10  # x_i ∈ R^10: p(3) + v(3) + r(4) + style(1) = 11, but we will use 10 by excluding style from the state vector and handling it as a condition
     history_len = 20  # 20-frame historical observations
+    trajectory_length_multiplier = 2  # Generate longer trajectories for random windows
 
     # Condition dimensions
     target_dim = 4  # p_t ∈ R^3 + valid flag (1)
@@ -1266,6 +1267,22 @@ def denormalize_obstacle(obstacle_center_norm, mean, std):
     # Denormalize obstacle center
     obstacle_denorm = obstacle_center_norm * pos_std + pos_mean
     return obstacle_denorm
+
+def sample_trajectory_windows(trajectories, history_len, seq_len):
+    """Sample an independent contiguous history + future window per trajectory."""
+    window_len = history_len + seq_len
+    if history_len < 0 or seq_len <= 0:
+        raise ValueError("history_len must be nonnegative and seq_len must be positive")
+    if trajectories.ndim != 3 or trajectories.shape[1] < window_len:
+        raise ValueError("Expected (batch, time, features) trajectories long enough for a window")
+    batch_size, total_len, _ = trajectories.shape
+    starts = torch.randint(
+        total_len - window_len + 1, (batch_size,), device=trajectories.device
+    )
+    times = starts[:, None] + torch.arange(window_len, device=trajectories.device)
+    batches = torch.arange(batch_size, device=trajectories.device)[:, None]
+    return trajectories[batches, times]
+
 
 def generate_target_waypoints(trajectory):
     # Target is the final position (indices 1:4 for x, y, z)
@@ -3296,9 +3313,14 @@ if __name__ == "__main__":
     _base_num_trajectories = config._base_num_trajectories
     
     print("Generating training data with obstacle-aware transformer...")
+    if config.trajectory_length_multiplier < 1:
+        raise ValueError("trajectory_length_multiplier must be at least 1")
+    generated_seq_len = int(
+        (config.history_len + config.seq_len) * config.trajectory_length_multiplier
+    )
     trajectories = generate_aerobatic_trajectories_pvR(
         num_trajectories=_base_num_trajectories, 
-        seq_len=config.seq_len + config.history_len,
+        seq_len=generated_seq_len,
         delta_T=config.delta_T
     )
 
@@ -3323,7 +3345,7 @@ if __name__ == "__main__":
     # )
     
     num_trajectories = trajectories.shape[0]
-    # Split trajectories into train and test sets (80/20 split)
+    # Split full trajectories before sampling windows to avoid train/test leakage (90/10).
     torch.manual_seed(42) # For reproducibility
     indices = torch.randperm(num_trajectories)
     train_size = int(0.9 * num_trajectories)
@@ -3336,6 +3358,8 @@ if __name__ == "__main__":
     # Normalize on train set and apply to test
     train_norm, mean, std = normalize_trajectories(train_trajectories)
     test_norm, _, _ = normalize_trajectories(test_trajectories, mean=mean, std=std)
+    # Keep evaluation windows fixed; training windows are resampled every epoch.
+    test_norm = sample_trajectory_windows(test_norm, config.history_len, config.seq_len)
     
     # Move data to device
     train_norm = train_norm.to(device)
@@ -3374,7 +3398,9 @@ if __name__ == "__main__":
                 actual_batch_size = batch_size
             
             batch_indices = indices[i:i+actual_batch_size]
-            full_traj = train_norm[batch_indices] # (B, T_full, D)
+            full_traj = sample_trajectory_windows(
+                train_norm[batch_indices], config.history_len, config.seq_len
+            )  # (B, history_len + seq_len, D), including aligned style labels
             
             # Extract style index (last dimension)
             style_info = full_traj[:, :, -1:]  # Shape: (B, T_full, 1)
