@@ -90,6 +90,11 @@ class Config:
     # Test
     target_random_offset_bound = 1.0
     maneuver_duration = 16.0  # Duration of the maneuver in seconds (for generating test trajectories)
+    # Success criteria (physical distances in meters after denormalization)
+    success_max_position_error = 2.0  # Maximum pointwise error, strict <
+    success_target_reach_radius = 1.0  # Endpoint distance to target, strict <
+    success_min_safety_distance = 0.0  # Clearance beyond radius + safety_margin, >=
+
     # Plotting control
     plot_guidance_steps = False  # Plot physical barrier correction at every guided diffusion step
     enable_test_plots = True  # Disable evaluation plots and image saving for benchmarking
@@ -1875,7 +1880,7 @@ def test_model_performance_cb_eva(model, trajectories_norm, mean, std, num_test_
         all_guided_positions, 
         all_ground_truth_positions,
         all_target_positions,
-        all_obstacles_data
+        all_obstacles_data, config=config
     )
     
     # Plot combined trajectories for first 9 cases
@@ -2058,18 +2063,18 @@ def compute_collision_rate(trajectories_pos, obstacles_data, safety_margin=None)
         'total_trajectories': batch_size
     }
 
-def compute_success_rates(trajectories_pos, ground_truth_positions, target_positions, obstacles_data, safety_margin=None):
+def compute_success_rates(trajectories_pos, ground_truth_positions, target_positions, obstacles_data, safety_margin=None, config=None):
     """
     Compute comprehensive success rates based on multiple criteria.
     
     Success definitions:
     1. Collision-free: Trajectory has no collisions with obstacles
-    2. Trajectory accuracy: Position error < 2.0 (normalized units)
-    3. Final point accuracy: Final position error < 1.0
-    4. Target reach: Distance to target < 2.0 at final step
-    5. Overall success: Meets all criteria
+    2. Trajectory accuracy: Maximum position error below configured threshold (meters)
+    3. Target reach: Endpoint distance below configured radius (meters)
+    4. Overall success: Meets all criteria
     """
-    safety_margin = Config.safety_margin if safety_margin is None else safety_margin
+    config = Config() if config is None else config
+    safety_margin = config.safety_margin if safety_margin is None else safety_margin
     batch_size = trajectories_pos.shape[0]
     
     if hasattr(trajectories_pos, 'cpu'):
@@ -2079,18 +2084,15 @@ def compute_success_rates(trajectories_pos, ground_truth_positions, target_posit
     if hasattr(target_positions, 'cpu'):
         target_positions = target_positions.cpu().numpy()
     
-    # Success criteria thresholds (can be adjusted)
     criteria = {
-        'max_position_error': 2.0,      # Max allowed position error
-        'max_final_error': 1.0,          # Max allowed final position error
-        'target_reach_radius': 2.0,      # Distance to target considered "reached"
-        'min_safety_distance': 0.0       # Min distance to the margin-expanded obstacle surface
+        'max_position_error': config.success_max_position_error,
+        'target_reach_radius': config.success_target_reach_radius,
+        'min_safety_distance': config.success_min_safety_distance,
     }
-    
+
     # Initialize success flags
     collision_free = np.ones(batch_size, dtype=bool)
     trajectory_accurate = np.ones(batch_size, dtype=bool)
-    final_point_accurate = np.ones(batch_size, dtype=bool)
     target_reached = np.ones(batch_size, dtype=bool)
     safe_distance_maintained = np.ones(batch_size, dtype=bool)
     
@@ -2140,12 +2142,11 @@ def compute_success_rates(trajectories_pos, ground_truth_positions, target_posit
         max_errors.append(max_error)
         trajectory_accurate[batch_idx] = max_error < criteria['max_position_error']
         
-        # 3. Final point accuracy
+        # Endpoint error retained as a descriptive metric only
         final_error = np.linalg.norm(traj_pos[-1] - gt_pos[-1])
         final_errors.append(final_error)
-        final_point_accurate[batch_idx] = final_error < criteria['max_final_error']
         
-        # 4. Target reach
+        # 3. Target reach
         dist_to_target = np.linalg.norm(traj_pos[-1] - target_pos)
         target_distances.append(dist_to_target)
         target_reached[batch_idx] = dist_to_target < criteria['target_reach_radius']
@@ -2154,7 +2155,6 @@ def compute_success_rates(trajectories_pos, ground_truth_positions, target_posit
     overall_success = (
         collision_free & 
         trajectory_accurate & 
-        final_point_accurate & 
         target_reached
     )
     
@@ -2162,7 +2162,6 @@ def compute_success_rates(trajectories_pos, ground_truth_positions, target_posit
     results = {
         'collision_free_rate': np.mean(collision_free) * 100,
         'trajectory_accuracy_rate': np.mean(trajectory_accurate) * 100,
-        'final_point_accuracy_rate': np.mean(final_point_accurate) * 100,
         'target_reach_rate': np.mean(target_reached) * 100,
         'safety_distance_rate': np.mean(safe_distance_maintained) * 100,
         'overall_success_rate': np.mean(overall_success) * 100,
@@ -2253,8 +2252,9 @@ def config_to_string(config):
 
 def print_metrics_with_success_rates(unguided_positions, guided_positions, 
                                       ground_truth_positions, target_positions, 
-                                      obstacles_data):
+                                      obstacles_data, config=None):
     """Print comprehensive metrics including success rates and save to timestamped file."""
+    config = Config() if config is None else config
     
     # Generate timestamp for filename
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -2281,8 +2281,8 @@ def print_metrics_with_success_rates(unguided_positions, guided_positions,
     write_and_print("COLLISION RATE ANALYSIS")
     write_and_print("-"*60)
     
-    unguided_collision = compute_collision_rate(unguided_positions, obstacles_data)
-    guided_collision = compute_collision_rate(guided_positions, obstacles_data)
+    unguided_collision = compute_collision_rate(unguided_positions, obstacles_data, safety_margin=config.safety_margin)
+    guided_collision = compute_collision_rate(guided_positions, obstacles_data, safety_margin=config.safety_margin)
     
     write_and_print(f"\nUNGuided Trajectories (without CBF):")
     write_and_print(f"  - Collision Rate: {unguided_collision['collision_rate']*100:.2f}%")
@@ -2320,10 +2320,10 @@ def print_metrics_with_success_rates(unguided_positions, guided_positions,
     write_and_print("-"*60)
     
     write_and_print("\nSuccess Criteria:")
-    write_and_print("  ✓ Collision-free: No intersection with obstacles")
-    write_and_print("  ✓ Trajectory accuracy: Max position error < 2.0")
-    write_and_print("  ✓ Final point accuracy: Final position error < 1.0")
-    write_and_print("  ✓ Target reach: Distance to target < 2.0 at final step")
+    write_and_print(f"  ✓ Collision-free: radius + safety_margin ({config.safety_margin:g} m)")
+    write_and_print(f"  ✓ Safety distance: Clearance beyond expanded surface >= {config.success_min_safety_distance:g} m")
+    write_and_print(f"  ✓ Trajectory accuracy: Max position error < {config.success_max_position_error:g} m")
+    write_and_print(f"  ✓ Target reach: Distance to target < {config.success_target_reach_radius:g} m at final step")
     write_and_print("  ✓ Overall success: Meets ALL above criteria")
     
     # Unguided success rates
@@ -2331,12 +2331,11 @@ def print_metrics_with_success_rates(unguided_positions, guided_positions,
     write_and_print("UNGuided Trajectories (without CBF)")
     write_and_print("="*60)
     unguided_success = compute_success_rates(
-        unguided_positions, ground_truth_positions, target_positions, obstacles_data
+        unguided_positions, ground_truth_positions, target_positions, obstacles_data, config=config
     )
     
     write_and_print(f"\n  📊 Collision-Free Rate:     {unguided_success['collision_free_rate']:6.2f}%")
     write_and_print(f"  📊 Trajectory Accuracy Rate: {unguided_success['trajectory_accuracy_rate']:6.2f}%")
-    write_and_print(f"  📊 Final Point Accuracy Rate:{unguided_success['final_point_accuracy_rate']:6.2f}%")
     write_and_print(f"  📊 Target Reach Rate:        {unguided_success['target_reach_rate']:6.2f}%")
     write_and_print(f"  📊 Safety Distance Rate:     {unguided_success['safety_distance_rate']:6.2f}%")
     write_and_print(f"  ⭐ OVERALL SUCCESS RATE:     {unguided_success['overall_success_rate']:6.2f}%")
@@ -2346,12 +2345,11 @@ def print_metrics_with_success_rates(unguided_positions, guided_positions,
     write_and_print("Guided Trajectories (with CBF)")
     write_and_print("="*60)
     guided_success = compute_success_rates(
-        guided_positions, ground_truth_positions, target_positions, obstacles_data
+        guided_positions, ground_truth_positions, target_positions, obstacles_data, config=config
     )
     
     write_and_print(f"\n  📊 Collision-Free Rate:     {guided_success['collision_free_rate']:6.2f}%")
     write_and_print(f"  📊 Trajectory Accuracy Rate: {guided_success['trajectory_accuracy_rate']:6.2f}%")
-    write_and_print(f"  📊 Final Point Accuracy Rate:{guided_success['final_point_accuracy_rate']:6.2f}%")
     write_and_print(f"  📊 Target Reach Rate:        {guided_success['target_reach_rate']:6.2f}%")
     write_and_print(f"  📊 Safety Distance Rate:     {guided_success['safety_distance_rate']:6.2f}%")
     write_and_print(f"  ⭐ OVERALL SUCCESS RATE:     {guided_success['overall_success_rate']:6.2f}%")

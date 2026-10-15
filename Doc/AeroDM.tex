@@ -108,6 +108,126 @@ Multi-modal conditioning with obstacle fusion:
 e_{cond} = \text{FusionLayer}([e_t; e_{target}; e_{action}; e_{obstacles}])
 \end{equation}
 
+\subsection{Training Objective}
+\label{sec:training-objective}
+
+The training objective below follows the current implementation of
+\texttt{AeroDMLoss} in \texttt{AeroDM\_ObstacleAware\_Training\_Test.py}.
+The model predicts the clean trajectory $\hat{x}_0$ from a noisy input at a
+random diffusion step; supervision is applied to this reconstructed trajectory.
+Let $B$ be the batch size and $T$ the prediction horizon. Each state contains
+scalar speed $s$, position $p\in\mathbb{R}^3$, velocity $v\in\mathbb{R}^3$,
+and three attitude components $\eta\in\mathbb{R}^3$. A tilde denotes a
+feature normalized using the training mean and standard deviation, and a hat
+denotes a prediction. Unless stated otherwise, the losses use normalized states.
+
+\subsubsection{State Reconstruction and Endpoint Supervision}
+Define the unweighted reconstruction terms as
+\begin{align}
+\mathcal{L}_{p} &= \frac{1}{BT}\sum_{b=1}^{B}\sum_{\tau=1}^{T}
+ \|\hat{\tilde p}_{b,\tau}-\tilde p_{b,\tau}\|_2^2, \\
+\mathcal{L}_{e} &= \frac{1}{B}\sum_{b=1}^{B}
+ \|\hat{\tilde p}_{b,T}-\tilde p_{b,T}\|_2^2, \\
+\mathcal{L}_{v} &= \frac{1}{BT}\sum_{b=1}^{B}\sum_{\tau=1}^{T}
+ \|\hat{\tilde v}_{b,\tau}-\tilde v_{b,\tau}\|_2^2, \\
+\mathcal{L}_{s} &= \frac{1}{BT}\sum_{b=1}^{B}\sum_{\tau=1}^{T}
+ (\hat{\tilde s}_{b,\tau}-\tilde s_{b,\tau})^2, \\
+\mathcal{L}_{\eta} &= \frac{1}{3BT}\sum_{b=1}^{B}\sum_{\tau=1}^{T}
+ \|\hat{\tilde\eta}_{b,\tau}-\tilde\eta_{b,\tau}\|_2^2.
+\end{align}
+The position, endpoint, and velocity terms sum three per-axis mean squared
+errors, whereas the attitude term averages over its three channels. The same
+position scale factor $w$ is applied to all three axes; there is no additional
+vertical-axis weight. The endpoint term supervises the final ground-truth
+position. Removing the endpoint-error threshold from evaluation does not remove
+this training term. The implementation sets $\mathcal{L}_{v}=0$ for $T\leq1$.
+
+\subsubsection{Boundary Continuity and Trajectory Smoothness}
+Let $\tilde p^h_{b,-1}$ and $\tilde p^h_{b,0}$ be the last two historical
+positions. With equally spaced historical and predicted samples, boundary
+continuity is encouraged by matching their displacements:
+\begin{equation}
+\mathcal{L}_{c}=\frac{1}{3B}\sum_{b=1}^{B}
+\left\|(\hat{\tilde p}_{b,1}-\tilde p^h_{b,0})
+ -(\tilde p^h_{b,0}-\tilde p^h_{b,-1})\right\|_2^2.
+\end{equation}
+This term is zero when fewer than two historical samples are available.
+Smoothness within the predicted horizon is penalized using second differences:
+\begin{equation}
+\mathcal{L}_{a}=\frac{1}{3B(T-2)}\sum_{b=1}^{B}\sum_{\tau=2}^{T-1}
+\left\|\hat{\tilde p}_{b,\tau+1}-2\hat{\tilde p}_{b,\tau}
+ +\hat{\tilde p}_{b,\tau-1}\right\|_2^2,\qquad T\geq3.
+\end{equation}
+For shorter horizons this term is zero. It is a normalized-position
+second-difference penalty, without division by $\Delta t^4$, rather than a
+mean squared physical acceleration or an acceleration-tracking objective.
+
+\subsubsection{Kinematic Consistency}
+Positions and velocity channels are first denormalized. When history is
+available, its final state is prepended to the predictions so that the boundary
+interval is also constrained. For each consecutive pair in this augmented
+sequence, define
+\begin{align}
+ a_{b,\tau} &= \frac{v_{b,\tau}-v_{b,\tau-1}}{\Delta t}, \\
+ r_{b,\tau} &= \left[p_{b,\tau}-p_{b,\tau-1}
+ -v_{b,\tau-1}\Delta t-\tfrac12 a_{b,\tau}\Delta t^2\right]
+ \oslash\sigma_p, \\
+\mathcal{L}_{k} &= \frac{1}{3BK}\sum_{b=1}^{B}\sum_{\tau=1}^{K}
+ \|r_{b,\tau}\|_2^2.
+\end{align}
+Here the states are predicted except for the optional historical boundary
+state, $\oslash$ is componentwise division, and $\sigma_p$ is the position
+standard deviation, clamped below by $10^{-8}$. There are $K=T$ intervals
+with history and $K=T-1$ otherwise; the loss is zero if no interval exists.
+The update is equivalent to trapezoidal integration,
+$p_{\tau}-p_{\tau-1}=\tfrac12(v_{\tau-1}+v_{\tau})\Delta t$.
+The physical residual is normalized to the position-reconstruction scale.
+Training supplies the normalization statistics; if both are omitted, the
+implementation treats the supplied states as physical and uses unit scale.
+
+\subsubsection{Optional Obstacle Penalty}
+For sample $b$, let $\mathcal{O}_b$ contain spherical obstacles with centers
+$c_{b,j}$ and radii $r_{b,j}$, and let $N=\sum_b|\mathcal{O}_b|$. Using
+physical predicted positions and an absolute safety margin $m$ in meters,
+\begin{equation}
+\mathcal{L}_{o}=\frac{1}{N}\sum_{b=1}^{B}\sum_{j\in\mathcal{O}_b}
+ \sum_{\tau=1}^{T}
+ \left[\max\left(0,r_{b,j}+m-\|\hat p_{b,\tau}-c_{b,j}\|_2\right)\right]^2.
+\end{equation}
+The term is zero when disabled, when the required obstacle data or normalization
+statistics are absent, or when $N=0$. The implemented denominator is the total
+obstacle count $N=B\bar N$, without division by $T$; consequently, the penalty
+accumulates over the prediction horizon.
+
+\subsubsection{Total Objective and Current Weights}
+The exact weighted objective, expressed using the unweighted terms above, is
+\begin{equation}
+\begin{split}
+\mathcal{L}_{\mathrm{total}}={}&w^2\mathcal{L}_{p}
+ +\lambda_e w\mathcal{L}_{e}+\lambda_v w\mathcal{L}_{v}
+ +\lambda_{\mathrm{other}}(\mathcal{L}_{s}+\mathcal{L}_{\eta})\\
+ &+\lambda_o\mathcal{L}_{o}+\lambda_c\mathcal{L}_{c}
+ +\lambda_a\mathcal{L}_{a}+\lambda_k\mathcal{L}_{k}.
+\end{split}
+\end{equation}
+The factor $w^2$ reflects the implementation: \texttt{xyz\_weight} multiplies
+each position-axis loss and then multiplies their sum again in the total loss.
+The endpoint and velocity terms each receive this factor only once.
+The current configuration uses
+\begin{equation}
+\begin{gathered}
+w=1,\quad \lambda_e=100,\quad \lambda_v=0,\quad
+\lambda_{\mathrm{other}}=1,\\
+\lambda_o=1,\quad \lambda_c=5,\quad \lambda_a=1,\quad
+\lambda_k=10,\quad \Delta t=0.1\,\mathrm{s},\quad m=0\,\mathrm{m}.
+\end{gathered}
+\end{equation}
+Thus direct velocity reconstruction is inactive, while velocity channels remain
+constrained by kinematic consistency. Obstacle loss is currently disabled by
+\texttt{use\_obstacle\_loss=False}, so its contribution is zero despite
+$\lambda_o=1$. These are fixed weights; adaptive weighting is a proposed
+extension, not part of the current training objective.
+
 \section{Model Configuration}
 
 \begin{table}[h]
@@ -123,7 +243,7 @@ Number of Heads & 4 & Multi-head attention heads \\
 Dropout Rate & 0.1 & Regularization parameter \\
 Diffusion Steps & 30 & Number of diffusion steps \\
 Sequence Length & 60 & Trajectory time steps \\
-State Dimension & 10 & $[speed, x, y, z, attitude(6)]$ \\
+State Dimension & 10 & $[s, p(3), v(3), \eta(3)]$ \\
 History Length & 5 & Historical observations \\
 Target Dimension & 3 & Waypoint coordinates \\
 Action Dimension & 5 & Maneuver styles \\
@@ -144,7 +264,7 @@ Obstacle Radius & 5.0 & Safe distance radius \\
     \item \textbf{CBF Safety Guarantees}: Formal safety verification through barrier functions
     \item \textbf{Multi-scale Conditioning}: Effective integration of temporal, spatial, behavioral, and obstacle constraints
     \item \textbf{Causal Attention}: Proper temporal modeling with masked self-attention
-    \item \textbf{Unified Loss Function}: Comprehensive loss with obstacle avoidance and continuity terms
+    \item \textbf{Unified Loss Function}: State reconstruction with endpoint supervision, boundary continuity, second-difference smoothness, kinematic consistency, and optional obstacle avoidance
 \end{enumerate}
 
 \subsection{Training Methodology}
@@ -153,7 +273,7 @@ Obstacle Radius & 5.0 & Safe distance radius \\
     \item \textbf{Enhanced Data Generation}: Diverse aerobatic maneuver simulation with urban obstacles
     \item \textbf{Progressive Normalization}: Dimension-aware normalization strategy
     \item \textbf{CBF-Guided Sampling}: Safety-aware reverse diffusion process
-    \item \textbf{Obstacle-Aware Loss}: Training with explicit obstacle avoidance objectives
+    \item \textbf{Obstacle-Aware Loss}: Optional explicit obstacle penalty (disabled in the current configuration)
 \end{itemize}
 
 \section{Limitations and Improvement Areas}
@@ -242,7 +362,7 @@ Learnable guidance scheduling:
 
 \subsubsection{Enhanced Loss Balancing}
 
-Uncertainty-weighted multi-task loss:
+As a future extension to the fixed weights in Section~\ref{sec:training-objective}, an uncertainty-weighted multi-task objective could be used:
 
 \begin{equation}
 \mathcal{L}_{total} = \sum_{i=1}^{D} \frac{1}{2\sigma_i^2} \mathcal{L}_i + \log \sigma_i
