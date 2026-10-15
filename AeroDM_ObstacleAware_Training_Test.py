@@ -64,9 +64,9 @@ class Config:
 
     # CBF Guidance parameters (from CoDiG paper)
     # enable_cbf_guidance = True  # Disabled by default; toggle for inference
-    guidance_gamma = 1.0  # Barrier guidance strength (0 to 1); internally scaled by 4000
-    safe_extra_factor=0.20 # Safety buffer as fraction of radius (e.g., 20%)
-    barrier_sigma = 0.4 # Smoothness parameter for logistic barrier function (tune for best results)
+    guidance_gamma = 0.5  # Barrier guidance strength (0 to 1); internally scaled by 4000
+    barrier_type = "logistic"  # "standard": compute_barrier_and_grad; "logistic": compute_barrier_and_grad_logistic
+    barrier_sigma = 0.3 # Smoothness parameter for logistic barrier function (only used with barrier_type="logistic")
 
     last_xyz_weight=50.0 # Extra weight for final timestep's position error
     xyz_weight=1.0 # Extra weight for Z-axis (height) in aviation
@@ -525,7 +525,7 @@ class ObstacleAwareDiffusionTransformer(nn.Module):
         return mask
 
 # Barrier Function Computation for Multiple Obstacles
-def compute_barrier_and_grad(x, mean, std, obstacles_data=None, safety_margin = 0.20):
+def compute_barrier_and_grad(x, mean, std, obstacles_data=None):
     """
     Compute barrier V and its gradient ∇V for the trajectory x.
     Fixed version with proper gradient computation.
@@ -550,7 +550,7 @@ def compute_barrier_and_grad(x, mean, std, obstacles_data=None, safety_margin = 
             
             for obstacle in batch_obs:
                 center = obstacle['center'].to(x.device)
-                radius = obstacle['radius'] + safety_margin  # Add safety margin
+                radius = obstacle['radius']
                 
                 # Euclidean distances
                 distances = torch.norm(pos_denorm[batch_idx] - center.unsqueeze(0), dim=1)
@@ -588,13 +588,13 @@ def compute_barrier_and_grad(x, mean, std, obstacles_data=None, safety_margin = 
     return V_avg, grad_x
 
 # Barrier Function Computation for Multiple Obstacles using Logistic (Sigmoid) Approach
-def compute_barrier_and_grad_logistic(x, mean, std, obstacles_data=None, safety_margin=0.20, sigma=0.5):
+def compute_barrier_and_grad_logistic(x, mean, std, obstacles_data=None, sigma=0.5):
     """
     Compute barrier V and its gradient ∇V for the trajectory x using Logistic (Sigmoid) approach.
     
     Logistic probability function:
         P(d) = 1 / (1 + exp(-(d^2 - R_s^2) / sigma))
-        where R_s = radius + safety_margin, d = distance to obstacle center
+        where R_s = obstacle radius, d = distance to obstacle center
     
     The barrier value V = -log(P(d)) encourages the trajectory to stay away from obstacles.
     This provides a smooth, differentiable barrier with probabilistic interpretation.
@@ -605,7 +605,6 @@ def compute_barrier_and_grad_logistic(x, mean, std, obstacles_data=None, safety_
         mean: Normalization mean tensor
         std: Normalization std tensor
         obstacles_data: List of obstacle dictionaries for each batch sample
-        safety_margin: Additional safety buffer beyond obstacle radius
         sigma: Smoothness parameter for logistic function (controls transition sharpness)
     
     Returns:
@@ -633,7 +632,7 @@ def compute_barrier_and_grad_logistic(x, mean, std, obstacles_data=None, safety_
             
             for obstacle in batch_obs:
                 center = obstacle['center'].to(x.device)
-                radius = obstacle['radius'] + safety_margin  # Add safety margin
+                radius = obstacle['radius']
                 
                 # Compute squared Euclidean distances (batch, seq_len)
                 # dist_sq = ||p - c||^2
@@ -771,7 +770,17 @@ class ObstacleAwareDiffusionProcess:
                 gamma_t = (4000.0 * guidance_gamma) * (1.0 - t_exp.squeeze(1).float() / self.config.diffusion_steps)
                 
                 # Compute barrier gradient ∇V with multiple obstacles
-                V, grad_V = compute_barrier_and_grad_logistic(pred_x0, mean, std, obstacles_data, safety_margin=config.safe_extra_factor, sigma=config.barrier_sigma)
+                if self.config.barrier_type == "standard":
+                    V, grad_V = compute_barrier_and_grad(pred_x0, mean, std, obstacles_data)
+                elif self.config.barrier_type == "logistic":
+                    V, grad_V = compute_barrier_and_grad_logistic(
+                        pred_x0, mean, std, obstacles_data, sigma=self.config.barrier_sigma
+                    )
+                else:
+                    raise ValueError(
+                        f"Unsupported barrier_type: {self.config.barrier_type!r}; "
+                        "expected 'standard' or 'logistic'"
+                    )
 
                 barrier_info = {'V': V, 'grad_V': grad_V, 'gamma_t': gamma_t}
                 # print(barrier_info)
@@ -1067,15 +1076,13 @@ class AeroDMLoss(nn.Module):
     Unified loss function for AeroDM training.
     Combines position, velocity, speed, attitude, and optional obstacle avoidance losses.
     Supports switching obstacle term via flag; always returns 5 values for consistency.
-    Fixes: Proper safety margin for obstacles, Z-weighting, normalization by avg obstacles.
+    Uses actual obstacle radii, Z-weighting, and normalization by average obstacle count.
     """
-    def __init__(self, config, enable_obstacle_term=False, safe_extra_factor=0.2, last_xyz_weight=1.5, xyz_weight=1.5, vel_weight=1.0, other_weight=1.0, obstacle_weight=10.0, continuity_weight=15.0, acc_weight=1.0, kinematics_weight=1.0):
+    def __init__(self, config, enable_obstacle_term=False, last_xyz_weight=1.5, xyz_weight=1.5, vel_weight=1.0, other_weight=1.0, obstacle_weight=10.0, continuity_weight=15.0, acc_weight=1.0, kinematics_weight=1.0):
         super().__init__()
         self.config = config
         # Flag to enable/disable obstacle distance penalty in total loss
         self.enable_obstacle_term = enable_obstacle_term
-        # Safety buffer beyond obstacle surface (as fraction of radius, e.g., 0.2 = 20%)
-        self.safe_extra_factor = safe_extra_factor
         # Extra weight for the last point's position loss (critical for trajectory endpoint accuracy)
         self.last_xyz_weight = last_xyz_weight
         # Extra weight for Z-axis losses (height is critical in aviation trajectories)
@@ -1099,9 +1106,8 @@ class AeroDMLoss(nn.Module):
     def compute_obstacle_distance_loss(self, pred_trajectory, obstacles_data, mean, std):
         """
         Computes obstacle avoidance loss.
-        Penalizes trajectories that enter a safety buffer around obstacles.
-        Formula: sum_over_obs_and_time [max(0, safe_extra - (dist_to_surface))^2] / (batch * seq * avg_num_obs)
-        Where dist_to_surface = dist_to_center - radius.
+        Penalizes only points inside the actual obstacle radius.
+        Formula: sum_over_obs_and_time [max(0, radius - distance)^2] / total_num_obs.
         Returns 0 if disabled or no obstacles.
         """
         if not self.enable_obstacle_term or not obstacles_data or len(obstacles_data) == 0:
@@ -1131,18 +1137,13 @@ class AeroDMLoss(nn.Module):
                 # Obstacle center (3D tensor) and radius (scalar)
                 center = obstacle['center'].to(device)  # Shape: (3,)
                 radius = obstacle['radius']  # Scalar float
-                # Compute safety extra distance (proportional to radius)
-                safe_extra = self.safe_extra_factor * radius
                 
                 # Euclidean distances from trajectory points to center
                 # Shape: (seq_len,)
                 distances = torch.norm(pred_pos_denorm[batch_idx] - center.unsqueeze(0), dim=1)
                 
-                # Distance to obstacle surface (positive outside, negative inside)
-                surface_dist = distances - radius
-                # Penalty only if inside safety buffer: clamp(safe_extra - surface_dist, 0)
-                # E.g., if surface_dist < safe_extra, penalize the violation squared
-                closeness_penalty = torch.clamp(safe_extra - surface_dist, min=0.0)
+                # Penalize penetration into the actual obstacle only.
+                closeness_penalty = torch.clamp(radius - distances, min=0.0)
                 # Accumulate squared penalties over time steps
                 obstacle_loss = obstacle_loss + torch.sum(closeness_penalty ** 2)
         
@@ -1964,7 +1965,7 @@ def print_inference_time_statistics(times_unguided, times_guided):
         'speedup': speedup
     }
 
-def compute_collision_rate(trajectories_pos, obstacles_data, safety_margin=0.0):
+def compute_collision_rate(trajectories_pos, obstacles_data):
     """Compute collision rate for a batch of trajectories."""
     batch_size = trajectories_pos.shape[0]
     
@@ -1985,7 +1986,7 @@ def compute_collision_rate(trajectories_pos, obstacles_data, safety_margin=0.0):
                 center = obstacle['center']
                 if hasattr(center, 'cpu'):
                     center = center.cpu().numpy()
-                radius = obstacle['radius'] + safety_margin
+                radius = obstacle['radius']
                 
                 dist = np.linalg.norm(point - center)
                 if dist < radius:
@@ -2015,9 +2016,8 @@ def compute_success_rates(trajectories_pos, ground_truth_positions, target_posit
     Success definitions:
     1. Collision-free: Trajectory has no collisions with obstacles
     2. Trajectory accuracy: Position error < 2.0 (normalized units)
-    3. Final point accuracy: Final position error < 1.0
-    4. Target reach: Distance to target < 2.0 at final step
-    5. Overall success: Meets all criteria
+    3. Target reach: Distance to target < 1.0 at final step
+    4. Overall success: Meets all criteria
     """
     batch_size = trajectories_pos.shape[0]
     
@@ -2031,15 +2031,13 @@ def compute_success_rates(trajectories_pos, ground_truth_positions, target_posit
     # Success criteria thresholds (can be adjusted)
     criteria = {
         'max_position_error': 2.0,      # Max allowed position error
-        'max_final_error': 1.0,          # Max allowed final position error
-        'target_reach_radius': 2.0,      # Distance to target considered "reached"
-        'min_safety_distance': 0.3       # Min distance to obstacle surface
+        'target_reach_radius': 1.0,      # Distance to target considered "reached"
+        'min_safety_distance': 0.       # Min distance to obstacle surface
     }
     
     # Initialize success flags
     collision_free = np.ones(batch_size, dtype=bool)
     trajectory_accurate = np.ones(batch_size, dtype=bool)
-    final_point_accurate = np.ones(batch_size, dtype=bool)
     target_reached = np.ones(batch_size, dtype=bool)
     safe_distance_maintained = np.ones(batch_size, dtype=bool)
     
@@ -2089,12 +2087,11 @@ def compute_success_rates(trajectories_pos, ground_truth_positions, target_posit
         max_errors.append(max_error)
         trajectory_accurate[batch_idx] = max_error < criteria['max_position_error']
         
-        # 3. Final point accuracy
+        # Record final point error for diagnostics only
         final_error = np.linalg.norm(traj_pos[-1] - gt_pos[-1])
         final_errors.append(final_error)
-        final_point_accurate[batch_idx] = final_error < criteria['max_final_error']
         
-        # 4. Target reach
+        # 3. Target reach
         dist_to_target = np.linalg.norm(traj_pos[-1] - target_pos)
         target_distances.append(dist_to_target)
         target_reached[batch_idx] = dist_to_target < criteria['target_reach_radius']
@@ -2103,7 +2100,6 @@ def compute_success_rates(trajectories_pos, ground_truth_positions, target_posit
     overall_success = (
         collision_free & 
         trajectory_accurate & 
-        final_point_accurate & 
         target_reached
     )
     
@@ -2111,7 +2107,6 @@ def compute_success_rates(trajectories_pos, ground_truth_positions, target_posit
     results = {
         'collision_free_rate': np.mean(collision_free) * 100,
         'trajectory_accuracy_rate': np.mean(trajectory_accurate) * 100,
-        'final_point_accuracy_rate': np.mean(final_point_accurate) * 100,
         'target_reach_rate': np.mean(target_reached) * 100,
         'safety_distance_rate': np.mean(safe_distance_maintained) * 100,
         'overall_success_rate': np.mean(overall_success) * 100,
@@ -2173,7 +2168,7 @@ def config_to_string(config):
     lines.append("")
     lines.append(f"CBF Guidance Parameters:")
     lines.append(f"  guidance_gamma: {config.guidance_gamma}")
-    lines.append(f"  safe_extra_factor: {config.safe_extra_factor}")
+    lines.append(f"  barrier_type: {config.barrier_type}")
     lines.append(f"  barrier_sigma: {config.barrier_sigma}")
     lines.append("")
     lines.append(f"Loss Weights:")
@@ -2226,8 +2221,8 @@ def print_metrics_with_success_rates(unguided_positions, guided_positions,
     write_and_print("COLLISION RATE ANALYSIS")
     write_and_print("-"*60)
     
-    unguided_collision = compute_collision_rate(unguided_positions, obstacles_data, safety_margin=0.0)
-    guided_collision = compute_collision_rate(guided_positions, obstacles_data, safety_margin=0.0)
+    unguided_collision = compute_collision_rate(unguided_positions, obstacles_data)
+    guided_collision = compute_collision_rate(guided_positions, obstacles_data)
     
     write_and_print(f"\nUNGuided Trajectories (without CBF):")
     write_and_print(f"  - Collision Rate: {unguided_collision['collision_rate']*100:.2f}%")
@@ -2267,8 +2262,7 @@ def print_metrics_with_success_rates(unguided_positions, guided_positions,
     write_and_print("\nSuccess Criteria:")
     write_and_print("  ✓ Collision-free: No intersection with obstacles")
     write_and_print("  ✓ Trajectory accuracy: Max position error < 2.0")
-    write_and_print("  ✓ Final point accuracy: Final position error < 1.0")
-    write_and_print("  ✓ Target reach: Distance to target < 2.0 at final step")
+    write_and_print("  ✓ Target reach: Distance to target < 1.0 at final step")
     write_and_print("  ✓ Overall success: Meets ALL above criteria")
     
     # Unguided success rates
@@ -2281,7 +2275,6 @@ def print_metrics_with_success_rates(unguided_positions, guided_positions,
     
     write_and_print(f"\n  📊 Collision-Free Rate:     {unguided_success['collision_free_rate']:6.2f}%")
     write_and_print(f"  📊 Trajectory Accuracy Rate: {unguided_success['trajectory_accuracy_rate']:6.2f}%")
-    write_and_print(f"  📊 Final Point Accuracy Rate:{unguided_success['final_point_accuracy_rate']:6.2f}%")
     write_and_print(f"  📊 Target Reach Rate:        {unguided_success['target_reach_rate']:6.2f}%")
     write_and_print(f"  📊 Safety Distance Rate:     {unguided_success['safety_distance_rate']:6.2f}%")
     write_and_print(f"  ⭐ OVERALL SUCCESS RATE:     {unguided_success['overall_success_rate']:6.2f}%")
@@ -2296,7 +2289,6 @@ def print_metrics_with_success_rates(unguided_positions, guided_positions,
     
     write_and_print(f"\n  📊 Collision-Free Rate:     {guided_success['collision_free_rate']:6.2f}%")
     write_and_print(f"  📊 Trajectory Accuracy Rate: {guided_success['trajectory_accuracy_rate']:6.2f}%")
-    write_and_print(f"  📊 Final Point Accuracy Rate:{guided_success['final_point_accuracy_rate']:6.2f}%")
     write_and_print(f"  📊 Target Reach Rate:        {guided_success['target_reach_rate']:6.2f}%")
     write_and_print(f"  📊 Safety Distance Rate:     {guided_success['safety_distance_rate']:6.2f}%")
     write_and_print(f"  ⭐ OVERALL SUCCESS RATE:     {guided_success['overall_success_rate']:6.2f}%")
@@ -3444,7 +3436,6 @@ if __name__ == "__main__":
     criterion = AeroDMLoss(
         config, 
         enable_obstacle_term = config.use_obstacle_loss,
-        safe_extra_factor=config.safe_extra_factor,
         last_xyz_weight=config.last_xyz_weight,
         xyz_weight=config.xyz_weight,
         vel_weight=config.vel_weight,
