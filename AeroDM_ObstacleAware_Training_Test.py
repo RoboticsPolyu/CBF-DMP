@@ -1,6 +1,7 @@
 #AeroDM + Barrier Function Guidance + Obstacle Encoding
 
 import os
+import pickle
 from unittest import case
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
 
@@ -29,8 +30,11 @@ from Test.distribute_trajectories import generate_distributed_trajectories
 # Configuration parameters based on the paper
 class Config:
     # Training parameters
-    num_epochs = 100
-    batch_size = 32
+    # device = "cuda:0"  # Remote NVIDIA GPU; fail explicitly if CUDA is unavailable
+    device = "mps"  # Apple GPU; also supports "cuda:0" or "cpu"
+    num_epochs = 200
+    checkpoint_interval = 50  # Save a historical checkpoint every N completed epochs
+    batch_size = 256
     _base_num_trajectories = 25000 # Base number of trajectories before augmentation (will be increased by concatenation)
     test_batch_size = 8  # Evaluation batch size; 1 restores serial sampling
     num_test_samples = 200
@@ -64,8 +68,8 @@ class Config:
 
     # CBF Guidance parameters (from CoDiG paper)
     # enable_cbf_guidance = True  # Disabled by default; toggle for inference
-    guidance_gamma = 0.5  # Barrier guidance strength (0 to 1); internally scaled by 4000
-    barrier_type = "logistic"  # "standard": compute_barrier_and_grad; "logistic": compute_barrier_and_grad_logistic
+    guidance_gamma = 1.0  # Barrier guidance strength (0 to 1); internally scaled by 4000
+    barrier_type = "standard"  # "standard": compute_barrier_and_grad; "logistic": compute_barrier_and_grad_logistic
     barrier_sigma = 0.3 # Smoothness parameter for logistic barrier function (only used with barrier_type="logistic")
 
     last_xyz_weight=50.0 # Extra weight for final timestep's position error
@@ -93,8 +97,32 @@ class Config:
     
     # Model save/load paths
     model_save_dir = "model"
-    model_filename = "aerodm_v2_test_2026_oct_04.pth"  # Base name (timestamp will be added when saving)
-    # model_filename = "aerodm_v2_test_23styles.pth"  # Base name (timestamp will be added when saving) 2026-Jul-30 good model
+    model_filename = "aerodm_v2_test_2026_oct_04_20261004_190459.pth"  # Base name (timestamp will be added when saving)
+    # aerodm_v2_test_2026_oct_04_20261004_190459.pth good for testing; aerodm_v2_test_2026_oct_04_20261004_190459.pth is a trained model without obstacle encoding and CBF guidance
+    # aerodm_v2_test_enc_20261016_182457.pth is a trained model with obstacle encoding and CBF guidance
+
+
+
+class _CheckpointUnpickler(pickle.Unpickler):
+    """Resolve the Config class used by checkpoints from the modular trainer."""
+
+    def find_class(self, module, name):
+        if module == 'aerodm_core.config' and name == 'Config':
+            return Config
+        return super().find_class(module, name)
+
+
+class _CheckpointPickleModule:
+    Unpickler = _CheckpointUnpickler
+    load = staticmethod(pickle.load)
+
+
+def load_model_checkpoint(model_path, device):
+    return torch.load(
+        model_path, map_location=device, weights_only=False,
+        pickle_module=_CheckpointPickleModule,
+    )
+
 
 # Transformer positional encoding
 class PositionalEncoding(nn.Module):
@@ -220,7 +248,7 @@ class AttentionObstacleEncoder(nn.Module):
     """
     Attention-based obstacle encoder for small obstacle sets (<10 obstacles).
     Uses self-attention to model interactions between obstacles and handles
-    variable numbers of obstacles naturally without padding.
+    variable obstacle counts via legacy lists or masked batches.
     """
     def __init__(self, config):
         super().__init__()
@@ -268,6 +296,25 @@ class AttentionObstacleEncoder(nn.Module):
             global_features: Tensor of shape [batch_size, obs_latent_dim]
                             Global obstacle embedding for each sample
         """
+        if isinstance(obstacles_data, dict):
+            centers = obstacles_data['centers']
+            radii = obstacles_data['radii']
+            valid = obstacles_data['valid_mask']
+            features = torch.cat((centers, radii.unsqueeze(-1)), dim=-1)
+            embedded = self.obstacle_proj(features) + self.pos_encoding[:, :centers.size(1)]
+            # Give empty samples a dummy key to avoid all-masked attention NaNs.
+            nonempty = valid.any(dim=1)
+            attention_valid = valid.clone()
+            attention_valid[:, 0] |= ~nonempty
+            attended, _ = self.attention(embedded, embedded, embedded,
+                                        key_padding_mask=~attention_valid, need_weights=False)
+            masked = attended.masked_fill(~valid.unsqueeze(-1), 0)
+            pooled_mean = masked.sum(dim=1) / valid.sum(dim=1, keepdim=True).clamp_min(1)
+            pooled_max = attended.masked_fill(~valid.unsqueeze(-1), float('-inf')).max(dim=1).values
+            pooled_max = torch.where(nonempty[:, None], pooled_max, torch.zeros_like(pooled_max))
+            result = self.global_proj(torch.cat((pooled_mean, pooled_max), dim=-1))
+            return result.masked_fill(~nonempty[:, None], 0)
+
         batch_size = len(obstacles_data)
         device = next(self.parameters()).device
         
@@ -1114,6 +1161,14 @@ class AeroDMLoss(nn.Module):
             # Return a scalar tensor with requires_grad for backprop compatibility
             return torch.tensor(0.0, device=pred_trajectory.device, requires_grad=True)
         
+        if isinstance(obstacles_data, dict):
+            positions = pred_trajectory[..., 1:4] * std[..., 1:4] + mean[..., 1:4]
+            distances = torch.linalg.vector_norm(
+                positions[:, :, None, :] - obstacles_data['centers'][:, None, :, :], dim=-1)
+            penalties = (obstacles_data['radii'][:, None, :] - distances).clamp_min(0).square()
+            valid = obstacles_data['valid_mask']
+            return (penalties * valid[:, None, :]).sum() / valid.sum().clamp_min(1)
+
         batch_size, seq_len, _ = pred_trajectory.shape
         device = pred_trajectory.device
         # Initialize accumulators
@@ -1342,6 +1397,26 @@ def add_target_noise(target, bound=1.0):
     target_noisy[:, :3] = target_noisy[:, :3] + noise
     
     return target_noisy
+
+@torch.no_grad()
+def generate_training_obstacles_batch(positions, num_obstacles_range=(3, 5), radius_range=(0.5, 1.0)):
+    """Sample physical obstacles on-device, matching the legacy check_collision=False rule.
+
+    Random-number sequences differ, but counts, frame selection, offset and radius
+    distributions are unchanged. Invalid padded slots are excluded by valid_mask.
+    """
+    batch_size, steps, _ = positions.shape
+    minimum, maximum = num_obstacles_range
+    if steps <= 10 or not 0 <= minimum <= maximum or maximum < 1:
+        raise ValueError("Need >10 trajectory frames and a valid positive obstacle capacity")
+    counts = torch.randint(minimum, maximum + 1, (batch_size,), device=positions.device)
+    indices = torch.randint(10, steps, (batch_size, maximum), device=positions.device)
+    centers = positions.gather(1, indices[..., None].expand(-1, -1, 3)) + 0.3
+    radii = torch.empty(batch_size, maximum, device=positions.device, dtype=positions.dtype)
+    radii.uniform_(*radius_range)
+    valid = torch.arange(maximum, device=positions.device)[None, :] < counts[:, None]
+    return {'centers': centers, 'radii': radii, 'valid_mask': valid}
+
 
 def generate_random_obstacles(trajectory, num_obstacles_range=(1, 5), radius_range=(0.5, 2.0), check_collision=False, device='cpu'):
     """
@@ -1714,8 +1789,9 @@ def test_model_performance_cb_eva(model, trajectories_norm, mean, std, num_test_
     # Set normalization parameters
     model.set_normalization_params(mean, std)
     
-    # Store data for first 9 cases for combined visualization
+    # Store one case per prediction style for combined visualization.
     combined_cases = []
+    combined_style_ids = set()
     
     # Storage for metrics computation
     all_unguided_positions = []
@@ -1795,9 +1871,11 @@ def test_model_performance_cb_eva(model, trajectories_norm, mean, std, num_test_
                 all_target_positions.append(target_denorm[0, :3].cpu().numpy())
                 all_obstacles_data.append(obstacles)
 
-                # Store first 9 cases for combined visualization
-                if enable_plots and i < 9 and plot_combined:
-                    hist_idx, pred_idx = history_style.item(), pred_style.item()
+                # Select the first nine distinct prediction styles across all batches.
+                hist_idx, pred_idx = history_style.item(), pred_style.item()
+                if (enable_plots and plot_combined and len(combined_cases) < 9
+                        and pred_idx not in combined_style_ids):
+                    combined_style_ids.add(pred_idx)
                     combined_cases.append({
                         'idx': i + 1,
                         'original': x_0_denorm[0, :, 1:4].detach().cpu().numpy(),
@@ -1830,7 +1908,7 @@ def test_model_performance_cb_eva(model, trajectories_norm, mean, std, num_test_
         all_obstacles_data
     )
     
-    # Plot combined trajectories for first 9 cases
+    # Plot combined trajectories with distinct prediction styles
     if enable_plots and plot_combined and len(combined_cases) > 0:
         plot_combined_trajectories(combined_cases, show_flag)
 
@@ -2505,7 +2583,7 @@ def plot_combined_trajectories(combined_cases, show_flag=True):
     Plot 3D trajectories from multiple test cases in a single figure (3x3 grid).
     
     Args:
-        combined_cases: List of 9 case data dictionaries, each containing:
+        combined_cases: List of 9 case data dictionaries with distinct prediction styles, each containing:
             - idx: case index
             - original: original trajectory positions (seq_len, 3)
             - guided: CBF-guided sampled trajectory positions (seq_len, 3)
@@ -2517,9 +2595,13 @@ def plot_combined_trajectories(combined_cases, show_flag=True):
         show_flag: Whether to display the plot or save to file
     """
     num_cases = len(combined_cases)
-    if num_cases == 0:
-        print("No cases to plot combined trajectories.")
+    if num_cases != 9:
+        print(f"Skipping combined plot: need 9 distinct prediction styles, got {num_cases}. "
+              "Increase num_test_samples or use a test set with more styles.")
         return
+    prediction_styles = [case['pred_style'] for case in combined_cases]
+    if len(set(prediction_styles)) != 9:
+        raise ValueError("Combined plot requires 9 distinct prediction styles")
     
     # Define grid layout (3x3)
     rows = 3
@@ -2632,7 +2714,8 @@ def plot_combined_trajectories(combined_cases, show_flag=True):
     if show_flag:
         plt.show()
     # else:
-    filename = "Figs/combined_9_test_cases.svg"
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    filename = f"Figs/combined_9_test_cases_{timestamp}.svg"
     plt.savefig(filename, format='svg', bbox_inches='tight', dpi=300)
     plt.close()
     print(f"Combined plot saved to {filename}")
@@ -3083,6 +3166,7 @@ def plot_test_results(original, sampled_unguided_denorm, sampled_guided_denorm, 
                       history_style=None, pred_style=None, style_names=None, pdf=None):
     """Draw one publication-style page; append to the evaluation's shared PDF.
 
+    Also save a standalone 3D SVG per sample in output/svg.
     Direct calls without a writer save an individual PDF in output/pdf.
     show_flag controls interactive display only; every page is saved.
     """
@@ -3111,23 +3195,7 @@ def plot_test_results(original, sampled_unguided_denorm, sampled_guided_denorm, 
     half = max(float(np.max(high - low)), 1.0) * 0.58
     limits = [(c - half, c + half) for c in center]
 
-    fig = plt.figure(figsize=(11.7, 8.3), facecolor='white')
-    try:
-        fig.text(0.07, 0.95, f'Trajectory comparison | Sample {step_idx:03d}', fontsize=15)
-        def style_name(value):
-            idx = int(value.item()) if hasattr(value, 'item') else value
-            return str((style_names or {}).get(idx, f'Style {idx}')).replace('_', ' ')
-        subtitle = []
-        if history_style is not None:
-            subtitle.append('History: ' + style_name(history_style))
-        if pred_style is not None:
-            subtitle.append('Prediction: ' + style_name(pred_style))
-        fig.text(0.07, 0.915, '  |  '.join(subtitle), fontsize=9, color='#555555')
-        grid = fig.add_gridspec(2, 3, left=0.07, right=0.94, bottom=0.12,
-                               top=0.85, wspace=0.48, hspace=0.5)
-        ax3 = fig.add_subplot(grid[:, :2], projection='3d')
-        ax3.set_position([0.035, 0.22, 0.52, 0.59])
-        ax3.set_title('(a) Spatial trajectory', loc='left', pad=12)
+    def draw_spatial_view(ax3):
         ax3.set_proj_type('ortho')
         ax3.view_init(elev=24, azim=-58)
         for pos, label, color, ls, lw in curves:
@@ -3149,6 +3217,25 @@ def plot_test_results(original, sampled_unguided_denorm, sampled_guided_denorm, 
         ax3.set(xlim=limits[0], ylim=limits[1], zlim=limits[2],
                 xlabel='X (m)', ylabel='Y (m)', zlabel='Z (m)')
         ax3.set_box_aspect((1, 1, 1))
+
+    fig = plt.figure(figsize=(11.7, 8.3), facecolor='white')
+    try:
+        fig.text(0.07, 0.95, f'Trajectory comparison | Sample {step_idx:03d}', fontsize=15)
+        def style_name(value):
+            idx = int(value.item()) if hasattr(value, 'item') else value
+            return str((style_names or {}).get(idx, f'Style {idx}')).replace('_', ' ')
+        subtitle = []
+        if history_style is not None:
+            subtitle.append('History: ' + style_name(history_style))
+        if pred_style is not None:
+            subtitle.append('Prediction: ' + style_name(pred_style))
+        fig.text(0.07, 0.915, '  |  '.join(subtitle), fontsize=9, color='#555555')
+        grid = fig.add_gridspec(2, 3, left=0.07, right=0.94, bottom=0.12,
+                               top=0.85, wspace=0.48, hspace=0.5)
+        ax3 = fig.add_subplot(grid[:, :2], projection='3d')
+        ax3.set_position([0.035, 0.22, 0.52, 0.59])
+        ax3.set_title('(a) Spatial trajectory', loc='left', pad=12)
+        draw_spatial_view(ax3)
         # Three equal-sized projections in a dedicated right-hand column.
         for k, (a, b, title) in enumerate([(0, 1, '(b) XY plane'),
                                           (0, 2, '(c) XZ plane'),
@@ -3196,6 +3283,18 @@ def plot_test_results(original, sampled_unguided_denorm, sampled_guided_denorm, 
         else:
             os.makedirs('output/pdf', exist_ok=True)
             fig.savefig(f'output/pdf/test_sample_{step_idx:03d}_results.pdf', facecolor='white')
+        svg_fig = plt.figure(figsize=(7.2, 7.2), facecolor='white')
+        try:
+            svg_ax = svg_fig.add_axes([0.08, 0.19, 0.80, 0.73], projection='3d')
+            draw_spatial_view(svg_ax)
+            svg_fig.legend(handles=handles, loc='lower center',
+                           bbox_to_anchor=(0.5, 0.025), ncol=min(3, len(handles)),
+                           frameon=False, handlelength=2.7, columnspacing=1.7)
+            os.makedirs('output/svg', exist_ok=True)
+            svg_fig.savefig(f'output/svg/test_sample_{step_idx:03d}_results.svg',
+                            format='svg', bbox_inches='tight', facecolor='white')
+        finally:
+            plt.close(svg_fig)
         if show_flag:
             plt.show()
     finally:
@@ -3425,9 +3524,20 @@ if __name__ == "__main__":
     print("Training Obstacle-Aware AeroDM with Transformer Integration and Obstacle-Aware Loss...")
     
     # Device setup
-    device = torch.device("cuda" if torch.cuda.is_available() else 
-                          "mps" if torch.backends.mps.is_available() else "cpu")
-    print(f"Using device: {device}")
+    device = torch.device(Config.device)
+    if device.type == 'cuda':
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA was selected, but CUDA is unavailable in this environment")
+        device_name = torch.cuda.get_device_name(device)
+    elif device.type == 'mps':
+        if not torch.backends.mps.is_available():
+            raise RuntimeError("MPS was selected, but MPS is unavailable in this environment")
+        device_name = "Apple GPU (MPS)"
+    elif device.type == 'cpu':
+        device_name = "CPU"
+    else:
+        raise ValueError(f"Unsupported device: {device}; use mps, cuda:0, or cpu")
+    print(f"Using device: {device} ({device_name})")
     
     # Configuration
     config = Config()
@@ -3502,6 +3612,7 @@ if __name__ == "__main__":
         start_time = time.time()
 
         # Training Loop
+        checkpoint_run_id = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
         for epoch in range(num_epochs):
             model.train()
             epoch_total_loss = 0
@@ -3547,17 +3658,8 @@ if __name__ == "__main__":
                 # Generate obstacles for this batch (only needed if obstacle loss is enabled)
                 obstacles_for_batch = None
                 if config.use_obstacle_loss or config.enable_obstacle_encoding:
-                    obstacles_for_batch = []
-                    for b in range(actual_batch_size):
-                        traj_denorm = denormalize_trajectories(full_traj[b:b+1, config.history_len:, :], mean, std)
-                        obstacles = generate_random_obstacles(
-                            traj_denorm[0], 
-                            num_obstacles_range=(3, 5), 
-                            radius_range=(0.5, 1.0), 
-                            check_collision=False, 
-                            device=device
-                        )
-                        obstacles_for_batch.append(obstacles) 
+                    physical_positions = x_0[..., 1:4] * std[..., 1:4] + mean[..., 1:4]
+                    obstacles_for_batch = generate_training_obstacles_batch(physical_positions)
 
                 # Model prediction (reverse process: predict x_0 from x_t)
                 pred_x0 = model(x_t, t, target, action, history, obstacles_data=obstacles_for_batch)
@@ -3610,6 +3712,29 @@ if __name__ == "__main__":
             sys.stdout.write(progress_str)
             sys.stdout.flush()
             
+            if (epoch + 1) % config.checkpoint_interval == 0:
+                os.makedirs(config.model_save_dir, exist_ok=True)
+                stem = os.path.splitext(config.model_filename)[0]
+                history_path = os.path.join(
+                    config.model_save_dir,
+                    f'{stem}_{checkpoint_run_id}_epoch_{epoch + 1:04d}.pth')
+                history_checkpoint = {
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'epoch': epoch,  # Zero-based, consistent with the final checkpoint
+                    'loss': losses,
+                    'mean': mean,
+                    'std': std,
+                    'use_obstacle_loss': config.use_obstacle_loss,
+                    'config': config,
+                    'config_values': {key: getattr(config, key) for key in dir(config)
+                                      if not key.startswith('__') and not callable(getattr(config, key))},
+                }
+                # Replace only after a complete write, avoiding partial .pth files.
+                torch.save(history_checkpoint, history_path + '.tmp')
+                os.replace(history_path + '.tmp', history_path)
+                print(f"\nHistorical checkpoint saved after epoch {epoch + 1}: {history_path}", flush=True)
+
             if epoch == num_epochs - 1:
                 print() 
                 
@@ -3658,7 +3783,7 @@ if __name__ == "__main__":
         
         if os.path.exists(model_path):
             print(f"Loading model from: {model_path}")
-            checkpoint = torch.load(model_path, map_location=device, weights_only=False)
+            checkpoint = load_model_checkpoint(model_path, device)
             
             # Load model state
             model.load_state_dict(checkpoint['model_state_dict'])
