@@ -30,8 +30,8 @@ from Test.distribute_trajectories import generate_distributed_trajectories
 class Config:
     # Training parameters
     seed = 42  # NumPy data generation and PyTorch initialization / sampling
-    num_epochs = 100
-    batch_size = 16
+    num_epochs = 200
+    batch_size = 32
     _base_num_trajectories = 25000 # Base number of trajectories before augmentation (will be increased by concatenation)
     test_batch_size = 16  # Evaluation batch size; 1 restores serial sampling
     num_test_samples = 200
@@ -3558,7 +3558,9 @@ if __name__ == "__main__":
     train_norm, mean, std = normalize_trajectories(train_trajectories)
     test_norm, _, _ = normalize_trajectories(test_trajectories, mean=mean, std=std)
     
-    # Keep the expanded training set on CPU; transfer only the current batch.
+    # Keep normalized training windows resident on the training device.
+    train_norm = train_norm.to(device)
+    print(f"Training data resident on {train_norm.device}: {train_norm.numel() * train_norm.element_size() / 2**20:.1f} MiB; batch_size={batch_size}")
     test_norm = test_norm.to(device)
     mean = mean.to(device)
     std = std.to(device)
@@ -3586,14 +3588,12 @@ if __name__ == "__main__":
         # Training Loop
         for epoch in range(num_epochs):
             model.train()
-            epoch_total_loss = 0
-            epoch_position_loss = 0
-            epoch_vel_loss = 0
-            epoch_obstacle_loss = 0 if config.use_obstacle_loss else None
-            epoch_continuity_loss = 0
+            # MPS does not support float64; keep detached metric sums on device.
+            metric_dtype = torch.float32 if device.type == "mps" else torch.float64
+            epoch_loss_sums = torch.zeros(5, device=device, dtype=metric_dtype)
             num_batches = 0
             
-            indices = torch.randperm(train_size)
+            indices = torch.randperm(train_size).to(device)
             
             for i in range(0, train_size, batch_size):
                 if i + batch_size > train_size:
@@ -3602,7 +3602,7 @@ if __name__ == "__main__":
                     actual_batch_size = batch_size
                 
                 batch_indices = indices[i:i+actual_batch_size]
-                full_traj = train_norm[batch_indices].to(device)  # Already fixed-length windows
+                full_traj = train_norm[batch_indices]  # Fixed-length windows already on device
                 
                 # Extract style index (last dimension)
                 style_info = full_traj[:, :, -1:]  # Shape: (B, T_full, 1)
@@ -3660,21 +3660,20 @@ if __name__ == "__main__":
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
                 
-                # Accumulate losses
-                epoch_total_loss += total_loss.item()
-                epoch_position_loss += position_loss.item()
-                epoch_vel_loss += vel_loss.item()
-                if config.use_obstacle_loss:
-                    epoch_obstacle_loss += obstacle_loss.item()
-                epoch_continuity_loss += continuity_loss.item()
+                # Accumulate detached metrics on device; transfer once per epoch.
+                batch_metrics = torch.stack((
+                    total_loss.detach(), position_loss.detach(), vel_loss.detach(),
+                    obstacle_loss.detach() if config.use_obstacle_loss else total_loss.detach().new_zeros(()),
+                    continuity_loss.detach(),
+                ))
+                epoch_loss_sums.add_(batch_metrics.to(dtype=metric_dtype))
                 num_batches += 1
 
             # Calculate average losses for the epoch
             if num_batches > 0:
-                avg_total = epoch_total_loss / num_batches
-                avg_position = epoch_position_loss / num_batches
-                avg_vel = epoch_vel_loss / num_batches
-                avg_continuity = epoch_continuity_loss / num_batches
+                avg_total, avg_position, avg_vel, avg_obstacle, avg_continuity = (
+                    epoch_loss_sums / num_batches
+                ).cpu().tolist()
 
                 losses['total'].append(avg_total)
                 losses['position'].append(avg_position)
@@ -3682,7 +3681,6 @@ if __name__ == "__main__":
                 losses['continuity'].append(avg_continuity)
                 
                 if config.use_obstacle_loss:
-                    avg_obstacle = epoch_obstacle_loss / num_batches
                     losses['obstacle'].append(avg_obstacle)
                 else:
                     avg_obstacle = 0.0
