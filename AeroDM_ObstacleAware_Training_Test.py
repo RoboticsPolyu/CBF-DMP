@@ -85,6 +85,7 @@ class Config:
     drop_style_prob = 0.1  # Probability of dropping style information during training for robustness
     drop_target_prob = 0.1  # Probability of dropping target waypoint information during training for robustness    
     guidance_scale = 2.0  # Classifier-free guidance scale for sampling (tune for best results)
+    cfg_batch_forward = True  # Fuse conditional/style-null predictions into one inference batch
 
     # Plotting control
     plot_guidance_steps = False  # Plot physical barrier correction at every guided diffusion step
@@ -572,178 +573,54 @@ class ObstacleAwareDiffusionTransformer(nn.Module):
         return mask
 
 # Barrier Function Computation for Multiple Obstacles
+def pack_guidance_obstacles(obstacles_data, x):
+    """Pack once per sampling call; padded obstacles contribute exactly zero."""
+    if isinstance(obstacles_data, tuple):
+        return obstacles_data
+    batches = [] if obstacles_data is None else obstacles_data[:x.shape[0]]
+    count = max((len(obs) for obs in batches), default=0)
+    centers = x.new_zeros((x.shape[0], count, 3))
+    radius_sq = x.new_zeros((x.shape[0], count))
+    valid = torch.zeros((x.shape[0], count), device=x.device, dtype=torch.bool)
+    for b, obstacles in enumerate(batches):
+        for j, obstacle in enumerate(obstacles):
+            centers[b, j] = obstacle['center'].to(x.device)
+            # Square before conversion, as in the original implementation.
+            radius_sq[b, j] = obstacle['radius'] * obstacle['radius']
+            valid[b, j] = True
+    return centers, radius_sq, valid
+
+
+def _batched_barrier(x, mean, std, obstacles_data, sigma=None):
+    centers, radius_sq, valid = pack_guidance_obstacles(obstacles_data, x)
+    grad_x = torch.zeros_like(x)
+    if centers.shape[1] == 0:
+        return x.new_zeros(()), grad_x
+    pos = (x[:, :, 1:4] * std[0, 0, 1:4] + mean[0, 0, 1:4]).detach()
+    delta = pos[:, None, :, :] - centers[:, :, None, :]
+    if sigma is None:
+        distances = torch.norm(delta, dim=-1)
+        violation = torch.clamp(radius_sq[:, :, None] - distances * distances, min=0.0)
+        values = violation
+        gradients = -2 * violation[..., None] * (delta / (distances[..., None] + 1e-6))
+    else:
+        dist_sq = torch.sum(delta * delta, dim=-1)
+        p_safe = torch.sigmoid((dist_sq - radius_sq[:, :, None]) / sigma)
+        values = -torch.log(p_safe + 1e-8)
+        gradients = (-(1 - p_safe) * 2.0 / sigma)[..., None] * delta
+    values = values.masked_fill(~valid[:, :, None], 0)
+    gradients = gradients.masked_fill(~valid[:, :, None, None], 0)
+    # Keep the existing normalization and analytic guidance formulas unchanged.
+    grad_x[:, :, 1:4] = gradients.sum(dim=1) / std[0, 0, 1:4].to(x.device)
+    return values.sum(dim=2).sum(dim=1).mean(), grad_x
+
+
 def compute_barrier_and_grad(x, mean, std, obstacles_data=None):
-    """
-    Compute barrier V and its gradient ∇V for the trajectory x.
-    Fixed version with proper gradient computation.
-    """
-    # Denormalize positions for barrier computation
-    pos_denorm = x[:, :, 1:4] * std[0, 0, 1:4] + mean[0, 0, 1:4]
-    batch_size, seq_len, _ = pos_denorm.shape
-    
-    # Initialize gradient tensor for denormalized positions
-    grad_pos_denorm = torch.zeros_like(pos_denorm)
-    
-    pos_denorm = pos_denorm.clone().detach()
-    
-    # Initialize barrier value
-    V_total = torch.zeros(batch_size, device=x.device)
-    
-    # Process each obstacle
-    if obstacles_data is not None:
-        for batch_idx in range(batch_size):
-            # Get obstacles for this sample
-            batch_obs = obstacles_data[batch_idx] if batch_idx < len(obstacles_data) else []
-            
-            for obstacle in batch_obs:
-                center = obstacle['center'].to(x.device)
-                radius = obstacle['radius']
-                
-                # Euclidean distances
-                distances = torch.norm(pos_denorm[batch_idx] - center.unsqueeze(0), dim=1)
-                
-                # Closeness function: r - distance
-                h = radius * radius - distances * distances
-                # h = (p-o)^T*(p-o) - r^2
-                # P_free(x) = Φ(z) = Φ( h(x) / σ_h(x) )
-                # log(P_free) = log(Φ(z)) ; ∇log(P_free) = ( φ(z) / Φ(z) ) * ∇h / σ_h   
-                # φ(z) = exp(-0.5*z^2) / sqrt(2π)
-                
-                # Barrier violation term: max(0, h)^2
-                violation = torch.clamp(h, min=0.0)
-                V_obstacle = torch.sum(violation) # sum( min(0, r^2 - d^2  ) r^2 - d^2 = r^2 - ||p - c||^2
-                V_total[batch_idx] += V_obstacle
-                
-                # Compute gradient for this obstacle
-                violation_mask = (h > 0).float().unsqueeze(1)
-                direction_vec = pos_denorm[batch_idx] - center.unsqueeze(0)
-                
-                epsilon = 1e-6  
-                grad_dist = direction_vec / (distances.unsqueeze(1) + epsilon)
-                grad_V_obs = -2 * violation.unsqueeze(1) * grad_dist
+    return _batched_barrier(x, mean, std, obstacles_data)
 
-                grad_pos_denorm[batch_idx] = grad_pos_denorm[batch_idx] + grad_V_obs
-    
-    # Map gradient back to normalized space
-    grad_x = torch.zeros_like(x, device=x.device)
-    std_scaled = std[0, 0, 1:4].to(x.device)
-    grad_x[:, :, 1:4] = grad_pos_denorm / std_scaled
-    
-    # V_total is sum of barrier violations
-    V_avg = V_total.mean()
-    
-    return V_avg, grad_x
 
-# Barrier Function Computation for Multiple Obstacles using Logistic (Sigmoid) Approach
 def compute_barrier_and_grad_logistic(x, mean, std, obstacles_data=None, sigma=0.5):
-    """
-    Compute barrier V and its gradient ∇V for the trajectory x using Logistic (Sigmoid) approach.
-    
-    Logistic probability function:
-        P(d) = 1 / (1 + exp(-(d^2 - R_s^2) / sigma))
-        where R_s = obstacle radius, d = distance to obstacle center
-    
-    The barrier value V = -log(P(d)) encourages the trajectory to stay away from obstacles.
-    This provides a smooth, differentiable barrier with probabilistic interpretation.
-    
-    Args:
-        x: Normalized trajectory tensor (batch, seq_len, state_dim)
-        config: Configuration object
-        mean: Normalization mean tensor
-        std: Normalization std tensor
-        obstacles_data: List of obstacle dictionaries for each batch sample
-        sigma: Smoothness parameter for logistic function (controls transition sharpness)
-    
-    Returns:
-        V_avg: Average barrier violation value (scalar tensor)
-        grad_x: Gradient of barrier w.r.t normalized trajectory (same shape as x)
-    """
-    # Denormalize positions for barrier computation
-    pos_denorm = x[:, :, 1:4] * std[0, 0, 1:4] + mean[0, 0, 1:4]
-    batch_size, seq_len, _ = pos_denorm.shape
-    
-    # Initialize gradient tensor for denormalized positions
-    grad_pos_denorm = torch.zeros_like(pos_denorm)
-    
-    # Detach positions to avoid in-place modification issues
-    pos_denorm = pos_denorm.clone().detach()
-    
-    # Initialize barrier value (negative log probability)
-    V_total = torch.zeros(batch_size, device=x.device)
-    
-    # Process each obstacle
-    if obstacles_data is not None:
-        for batch_idx in range(batch_size):
-            # Get obstacles for this sample
-            batch_obs = obstacles_data[batch_idx] if batch_idx < len(obstacles_data) else []
-            
-            for obstacle in batch_obs:
-                center = obstacle['center'].to(x.device)
-                radius = obstacle['radius']
-                
-                # Compute squared Euclidean distances (batch, seq_len)
-                # dist_sq = ||p - c||^2
-                delta = pos_denorm[batch_idx] - center.unsqueeze(0)  # (seq_len, 3)
-                dist_sq = torch.sum(delta * delta, dim=1)  # (seq_len,)
-                
-                # Compute logistic probability: P = sigmoid((R_s^2 - d^2) / sigma)
-                # Note: Using (R_s^2 - d^2) gives high probability when d < R_s
-                R_sq = radius * radius
-                logit = (R_sq - dist_sq) / sigma  # Positive when inside safety radius
-                P = torch.sigmoid(logit)  # P in [0, 1], high when close to obstacle
-                
-                # Barrier: V = -log(P) = log(1 + exp(-logit))
-                # This is the negative log probability (softplus formulation)
-                # V is small when P is high (close to obstacle), large when far away
-                # Wait - careful: We want V to be HIGH when close to obstacle (barrier violation)
-                # Actually, -log(P) is large when P is small (far from obstacle)
-                # So we use V = -log(1 - P) or V = log(1/P) with P being collision probability
-                
-                # Alternative: Define barrier as -log(1 - P) which grows as P -> 1
-                # P = probability of being safe? Let's define P_safe = sigmoid((d^2 - R_s^2)/sigma)
-                # Then V = -log(P_safe) grows as trajectory enters obstacle region
-                
-                # Using: P_safe = sigmoid((d^2 - R_s^2)/sigma) = 1 / (1 + exp(-(d^2 - R_s^2)/sigma))
-                # This gives P_safe -> 0 when d << R_s (inside obstacle), P_safe -> 1 when d >> R_s
-                # Then V = -log(P_safe) is large when inside obstacle, small when outside
-                logit_safe = (dist_sq - R_sq) / sigma  # Negative inside, positive outside
-                P_safe = torch.sigmoid(logit_safe)  # Safe probability
-                
-                # Barrier value: negative log probability of being safe
-                # Add epsilon to avoid log(0)
-                V_obstacle = -torch.log(P_safe + 1e-8)
-                V_total[batch_idx] += torch.sum(V_obstacle)
-                
-                # Compute gradient of V w.r.t positions
-                # V = -log(P_safe) = -log(sigmoid(logit_safe))
-                # dV/dp = - (1/P_safe) * dP_safe/dp
-                # dP_safe/dp = P_safe * (1 - P_safe) * d(logit_safe)/dp
-                # d(logit_safe)/dp = (2 * delta) / sigma
-                # Therefore: dV/dp = - (1 - P_safe) * (2 * delta) / sigma
-                
-                # Compute P_safe gradient factor
-                # P_safe = sigmoid(logit_safe)
-                # dV/dp = - (1 - P_safe) * (2 * delta) / sigma
-                
-                # Gradient magnitude factor: - (1 - P_safe) * 2 / sigma
-                grad_factor = - (1 - P_safe) * 2.0 / sigma  # (seq_len,)
-                
-                # Direction vectors from points to obstacle center
-                # Note: delta = p - c, so gradient points away from obstacle (repulsive)
-                grad_V_obs = grad_factor.unsqueeze(1) * delta  # (seq_len, 3)
-                
-                # Accumulate gradient
-                grad_pos_denorm[batch_idx] = grad_pos_denorm[batch_idx] + grad_V_obs
-    
-    # Map gradient back to normalized space
-    grad_x = torch.zeros_like(x, device=x.device)
-    std_scaled = std[0, 0, 1:4].to(x.device)
-    grad_x[:, :, 1:4] = grad_pos_denorm / std_scaled
-    
-    # V_total is sum of barrier violations
-    V_avg = V_total.mean()
-    
-    return V_avg, grad_x
+    return _batched_barrier(x, mean, std, obstacles_data, sigma=sigma)
 
 # Diffusion Process with Obstacle-Aware Sampling
 class ObstacleAwareDiffusionProcess:
@@ -756,6 +633,17 @@ class ObstacleAwareDiffusionProcess:
         self.alphas = 1.0 - self.betas
         self.alpha_bars = torch.cumprod(self.alphas, dim=0)
         
+    def _schedule_on(self, device):
+        # Cache immutable schedules for each device; preserve their original dtype.
+        key = str(device)
+        if not hasattr(self, '_device_schedules'):
+            self._device_schedules = {}
+        if key not in self._device_schedules:
+            self._device_schedules[key] = tuple(
+                v.to(device) for v in (self.alphas, self.betas, self.alpha_bars)
+            )
+        return self._device_schedules[key]
+
     def q_sample(self, x_0, t, noise=None):
         """Forward diffusion process: q(x_t | x_0)"""
         if noise is None:
@@ -765,14 +653,15 @@ class ObstacleAwareDiffusionProcess:
             t = t.view(-1, 1, 1)
         
         # Move alpha_bars to the same device as x_0
-        alpha_bars = self.alpha_bars.to(x_0.device)
+        _, _, alpha_bars = self._schedule_on(x_0.device)
         alpha_bar_t = alpha_bars[t]
         x_t = torch.sqrt(alpha_bar_t) * x_0 + torch.sqrt(1 - alpha_bar_t) * noise
         
         return x_t, noise
     
     def p_sample(self, model, x_t, t, target=None, action=None, history=None, enable_guidance=True, guidance_gamma=None, 
-                mean=None, std=None, plot_step=False, step_idx=0, obstacles_data=None):
+                mean=None, std=None, plot_step=False, step_idx=0, obstacles_data=None,
+                timestep=None, guidance_obstacles=None):
         """
         Reverse diffusion process with obstacle-aware sampling.
         """
@@ -780,25 +669,38 @@ class ObstacleAwareDiffusionProcess:
         device = x_t.device
         # print("p_sample - enable_cbf_guidance: ", enable_guidance, "mean:", mean, "std: ", std, "gamma: ", guidance_gamma, "obstacles_data size: ", len(obstacles_data))
         with torch.no_grad():
-            # Conditional prediction (with action) for guidance
-            pred_x0_cond = model(x_t, t, target, action, history, obstacles_data)
-            
-            # Classifier-free guidance: pred_x0 = pred_x0_uncond + guidance_scale * (pred_x0_cond - pred_x0_uncond)
-            if enable_guidance and self.config.guidance_scale != 1.0:
-                # Only compute the unconditional prediction when CFG is active.
-                zero_action = torch.zeros_like(action)
-                pred_x0_uncond = model(x_t, t, target, zero_action, history, obstacles_data)
+            cfg_active = enable_guidance and self.config.guidance_scale != 1.0
+            # Keep the sequential path for training/dropout and optional benchmarking.
+            if cfg_active and getattr(self.config, 'cfg_batch_forward', True) and not model.training:
+                def duplicate(value):
+                    return None if value is None else torch.cat((value, value), dim=0)
+
+                cfg_action = action if action is not None else x_t.new_zeros((batch_size, self.config.action_dim))
+                cfg_history = history
+                if history is not None and history.size(0) == 1 and batch_size != 1:
+                    cfg_history = history.expand(batch_size, -1, -1)
+                cfg_obstacles = None if obstacles_data is None else list(obstacles_data) + list(obstacles_data)
+                predictions = model(
+                    duplicate(x_t), duplicate(t), duplicate(target),
+                    torch.cat((cfg_action, torch.zeros_like(cfg_action)), dim=0),
+                    duplicate(cfg_history), cfg_obstacles,
+                )
+                pred_x0_cond, pred_x0_uncond = predictions.chunk(2, dim=0)
                 pred_x0 = pred_x0_uncond + self.config.guidance_scale * (pred_x0_cond - pred_x0_uncond)
             else:
-                pred_x0 = pred_x0_cond
+                pred_x0_cond = model(x_t, t, target, action, history, obstacles_data)
+                if cfg_active:
+                    zero_action = torch.zeros_like(action)
+                    pred_x0_uncond = model(x_t, t, target, zero_action, history, obstacles_data)
+                    pred_x0 = pred_x0_uncond + self.config.guidance_scale * (pred_x0_cond - pred_x0_uncond)
+                else:
+                    pred_x0 = pred_x0_cond
 
             # Expand t for broadcasting
             t_exp = t.view(batch_size, 1, 1) if t.dim() == 1 else t.view(-1, 1, 1)
             
             # Move diffusion parameters to the same device as x_t
-            alphas = self.alphas.to(x_t.device)
-            betas = self.betas.to(x_t.device)
-            alpha_bars = self.alpha_bars.to(x_t.device)
+            alphas, betas, alpha_bars = self._schedule_on(x_t.device)
             
             alpha_bar_t = alpha_bars[t_exp.squeeze(1)].view(batch_size, 1, 1)
             alpha_t = alphas[t_exp.squeeze(1)].view(batch_size, 1, 1)
@@ -816,12 +718,13 @@ class ObstacleAwareDiffusionProcess:
                 # Compute γ_t (scheduled: strongest at t=0 for final safety enforcement)
                 gamma_t = (4000.0 * guidance_gamma) * (1.0 - t_exp.squeeze(1).float() / self.config.diffusion_steps)
                 
+                barrier_obstacles = obstacles_data if guidance_obstacles is None else guidance_obstacles
                 # Compute barrier gradient ∇V with multiple obstacles
                 if self.config.barrier_type == "standard":
-                    V, grad_V = compute_barrier_and_grad(pred_x0, mean, std, obstacles_data)
+                    V, grad_V = compute_barrier_and_grad(pred_x0, mean, std, barrier_obstacles)
                 elif self.config.barrier_type == "logistic":
                     V, grad_V = compute_barrier_and_grad_logistic(
-                        pred_x0, mean, std, obstacles_data, sigma=self.config.barrier_sigma
+                        pred_x0, mean, std, barrier_obstacles, sigma=self.config.barrier_sigma
                     )
                 else:
                     raise ValueError(
@@ -832,16 +735,12 @@ class ObstacleAwareDiffusionProcess:
                 barrier_info = {'V': V, 'grad_V': grad_V, 'gamma_t': gamma_t}
                 # print(barrier_info)
                 # Guided score: s_guided = s_theta - γ_t ∇V
-                sigma_t = sqrt_one_minus_alpha_bar_t
                 # ε_guided = mu_pred - gamma_t.view(batch_size, 1, 1) * grad_V
                 # norm(grad_V) << norm(mu_pred), sigma_t: 1->0, gamma_t: 0->4000*guidance_gamma
                 ε_guided = ε_pred + gamma_t.view(batch_size, 1, 1) * grad_V * sqrt_one_minus_alpha_bar_t
                 # ε_pred = score_function * - sqrt_one_minus_alpha_bar_t
                 # norm(score_function) = norm(ε_pred) / sigma_t; norm(ε_pred)^2 ~ χ2(D) 
 
-                s_norm = torch.norm(ε_pred, dim=(1,2), keepdim=True)
-                grad_norm = torch.norm(gamma_t.view(batch_size, 1, 1) * grad_V, dim=(1,2), keepdim=True)
-                # print("s_norm: ", s_norm, "grad_norm: ", grad_norm,  "gamma_t: ", gamma_t, "sigma_t: ", sigma_t)
 
             else:
                 ε_guided = ε_pred
@@ -852,7 +751,7 @@ class ObstacleAwareDiffusionProcess:
             mu = (1 / torch.sqrt(alpha_t)) * (x_t - coeff * ε_guided)
             
             # For t=0, return pred_x0 (or guided equivalent)
-            is_t_zero = (t_exp.squeeze(1) == 0).all()
+            is_t_zero = (timestep == 0) if timestep is not None else (t_exp.squeeze(1) == 0).all()
             if plot_step and barrier_info is not None:
                 # Isolate the barrier correction with the same prediction and noise.
                 # The final step uses the x0 reconstruction rather than the DDPM mean.
@@ -874,7 +773,7 @@ class ObstacleAwareDiffusionProcess:
                 return pred_x0_guided
             
             # Variance (DDPM posterior variance)
-            alpha_bar_prev = alpha_bars[t_exp.squeeze(1) - 1].view(batch_size, 1, 1) if t.min() > 0 else torch.ones_like(alpha_bar_t)
+            alpha_bar_prev = alpha_bars[t_exp.squeeze(1) - 1].view(batch_size, 1, 1) if (timestep > 0 if timestep is not None else t.min() > 0) else torch.ones_like(alpha_bar_t)
             # var = β_t * (1 - ᾱ_{t-1}) / (1 - ᾱ_t)
             var = beta_t * (1 - alpha_bar_prev) / one_minus_alpha_bar_t
             sigma = torch.sqrt(var)
@@ -1093,6 +992,8 @@ class AeroDM(nn.Module):
         
         # Reverse diffusion process
         self.diffusion_process._plot_run_id = time.time_ns()
+        guidance_obstacles = pack_guidance_obstacles(self.obstacles_data, x_t) if enable_guidance else None
+        self.diffusion_process._schedule_on(device)
         step_counter = 0
         for t_step in reversed(range(self.config.diffusion_steps)):
             t_batch = torch.full((batch_size,), t_step, device=device, dtype=torch.long)
@@ -1106,7 +1007,8 @@ class AeroDM(nn.Module):
             x_t = self.diffusion_process.p_sample(
                 self.diffusion_model, x_t, t_batch, target, action, history, enable_guidance,
                 gamma, self.mean, self.std, plot_step=plot_step, step_idx=step_counter,
-                obstacles_data=self.obstacles_data
+                obstacles_data=self.obstacles_data, timestep=t_step,
+                guidance_obstacles=guidance_obstacles
             )
             step_counter += 1
         

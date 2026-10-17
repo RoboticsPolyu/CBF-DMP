@@ -183,6 +183,26 @@ Record the checkpoint, full configuration, normalization statistics, test trajec
 
 This is a simulation research implementation with known spherical obstacles and sampled-point collision checks. Barrier guidance does not by itself certify continuous-time collision avoidance, dynamic feasibility, or safe hardware execution. Current code, historical scripts, and manuscript experiments may use different state layouts and training settings.
 
+## Batched classifier-free guidance
+
+`Config.cfg_batch_forward = True` combines the conditional and style-null CFG branches into one model call with twice the sampling batch size. The goal, history and obstacles are retained in both branches; the CFG formula, barrier guidance and number of sampling steps are unchanged. This applies in evaluation mode; training mode retains sequential calls. Set the flag to `False` to restore sequential CFG when comparing performance or reducing peak activation memory. Unguided sampling and CFG scale 1 still use one ordinary forward call.
+
+The local MPS comparison can be rerun with `python tests/benchmark_cfg_batch.py`. It uses the saved source in `output/cfg_batch_benchmark/before.py`, the configured checkpoint and shared scenes in `output/rk3588_20261017/scenes.npz`; these local artifacts must be present. Numerical comparisons use floating-point tolerances, since a different batch shape may change rounding.
+
+## Local MPS inference benchmark
+
+Measure unguided and guided inference for N trajectories with 60 diffusion steps:
+
+```bash
+python tests/benchmark_mps_inference.py --num-trajectories 200 --batch-size 32 --repeats 3
+```
+
+Requires an Apple Silicon PyTorch environment with MPS, NumPy and Matplotlib. The script loads the main script's configured checkpoint (override with `--checkpoint PATH`), uses its normalization, and prepares identical aerobatic histories and obstacle scenes for both modes. The main script's architecture and guidance settings are used, so an alternative checkpoint must match them. No training or plots are run. MPS must be available; the script does not silently fall back to CPU.
+
+Both modes are warmed up for each batch shape, timed with MPS synchronization, and use matched random seeds. Guided includes the existing CFG and barrier guidance. Printed averages exclude checkpoint loading, data preparation and warm-up; they include the production sampling call and obstacle packing. JSON results, individual batch timings and settings are saved under `Results/` (override with `--output PATH`). The final partial batch is included in N.
+
+The reported per-trajectory time is total sampling time divided by N, averaged over repeats. With batch sizes above 1, this measures amortized throughput; use `--batch-size 1` to measure serial per-trajectory latency. `--warmup` controls warm-up calls per mode and batch shape (default 2).
+
 ## Troubleshooting
 
 - **Checkpoint not found:** train with `train_model=True`, or correct `model_save_dir` and `model_filename`.
