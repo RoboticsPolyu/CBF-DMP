@@ -210,3 +210,25 @@ The reported per-trajectory time is total sampling time divided by N, averaged o
 - **Out of memory:** reduce training/evaluation batch sizes or the synthetic dataset size; the main script moves generated datasets to the selected device.
 - **Headless environment:** run `MPLBACKEND=Agg python AeroDM_ObstacleAware_Training_Test.py` and leave `show_flag=False`.
 - **Missing output directory:** create `model`, `Results`, `Figs`, and `output/pdf` before running.
+
+### 多机轨迹生成 Demo
+
+`demo_multi_agent.py` 是独立入口，复用 `AeroDM_ObstacleAware_Training_Test.py` 的模型定义和已有 checkpoint，不运行原文件的训练/测试入口，也不需要重新训练。
+
+```bash
+python demo_multi_agent.py --agents 4 --last-m 15 --collision-distance 1.0 --device cpu
+# Apple GPU 可用时：--device mps；NVIDIA GPU：--device cuda:0
+```
+
+- 一个 batch 表示同一场景中的 N 架无人机，每架使用独立 history、target、style；不能把不同场景混入同一 batch。
+- `--last-m` 指最后 M 个**反向扩散步**（t=M-1,...,0），不是未来轨迹的最后 M 帧。0 关闭机间引导。
+- 对预测的干净轨迹 x0 反归一化，在每个未来时刻计算所有 i<j 的中心距离，使用平方距离侵入惩罚的排斥方向同步更新所有无人机；不比较不同时间点，不计算自身碰撞。
+- `--collision-distance` 是物理坐标中的机间中心距离阈值。引导目标额外增加 `--safety-margin 0.05`；`--strength 0.4`、`--iterations 30` 控制每个扩散步内的修正。
+- 默认把不同生成轨迹平移到共同的未来交汇点来构造测试条件。两次采样使用相同随机种子及相同 CFG 设置，仅机间引导不同。
+- 输出 `output/multi_agent/comparison.png`、`trajectories.npz`、`metrics.json`。指标包括最小机间距离、低于阈值的“无人机对×时刻”数量、引导实际调用次数。
+
+自定义输入：`python demo_multi_agent.py --input scene.npz --last-m 15`。NPZ 必须包含物理单位的 `history [N,20,10]`、`target [N,3]`、整数 `style [N]`（0–22）；history 长度以 checkpoint 配置为准。状态顺序为 `[speed,x,y,z,vx,vy,vz,roll,pitch,yaw]`。所有无人机必须使用同一坐标系和同步时间轴；输入文件中的 N 决定无人机数量。
+
+该 demo 只修正位置通道，不约束速度/姿态一致性、历史连接或终点误差，也未检查采样点之间的连续时间碰撞。请以输出指标判断当前场景的避碰效果，不视为严格安全保证。
+
+验证：`PYTHONPATH=. python tests/check_multi_agent.py`。
