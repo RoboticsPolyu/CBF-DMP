@@ -34,9 +34,9 @@ class Config:
     device = "mps"  # Apple GPU; also supports "cuda:0" or "cpu"
     num_epochs = 200
     checkpoint_interval = 50  # Save a historical checkpoint every N completed epochs
-    batch_size = 256
+    batch_size = 16
     _base_num_trajectories = 25000 # Base number of trajectories before augmentation (will be increased by concatenation)
-    test_batch_size = 8  # Evaluation batch size; 1 restores serial sampling
+    test_batch_size = 32  # Evaluation batch size; 1 restores serial sampling
     num_test_samples = 200
 
     # Model dimensions
@@ -69,7 +69,7 @@ class Config:
     # CBF Guidance parameters (from CoDiG paper)
     # enable_cbf_guidance = True  # Disabled by default; toggle for inference
     guidance_gamma = 1.0  # Barrier guidance strength (0 to 1); internally scaled by 4000
-    barrier_type = "standard"  # "standard": compute_barrier_and_grad; "logistic": compute_barrier_and_grad_logistic
+    barrier_type = "logistic"  # "standard": compute_barrier_and_grad; "logistic": compute_barrier_and_grad_logistic
     barrier_sigma = 0.3 # Smoothness parameter for logistic barrier function (only used with barrier_type="logistic")
 
     last_xyz_weight=50.0 # Extra weight for final timestep's position error
