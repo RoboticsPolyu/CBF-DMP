@@ -121,7 +121,7 @@ def create_3d_animation_precomputed(ball_all, box, frame_points_list, obstacle_m
 
     if save_gif:
         print("Saving 3D animation with pre-computed maps as GIF...")
-        anim.save('Figs/3d_point_cloud_precomputed_maps.gif', writer='pillow', fps=3, dpi=100)
+        anim.save('Figures/3d_point_cloud_precomputed_maps.gif', writer='pillow', fps=3, dpi=100)
         print("3D animation saved as '3d_point_cloud_precomputed_maps.gif'")
     
     plt.show()
@@ -300,7 +300,7 @@ def test_lidar_map():
         gif_frames.append(img)
         plt.close(fig)
 
-    gif_path = "Figs/obstacle_map.gif"
+    gif_path = "Figures/obstacle_map.gif"
     print(f"Saving obstacle animation → {gif_path}")
     iio.imwrite(gif_path, gif_frames, fps=8, loop=0)
     print(f"Fixed animation saved: {os.path.abspath(gif_path)}")
@@ -590,7 +590,7 @@ def visualize_point_cloud_3d(point_cloud_3d, point_coords=None, obstacles=None,
     if show_flag:
         plt.show()
     else:
-        filename = "Figs/obstacle_point_cloud_3d.svg"
+        filename = "Figures/obstacle_point_cloud_3d.svg"
         plt.savefig(filename, format='svg', bbox_inches='tight', dpi=300)
         plt.close()
 

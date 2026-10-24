@@ -165,7 +165,7 @@ def plot_mpd_comparison(original, standard_sample, mpd_sample, history, target, 
     if show_flag:
         plt.show()
     else:
-        filename = f"Figs/mpd_planning_test_{step_idx:03d}.svg"
+        filename = f"Figures/mpd_planning_test_{step_idx:03d}.svg"
         plt.savefig(filename, format='svg', bbox_inches='tight')
         plt.close()
 

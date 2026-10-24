@@ -666,7 +666,7 @@ def plot_training_losses(losses, show_flag=False):
     if show_flag:
         plt.show()
     else:
-        filename = "Figs/training_losses_bg.svg"
+        filename = "Figures/training_losses_bg.svg"
         plt.savefig(filename, format='svg', bbox_inches='tight')
         plt.close()
 
@@ -924,7 +924,7 @@ def generate_history_segments(trajectories, history_len=5, device=None):
     
     return torch.stack(histories)
 
-def plot_trajectory_comparison(original, reconstructed, sampled, history=None, target=None, title="Figs/Barrier Guidance Trajectory Comparison", obstacle_center=None, obstacle_radius=None, show_flag=False):
+def plot_trajectory_comparison(original, reconstructed, sampled, history=None, target=None, title="Figures/Barrier Guidance Trajectory Comparison", obstacle_center=None, obstacle_radius=None, show_flag=False):
     """Enhanced visualization with history, target, and obstacle (for CBF demo)"""
     fig = plt.figure(figsize=(20, 15))
     fig.suptitle(title, fontsize=16)
@@ -1188,7 +1188,7 @@ def test_model_performance(model, trajectories_norm, mean, std, num_test_samples
             plot_trajectory_comparison(
                 x_0_denorm, sampled_unguided_denorm, sampled_guided_denorm, 
                 history=history_denorm, target=target_denorm,
-                title=f"Figs/CBF Guidance Test Sample {i+1}\n(Guided: Green avoids Red Obstacle)",
+                title=f"Figures/CBF Guidance Test Sample {i+1}\n(Guided: Green avoids Red Obstacle)",
                 obstacle_center=obstacle_center_viz,
                 obstacle_radius=config.obstacle_radius,
                 show_flag=show_flag

@@ -954,7 +954,7 @@ class ObstacleAwareDiffusionProcess:
             plt.show()
         else:
             # Save as SVG with descriptive filename
-            filename = f"Figs/diffusion_step_{step_idx:03d}_t_{t[0].item():03d}.svg"
+            filename = f"Figures/diffusion_step_{step_idx:03d}_t_{t[0].item():03d}.svg"
             plt.savefig(filename, format='svg', bbox_inches='tight')
             plt.close()  # Close the figure to free memory
         
@@ -2467,7 +2467,7 @@ def plot_combined_trajectories(combined_cases, show_flag=True):
     if show_flag:
         plt.show()
     # else:
-    filename = "Figs/combined_9_test_cases.svg"
+    filename = "Figures/combined_9_test_cases.svg"
     plt.savefig(filename, format='svg', bbox_inches='tight', dpi=300)
     plt.close()
     print(f"Combined plot saved to {filename}")
@@ -2781,7 +2781,7 @@ def plot_action_comparison(all_trajectories, target, obstacles, history, mean_st
     if show_flag:
         plt.show()
     else:
-        filename = f"Figs/action_comparison_sample_{sample_idx:03d}.svg"
+        filename = f"Figures/action_comparison_sample_{sample_idx:03d}.svg"
         plt.savefig(filename, format='svg', bbox_inches='tight')
         plt.close()
 
@@ -2874,7 +2874,7 @@ def plot_style_statistics(all_trajectories, show_flag, sample_idx=1):
     if show_flag:
         plt.show()
     else:
-        filename = f"Figs/style_statistics_sample_{sample_idx:03d}.svg"
+        filename = f"Figures/style_statistics_sample_{sample_idx:03d}.svg"
         plt.savefig(filename, format='svg', bbox_inches='tight')
         plt.close()
 
@@ -3039,7 +3039,7 @@ def plot_test_results(original, sampled_unguided_denorm, sampled_guided_denorm, 
     if show_flag:
         plt.show()
     else:
-        filename = f"Figs/test_sample_{step_idx:03d}_results.svg"
+        filename = f"Figures/test_sample_{step_idx:03d}_results.svg"
         plt.savefig(filename, format='svg', bbox_inches='tight', dpi=300)
         plt.close()
 

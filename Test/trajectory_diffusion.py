@@ -146,7 +146,7 @@ def main():
     for k in range(K):
         noisy_traj, _ = forward_diffusion(true_trajectory, k)
         forward_trajs.append(noisy_traj)
-    plot_trajectories(forward_trajs, true_trajectory, 'Forward Diffusion Process', 'Figs/forward_diffusion.png')
+    plot_trajectories(forward_trajs, true_trajectory, 'Forward Diffusion Process', 'Figures/forward_diffusion.png')
 
     # Train model
     model = NoiseModel(input_dim=T).to(device)
@@ -160,7 +160,7 @@ def main():
     plt.xlabel('Epoch')
     plt.ylabel('MSE Loss')
     plt.grid(True)
-    plt.savefig('Figs/training_loss.png')
+    plt.savefig('Figures/training_loss.png')
     plt.close()
 
     # Simulate backward diffusion
@@ -169,7 +169,7 @@ def main():
     for k in reversed(range(K)):
         current_traj = backward_diffusion(model, current_traj, k)
         backward_trajs.append(current_traj)
-    plot_trajectories(backward_trajs, true_trajectory, 'Backward Diffusion Process', 'Figs/backward_diffusion.png', steps_to_plot=[K, K//2, 0])
+    plot_trajectories(backward_trajs, true_trajectory, 'Backward Diffusion Process', 'Figures/backward_diffusion.png', steps_to_plot=[K, K//2, 0])
 
     # Evaluate: Compute MSE between final denoised trajectory and true trajectory
     final_mse = nn.functional.mse_loss(backward_trajs[-1], true_trajectory).item()

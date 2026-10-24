@@ -57,9 +57,9 @@ def compare_guidance_effects_corrected():
     print(f"sigma_ts[-5:]: {sigma_ts[-5:].numpy()}")
     
     # Guidance parameters
-    gamma_max = 1.0
+    gamma_max = 3000.0
     grad_V_norm = 1.0  # Assume constant gradient norm for comparison
-    t_start = 0.7  # Start time for constraint activation (normalized)
+    t_start = 1.0  # Start time for constraint activation (normalized)
     alpha = 0.6  # Exponential sharpness parameter
     
     # Normalized time from 1 to 0 (reverse diffusion direction)

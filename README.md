@@ -29,7 +29,7 @@ AeroTrajGen generates UAV maneuver trajectories conditioned on motion history, a
 | `Flow_Matching_SafeTrj_pvR_Test.py` | Flow-matching experiment |
 | `model/` | Local checkpoints; ignored by Git |
 | `Results/` | Timestamped evaluation reports; ignored by Git |
-| `Figs/` | Generated figures; ignored by Git |
+| `Figures/` | Generated figures; ignored by Git |
 | `Doc/` | Local manuscript sources; ignored by Git |
 
 Experimental scripts have their own configurations and are not interchangeable with the main entry point.
@@ -50,7 +50,7 @@ On Windows, activate the environment with `.venv\Scripts\activate`. For CUDA, in
 Create the output directories before running:
 
 ```bash
-mkdir -p model Results Figs output/pdf
+mkdir -p model Results Figures output/pdf
 ```
 
 ## Quick start
@@ -159,7 +159,7 @@ Typical outputs are:
 
 ```text
 Results/metrics_summary_YYYYMMDD_HHMMSS.txt
-Figs/combined_9_test_cases.svg
+Figures/combined_9_test_cases.svg
 output/pdf/test_samples_results.pdf
 model/<configured-checkpoint-name>.pth
 ```
@@ -209,7 +209,7 @@ The reported per-trajectory time is total sampling time divided by N, averaged o
 - **Checkpoint shape mismatch:** match the model dimensions and obstacle-encoder configuration used during training.
 - **Out of memory:** reduce training/evaluation batch sizes or the synthetic dataset size; the main script moves generated datasets to the selected device.
 - **Headless environment:** run `MPLBACKEND=Agg python AeroDM_ObstacleAware_Training_Test.py` and leave `show_flag=False`.
-- **Missing output directory:** create `model`, `Results`, `Figs`, and `output/pdf` before running.
+- **Missing output directory:** create `model`, `Results`, `Figures`, and `output/pdf` before running.
 
 ### 多机轨迹生成 Demo
 

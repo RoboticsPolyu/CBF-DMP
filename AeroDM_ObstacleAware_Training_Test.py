@@ -68,9 +68,17 @@ class Config:
 
     # CBF Guidance parameters (from CoDiG paper)
     # enable_cbf_guidance = True  # Disabled by default; toggle for inference
-    guidance_gamma = 1.0  # Barrier guidance strength (0 to 1); internally scaled by 4000
+    guidance_gamma = 3000.0  # Direct peak guidance coefficient; no hidden multiplier
     barrier_type = "logistic"  # "standard": compute_barrier_and_grad; "logistic": compute_barrier_and_grad_logistic
-    barrier_sigma = 0.3 # Smoothness parameter for logistic barrier function (only used with barrier_type="logistic")
+    barrier_sigma = 0.35 # Smoothness parameter for logistic barrier function (only used with barrier_type="logistic")
+
+    enable_cbf = True  # Include V_CBF and its direction in logistic guidance
+    enable_dyn = True  # Include V_dyn and its direction independently of V_CBF
+    guidance_w_p = 1.0  # Position penalty; fixes overall weight scale
+    guidance_w_b = 0.03  # CBF penalty, selected on 128 independent validation scenes
+    guidance_w_d = 30.0  # Mean-normalized dynamics penalty (1/(6N))
+    cbf_sigma = 0.5  # Squared-distance smoothing scale
+    cbf_kappa = 0.3
 
     last_xyz_weight=50.0 # Extra weight for final timestep's position error
     xyz_weight=1.0 # Extra weight for Z-axis (height) in aviation
@@ -591,36 +599,96 @@ def pack_guidance_obstacles(obstacles_data, x):
     return centers, radius_sq, valid
 
 
-def _batched_barrier(x, mean, std, obstacles_data, sigma=None):
+@torch.no_grad()
+def _batched_barrier(x, mean, std, obstacles_data, sigma=1.0, logistic=False):
+    """Position-only physical energy gradient scaled by inverse normalization std."""
+    if sigma <= 0:
+        raise ValueError("sigma must be positive")
+    mean = torch.as_tensor(mean, dtype=x.dtype, device=x.device)
+    std = torch.as_tensor(std, dtype=x.dtype, device=x.device)
     centers, radius_sq, valid = pack_guidance_obstacles(obstacles_data, x)
     grad_x = torch.zeros_like(x)
     if centers.shape[1] == 0:
         return x.new_zeros(()), grad_x
-    pos = (x[:, :, 1:4] * std[0, 0, 1:4] + mean[0, 0, 1:4]).detach()
-    delta = pos[:, None, :, :] - centers[:, :, None, :]
-    if sigma is None:
-        distances = torch.norm(delta, dim=-1)
-        violation = torch.clamp(radius_sq[:, :, None] - distances * distances, min=0.0)
-        values = violation
-        gradients = -2 * violation[..., None] * (delta / (distances[..., None] + 1e-6))
+    delta = (x[..., 1:4]*std[..., 1:4]+mean[..., 1:4])[:, None] - centers[:, :, None]
+    h = delta.square().sum(-1)-radius_sq[:, :, None]
+    if logistic:
+        values = F.softplus(-h/sigma)
+        coeff = -torch.sigmoid(-h/sigma)/sigma
     else:
-        dist_sq = torch.sum(delta * delta, dim=-1)
-        p_safe = torch.sigmoid((dist_sq - radius_sq[:, :, None]) / sigma)
-        values = -torch.log(p_safe + 1e-8)
-        gradients = (-(1 - p_safe) * 2.0 / sigma)[..., None] * delta
+        values = torch.relu(-h)/sigma
+        coeff = -(h < 0).to(x.dtype)/sigma
     values = values.masked_fill(~valid[:, :, None], 0)
-    gradients = gradients.masked_fill(~valid[:, :, None, None], 0)
-    # Keep the existing normalization and analytic guidance formulas unchanged.
-    grad_x[:, :, 1:4] = gradients.sum(dim=1) / std[0, 0, 1:4].to(x.device)
-    return values.sum(dim=2).sum(dim=1).mean(), grad_x
+    gradients = (2*coeff[..., None]*delta).masked_fill(~valid[:, :, None, None], 0)
+    grad_x[..., 1:4] = gradients.sum(1)/std[..., 1:4]
+    return values.sum((1, 2)).mean(), grad_x
 
 
-def compute_barrier_and_grad(x, mean, std, obstacles_data=None):
-    return _batched_barrier(x, mean, std, obstacles_data)
-
-
-def compute_barrier_and_grad_logistic(x, mean, std, obstacles_data=None, sigma=0.5):
+def compute_barrier_and_grad(x, mean, std, obstacles_data=None, sigma=1.0):
     return _batched_barrier(x, mean, std, obstacles_data, sigma=sigma)
+
+
+@torch.no_grad()
+def compute_barrier_and_grad_logistic(
+    x, mean, std, obstacles_data=None, sigma=0.5, *,
+    enable_cbf=True, enable_dyn=True, w_p=1.0, w_b=1.0, w_d=1.0,
+    sigma_b=0.5, kappa=0.3, dt=0.1,
+):
+    """Composite paper energy (batch mean) and per-trajectory direction.
+
+    x: normalized [batch, horizon, channels], with speed at 0, position
+    at 1:4 and velocity at 4:7. Extra channels receive zero direction.
+    Obstacles are physical coordinates. The direction is the gradient of
+    the summed energy with respect to physical trajectory coordinates,
+    without batch averaging, then divided by normalization std. This is a
+    preconditioned direction, not the exact normalized-coordinate gradient.
+    Both switches affect energy AND direction.
+    """
+    if x.ndim != 3 or x.shape[0] < 1 or x.shape[1] < 1 or x.shape[2] < 7:
+        raise ValueError("Expected nonempty [batch, horizon, channels>=7] input")
+    if sigma <= 0 or sigma_b <= 0 or dt <= 0 or not 0 < kappa <= 1:
+        raise ValueError("Require sigma, sigma_b, dt > 0 and 0 < kappa <= 1")
+    if min(w_p, w_b, w_d) < 0:
+        raise ValueError("Weights must be nonnegative")
+    mean = torch.as_tensor(mean, device=x.device, dtype=x.dtype)
+    std = torch.as_tensor(std, device=x.device, dtype=x.dtype)
+    # Checkpoint statistics also include the trailing maneuver-style label.
+    mean, std = mean[..., :x.shape[-1]], std[..., :x.shape[-1]]
+    physical = x * std + mean
+    pos, vel = physical[..., 1:4], physical[..., 4:7]
+    energy = x.new_zeros(x.shape[0])
+    gp, gv = torch.zeros_like(pos), torch.zeros_like(vel)
+    centers, radius_sq, valid = pack_guidance_obstacles(obstacles_data, x)
+    if centers.shape[1]:
+        centers = centers.to(device=x.device, dtype=x.dtype)
+        radius_sq = radius_sq.to(device=x.device, dtype=x.dtype)
+        valid = valid.to(device=x.device)
+        delta = pos[:, None] - centers[:, :, None]
+        h = delta.square().sum(-1) - radius_sq[:, :, None]
+        mask = valid[:, :, None]
+        # Stable -log(sigmoid(h/sigma)), including deep penetrations.
+        energy += (w_p * F.softplus(-h / sigma)).masked_fill(~mask, 0).sum((1, 2))
+        coeff = (-w_p / sigma * torch.sigmoid(-h / sigma)).masked_fill(~mask, 0)
+        gp += (2 * coeff[..., None] * delta).sum(1)
+        if enable_cbf:
+            velocity = vel[:, None]
+            residual = kappa * h + 2 * dt * (delta * velocity).sum(-1) + dt**2 * velocity.square().sum(-1)
+            energy += (w_b * F.softplus(-residual / sigma_b)).masked_fill(~mask, 0).sum((1, 2))
+            coeff = (-w_b / sigma_b * torch.sigmoid(-residual / sigma_b)).masked_fill(~mask, 0)
+            gp += (coeff[..., None] * (2 * kappa * delta + 2 * dt * velocity)).sum(1)
+            gv += (coeff[..., None] * (2 * dt * delta + 2 * dt**2 * velocity)).sum(1)
+    n = x.shape[1] - 1
+    if enable_dyn and n > 0:
+        residual = pos[:, 1:] - pos[:, :-1] - dt * vel[:, :-1]
+        energy += w_d / (6 * n) * residual.square().sum((1, 2))
+        derivative = w_d / (3 * n) * residual
+        gp[:, 1:] += derivative
+        gp[:, :-1] -= derivative
+        gv[:, :-1] -= dt * derivative
+    direction = torch.zeros_like(x)
+    direction[..., 1:4] = gp / std[..., 1:4]
+    direction[..., 4:7] = gv / std[..., 4:7]
+    return energy.mean(), direction
 
 # Diffusion Process with Obstacle-Aware Sampling
 class ObstacleAwareDiffusionProcess:
@@ -716,15 +784,19 @@ class ObstacleAwareDiffusionProcess:
             barrier_info = None
             if enable_guidance and guidance_gamma is not None and mean is not None and std is not None:
                 # Compute γ_t (scheduled: strongest at t=0 for final safety enforcement)
-                gamma_t = (4000.0 * guidance_gamma) * (1.0 - t_exp.squeeze(1).float() / self.config.diffusion_steps)
+                gamma_t = guidance_gamma * (1.0 - t_exp.squeeze(1).float() / self.config.diffusion_steps)
                 
                 barrier_obstacles = obstacles_data if guidance_obstacles is None else guidance_obstacles
-                # Compute barrier gradient ∇V with multiple obstacles
+                # Compute inverse-std-scaled energy direction with multiple obstacles
                 if self.config.barrier_type == "standard":
-                    V, grad_V = compute_barrier_and_grad(pred_x0, mean, std, barrier_obstacles)
+                    V, grad_V = compute_barrier_and_grad(pred_x0, mean, std, barrier_obstacles, sigma=self.config.barrier_sigma)
                 elif self.config.barrier_type == "logistic":
                     V, grad_V = compute_barrier_and_grad_logistic(
-                        pred_x0, mean, std, barrier_obstacles, sigma=self.config.barrier_sigma
+                        pred_x0, mean, std, barrier_obstacles, sigma=self.config.barrier_sigma,
+                        enable_cbf=self.config.enable_cbf, enable_dyn=self.config.enable_dyn,
+                        w_p=self.config.guidance_w_p, w_b=self.config.guidance_w_b,
+                        w_d=self.config.guidance_w_d, sigma_b=self.config.cbf_sigma,
+                        kappa=self.config.cbf_kappa, dt=self.config.delta_T,
                     )
                 else:
                     raise ValueError(
@@ -734,9 +806,9 @@ class ObstacleAwareDiffusionProcess:
 
                 barrier_info = {'V': V, 'grad_V': grad_V, 'gamma_t': gamma_t}
                 # print(barrier_info)
-                # Guided score: s_guided = s_theta - γ_t ∇V
+                # Guided score: s_guided = s_theta - gamma_t * direction
                 # ε_guided = mu_pred - gamma_t.view(batch_size, 1, 1) * grad_V
-                # norm(grad_V) << norm(mu_pred), sigma_t: 1->0, gamma_t: 0->4000*guidance_gamma
+                # norm(grad_V) << norm(mu_pred), sigma_t: 1->0, gamma_t: 0->guidance_gamma
                 ε_guided = ε_pred + gamma_t.view(batch_size, 1, 1) * grad_V * sqrt_one_minus_alpha_bar_t
                 # ε_pred = score_function * - sqrt_one_minus_alpha_bar_t
                 # norm(score_function) = norm(ε_pred) / sigma_t; norm(ε_pred)^2 ~ χ2(D) 
@@ -921,8 +993,8 @@ class ObstacleAwareDiffusionProcess:
             plt.show()
         else:
             # Save as SVG with descriptive filename
-            os.makedirs('Figs', exist_ok=True)
-            filename = f"Figs/diffusion_{getattr(self, '_plot_run_id', time.time_ns())}_step_{step_idx:03d}_t_{t[0].item():03d}.svg"
+            os.makedirs('Figures', exist_ok=True)
+            filename = f"Figures/diffusion_{getattr(self, '_plot_run_id', time.time_ns())}_step_{step_idx:03d}_t_{t[0].item():03d}.svg"
             plt.savefig(filename, format='svg', bbox_inches='tight')
             plt.close()  # Close the figure to free memory
         
@@ -2150,6 +2222,9 @@ def config_to_string(config):
     lines.append(f"  guidance_gamma: {config.guidance_gamma}")
     lines.append(f"  barrier_type: {config.barrier_type}")
     lines.append(f"  barrier_sigma: {config.barrier_sigma}")
+    for name in ("enable_cbf", "enable_dyn", "guidance_w_p", "guidance_w_b",
+                 "guidance_w_d", "cbf_sigma", "cbf_kappa"):
+        lines.append(f"  {name}: {getattr(config, name)}")
     lines.append("")
     lines.append(f"Loss Weights:")
     lines.append(f"  last_xyz_weight: {config.last_xyz_weight}")
@@ -2584,10 +2659,10 @@ def plot_combined_trajectories(combined_cases, show_flag=True):
         ax.set_zlabel('Z', fontsize=10)
         
         # Create title with style information
-        title_text = f"Case {case['idx']}"
-        if 'hist_style' in case and 'pred_style' in case:
-            title_text += f"\n{case['hist_style']} → {case['pred_style']}"
-        ax.set_title(title_text, fontsize=11, fontweight='bold')
+        # title_text = f"Case {case['idx']}"
+        # if 'hist_style' in case and 'pred_style' in case:
+        #     title_text += f"\n{case['hist_style']} → {case['pred_style']}"
+        # ax.set_title(title_text, fontsize=11, fontweight='bold')
         
         # Add grid
         ax.grid(True, alpha=0.3)
@@ -2617,7 +2692,7 @@ def plot_combined_trajectories(combined_cases, show_flag=True):
         plt.show()
     # else:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    filename = f"Figs/combined_9_test_cases_{timestamp}.svg"
+    filename = f"Figures/combined_9_test_cases_{timestamp}.svg"
     plt.savefig(filename, format='svg', bbox_inches='tight', dpi=300)
     plt.close()
     print(f"Combined plot saved to {filename}")
@@ -2901,7 +2976,7 @@ def plot_action_comparison(all_trajectories, target, obstacles, history, mean_st
     if show_flag:
         plt.show()
     else:
-        filename = f"Figs/action_comparison_sample_{sample_idx:03d}.svg"
+        filename = f"Figures/action_comparison_sample_{sample_idx:03d}.svg"
         plt.savefig(filename, format='svg', bbox_inches='tight')
         plt.close()
 
@@ -2994,7 +3069,7 @@ def plot_style_statistics(all_trajectories, show_flag, sample_idx=1):
     if show_flag:
         plt.show()
     else:
-        filename = f"Figs/style_statistics_sample_{sample_idx:03d}.svg"
+        filename = f"Figures/style_statistics_sample_{sample_idx:03d}.svg"
         plt.savefig(filename, format='svg', bbox_inches='tight')
         plt.close()
 

@@ -74,7 +74,7 @@ def main():
     parser.add_argument('--checkpoint', type=Path, default=Path(Config.model_save_dir)/Config.model_filename)
     parser.add_argument('--device', default=Config.device)
     parser.add_argument('--seed', type=int, default=42)
-    parser.add_argument('--output', type=Path, default=Path('Figs/target_neighborhood'))
+    parser.add_argument('--output', type=Path, default=Path('Figures/target_neighborhood'))
     args = parser.parse_args()
     torch.set_num_threads(4)
     device = torch.device(args.device)

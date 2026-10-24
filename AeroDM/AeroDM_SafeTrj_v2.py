@@ -550,7 +550,7 @@ class ObstacleAwareDiffusionProcess:
             plt.show()
         else:
             # Save as SVG with descriptive filename
-            filename = f"Figs/diffusion_step_{step_idx:03d}_t_{t[0].item():03d}.svg"
+            filename = f"Figures/diffusion_step_{step_idx:03d}_t_{t[0].item():03d}.svg"
             plt.savefig(filename, format='svg', bbox_inches='tight')
             plt.close()  # Close the figure to free memory
         
@@ -873,7 +873,7 @@ def plot_training_losses(losses, use_obstacle_loss, show_flag=True):
     if show_flag:
         plt.show()
     else:
-        filename = "Figs/training_losses.svg"
+        filename = "Figures/training_losses.svg"
         plt.savefig(filename, format='svg', bbox_inches='tight')
         plt.close()
 
@@ -1308,14 +1308,14 @@ def test_model_performance(model, trajectories_norm, mean, std, num_test_samples
             plot_trajectory_comparison(
                 x_0_denorm, sampled_unguided_denorm, sampled_guided_denorm, 
                 history=history_denorm, target=target_denorm, obstacles=obstacles,
-                title=f"Figs/Obstacle-Aware Test Sample {i+1}\n(Transformer + CBF Guidance)",
+                title=f"Figures/Obstacle-Aware Test Sample {i+1}\n(Transformer + CBF Guidance)",
                 show_flag=show_flag
             )
 
     model.train()
 
 def plot_trajectory_comparison(original, sampled_unguided_denorm, sampled_guided_denorm, history=None, 
-                                      target=None, obstacles=None, title="Figs/Trajectory Comparison", show_flag=True):
+                                      target=None, obstacles=None, title="Figures/Trajectory Comparison", show_flag=True):
     """visualization with multiple obstacles and trajectory comparison"""
     fig = plt.figure(figsize=(20, 15))
     fig.suptitle(title, fontsize=16)
